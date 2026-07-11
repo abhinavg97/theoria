@@ -40,6 +40,7 @@ class Proof:
 class Verdict:
     accepted: bool
     reason: str
+    infrastructure_failure: bool = False
 
 # ── JSON Schemas ────────────────────────────────────────────────
 
@@ -72,6 +73,7 @@ VERDICT_SCHEMA = {
         "reason": {"type": "string"},
     },
     "required": ["accepted", "reason"],
+    "additionalProperties": False,
 }
 
 
@@ -119,12 +121,18 @@ def agent_prompt(role: str) -> str:
     the shared `_preamble` block when the role sets `preamble: true`.
     Used to factor out environment descriptions or other content that
     should appear at the top of several roles' prompts without
-    duplicating the text in each role."""
-    p = agent_settings(role).get("prompt", "")
-    if agent_settings(role).get("preamble"):
+    duplicating the text in each role. A role may also provide a
+    `prompt_suffix`, which provider profiles use for capability-specific
+    policy without copying the role's full prompt."""
+    settings = agent_settings(role)
+    p = settings.get("prompt", "")
+    if settings.get("preamble"):
         pre = CONFIG.get("_preamble", "")
         if pre:
             p = f"{pre}\n\n{p}"
+    suffix = settings.get("prompt_suffix", "")
+    if suffix:
+        p = f"{p}\n\n{suffix}"
     return p
 
 # ── Config ─────────────────────────────────────────────────────
@@ -168,9 +176,14 @@ def agent_settings(role: str) -> dict:
 
 # ── LLM ────────────────────────────────────────────────────────
 
-from llm import llm as _llm_call
+from llm import StructuredOutputError, llm as _llm_call
 
 WATCH = False  # set in main
+
+_STRUCTURED_OUTPUT_FAILURE = (
+    "The provider failed to return valid structured output after the "
+    "configured retries. See the call artifacts for details."
+)
 
 async def llm(
     prompt: str,
@@ -236,8 +249,17 @@ async def judge(
         f"  Justification: {step.justification}"
     )
 
-    data, _ = await llm(user_msg, role=role, schema=VERDICT_SCHEMA, system=system)
-    verdict = Verdict(**data)
+    try:
+        data, _ = await llm(
+            user_msg, role=role, schema=VERDICT_SCHEMA, system=system,
+        )
+        verdict = Verdict(accepted=data["accepted"], reason=data["reason"])
+    except StructuredOutputError:
+        verdict = Verdict(
+            accepted=False,
+            reason=f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}",
+            infrastructure_failure=True,
+        )
     inputs = {"role": role, "user_msg": user_msg, "system": system}
     if on_complete is not None:
         await on_complete(step_number, verdict, inputs)
@@ -273,10 +295,17 @@ async def judge_initial_state(
         f"Initial state (state 0): {proof.initial_state}\n\n"
         f"Full proof for context:\n{_format_proof(proof)}"
     )
-    data, _ = await llm(
-        user_msg, role="initial_state", schema=VERDICT_SCHEMA, system=system,
-    )
-    verdict = Verdict(**data)
+    try:
+        data, _ = await llm(
+            user_msg, role="initial_state", schema=VERDICT_SCHEMA, system=system,
+        )
+        verdict = Verdict(accepted=data["accepted"], reason=data["reason"])
+    except StructuredOutputError:
+        verdict = Verdict(
+            accepted=False,
+            reason=f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}",
+            infrastructure_failure=True,
+        )
     inputs = {"role": "initial_state", "user_msg": user_msg, "system": system}
     if on_complete is not None:
         await on_complete(0, verdict, inputs)
@@ -357,12 +386,16 @@ async def _pedantry_check(
         f"Is this rejection legitimate (the proof is actually wrong) or "
         f"pedantic (the proof is correct, the judge is being too strict)?"
     )
-    data, _ = await llm(
-        user_msg, role="pedantry", schema=PEDANTRY_SCHEMA,
-        system=agent_prompt("pedantry"),
-    )
-    is_pedantic = data["is_pedantic"]
-    reason = data["reason"]
+    try:
+        data, _ = await llm(
+            user_msg, role="pedantry", schema=PEDANTRY_SCHEMA,
+            system=agent_prompt("pedantry"),
+        )
+        is_pedantic = data["is_pedantic"]
+        reason = data["reason"]
+    except StructuredOutputError:
+        is_pedantic = False
+        reason = f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}"
     if on_complete is not None:
         await on_complete(step_number, original_reason, is_pedantic, reason)
     return is_pedantic, reason
@@ -394,10 +427,20 @@ async def _convention_lift_step(
         f"that — if added as an explicit premise — would fully justify "
         f"this step and resolve the judge's objection?"
     )
-    data, _ = await llm(
-        user_msg, role="convention_lift", schema=CONVENTION_LIFT_SCHEMA,
-        system=agent_prompt("convention_lift"),
-    )
+    try:
+        data, _ = await llm(
+            user_msg, role="convention_lift", schema=CONVENTION_LIFT_SCHEMA,
+            system=agent_prompt("convention_lift"),
+        )
+    except StructuredOutputError:
+        data = {
+            "can_lift": False,
+            "convention": "",
+            "source": "",
+            "reasoning": (
+                f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}"
+            ),
+        }
     if on_complete is not None:
         await on_complete(step_number, data)
     return data
@@ -418,10 +461,20 @@ async def _convention_lift_state0(
         f"that — if added as an explicit premise — would fully justify "
         f"this initial state and resolve the judge's objection?"
     )
-    data, _ = await llm(
-        user_msg, role="convention_lift", schema=CONVENTION_LIFT_SCHEMA,
-        system=agent_prompt("convention_lift"),
-    )
+    try:
+        data, _ = await llm(
+            user_msg, role="convention_lift", schema=CONVENTION_LIFT_SCHEMA,
+            system=agent_prompt("convention_lift"),
+        )
+    except StructuredOutputError:
+        data = {
+            "can_lift": False,
+            "convention": "",
+            "source": "",
+            "reasoning": (
+                f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}"
+            ),
+        }
     if on_complete is not None:
         await on_complete(0, data)
     return data
@@ -442,12 +495,16 @@ async def _pedantry_check_state0(
         f"or made-up content not supported by the problem text) or pedantic "
         f"(state 0 is fine and the judge is being too strict)?"
     )
-    data, _ = await llm(
-        user_msg, role="pedantry", schema=PEDANTRY_SCHEMA,
-        system=agent_prompt("pedantry"),
-    )
-    is_pedantic = data["is_pedantic"]
-    reason = data["reason"]
+    try:
+        data, _ = await llm(
+            user_msg, role="pedantry", schema=PEDANTRY_SCHEMA,
+            system=agent_prompt("pedantry"),
+        )
+        is_pedantic = data["is_pedantic"]
+        reason = data["reason"]
+    except StructuredOutputError:
+        is_pedantic = False
+        reason = f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}"
     if on_complete is not None:
         await on_complete(0, verdict.reason, is_pedantic, reason)
     return is_pedantic, reason
@@ -466,9 +523,14 @@ async def _filter_pedantic(
     {step_number, original_reason, is_pedantic, pedantry_reason}; state
     0's record (if any) uses step_number=0.
     """
-    failed_indices = [i for i, v in enumerate(verdicts) if not v.accepted]
+    failed_indices = [
+        i for i, v in enumerate(verdicts)
+        if not v.accepted and not v.infrastructure_failure
+    ]
     state0_failed = (
-        state0_verdict is not None and not state0_verdict.accepted
+        state0_verdict is not None
+        and not state0_verdict.accepted
+        and not state0_verdict.infrastructure_failure
     )
     if not failed_indices and not state0_failed:
         return list(verdicts), state0_verdict, []
@@ -602,9 +664,9 @@ async def _formalizer_call(
     Two modes:
     - claude backend: uses session resume. Each call only sends new info;
       the formalizer remembers prior proofs and reasoning from the session.
-    - codex backend: stateless. Each call passes the full context (prior
-      proof + failed verdicts) because codex exec resume doesn't support
-      --output-schema, so we can't get structured output on resumed sessions.
+    - codex backend: deliberately stateless. Each call passes the full context
+      (prior proof + failed verdicts), which is more robust across local model
+      providers and Codex versions than relying on provider session state.
 
     Returns (decision_dict, session_id).
     """
@@ -664,6 +726,30 @@ async def _formalizer_call(
     return await llm(
         user_msg, role="formalizer", schema=_formalizer_decision_schema(),
         system=agent_prompt("formalizer"),
+    )
+
+
+def _coerce_formalizer_decision(decision: object) -> dict:
+    """Normalize formalizer output into a dict.
+
+    Some backends may return serialized JSON instead of a parsed object.
+    Invalid provider output is an infrastructure failure. The caller converts
+    it into a conservative formalizer rejection so the problem can continue.
+    """
+    if isinstance(decision, dict):
+        return decision
+    if isinstance(decision, str):
+        try:
+            parsed = json.loads(decision)
+        except json.JSONDecodeError as exc:
+            raise StructuredOutputError(
+                "Formalizer returned invalid JSON instead of a decision object."
+            ) from exc
+        if isinstance(parsed, dict):
+            return parsed
+    raise StructuredOutputError(
+        "Formalizer returned an unexpected response type: "
+        f"{type(decision).__name__}."
     )
 
 
@@ -730,10 +816,23 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
             f"\n[formalize] verify={verify_attempts}/{max_verify} "
             f"solver_answers={solver_answers}/{max_solver}..."
         )
-        decision, new_session = await _formalizer_call(
-            problem, solution, formalizer_session, failed_verdicts_text,
-            prior_proof=last_proof,
-        )
+        try:
+            decision, new_session = await _formalizer_call(
+                problem, solution, formalizer_session, failed_verdicts_text,
+                prior_proof=last_proof,
+            )
+            decision = _coerce_formalizer_decision(decision)
+        except StructuredOutputError:
+            reason = f"[STRUCTURED OUTPUT FAILURE] {_STRUCTURED_OUTPUT_FAILURE}"
+            log(f"    Formalizer unavailable: {reason}")
+            attempts.append({
+                "attempt": len(attempts) + 1,
+                "phase": "formalizer_error",
+                "error": reason,
+            })
+            state["infrastructure_error"] = reason
+            await save_partial("attempt_appended:formalizer_error")
+            break
         if formalizer_session is None:
             formalizer_session = new_session
         action = decision.get("action")
@@ -797,6 +896,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
                 "system": inputs["system"],
                 "accepted": verdict.accepted,
                 "reason": verdict.reason,
+                "infrastructure_failure": verdict.infrastructure_failure,
             }
             await save_partial(f"judge_completed:{step_number}")
 
@@ -808,6 +908,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
                 "system": inputs["system"],
                 "accepted": verdict.accepted,
                 "reason": verdict.reason,
+                "infrastructure_failure": verdict.infrastructure_failure,
             }
             await save_partial("state0_judge_completed")
 
@@ -922,7 +1023,11 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
             n_unlifted = len(legit_rejections) - n_lifted
             log(f"    {n_lifted} lifted under convention, {n_unlifted} not")
 
-        all_ok = state0_verdict.accepted and all(v.accepted for v in verdicts)
+        all_ok = (
+            state0_verdict.accepted
+            and not state0_verdict.infrastructure_failure
+            and all(v.accepted and not v.infrastructure_failure for v in verdicts)
+        )
         # Replace any pedantry-overridden verdicts in the in-progress record.
         in_progress["state0_verdict"] = {
             "step_number": 0,
@@ -931,6 +1036,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
             "system": state0_input["system"],
             "accepted": state0_verdict.accepted,
             "reason": state0_verdict.reason,
+            "infrastructure_failure": state0_verdict.infrastructure_failure,
         }
         for i, v in enumerate(verdicts):
             in_progress["verdicts"][i] = {
@@ -940,6 +1046,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
                 "system": judge_inputs[i]["system"],
                 "accepted": v.accepted,
                 "reason": v.reason,
+                "infrastructure_failure": v.infrastructure_failure,
             }
         in_progress["pedantry"] = pedantry_records
         in_progress["conventions"] = conventions_added
@@ -1016,6 +1123,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         "proof": proof_dict,
         "verdicts": verdicts_dict,
         "attempts": attempts,
+        "infrastructure_error": state.get("infrastructure_error"),
     }
 
 if __name__ == "__main__":

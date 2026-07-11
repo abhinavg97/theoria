@@ -1,0 +1,56 @@
+# Unaudited all-local profile for Codex's built-in Ollama adapter.
+#
+# The example model can be replaced for every role at run time with:
+#   --codex-model YOUR_OLLAMA_MODEL
+# or by changing `_ollama_role.model` below. Ollama must expose its compatible
+# endpoint at the configured URL. CODEX_OSS_BASE_URL overrides oss_base_url.
+
+_no_search_policy: &no_search_policy |
+  Live web search is disabled for this profile. Retrieving a known URL is
+  direct fetch, not search or source discovery. You may fetch and check an
+  authoritative source when its URL is already known. For any material
+  external claim that cannot be verified with the available tools, take this
+  role's conservative failure path rather than relying on memory.
+
+_ollama_role: &ollama_role
+  backend: codex
+  model: gpt-oss:20b
+  effort: null
+  oss: true
+  local_provider: ollama
+  oss_base_url: http://localhost:11434/v1
+  provider_env: []
+  search: false
+  schema_retries: 1
+
+solver:
+  <<: *ollama_role
+  prompt_suffix: *no_search_policy
+
+interpreter:
+  <<: *ollama_role
+
+formalizer:
+  <<: *ollama_role
+  prompt_suffix: *no_search_policy
+
+citation:
+  <<: *ollama_role
+  prompt_suffix: *no_search_policy
+
+problem_given:
+  <<: *ollama_role
+
+computation:
+  <<: *ollama_role
+
+pedantry:
+  <<: *ollama_role
+  prompt_suffix: *no_search_policy
+
+convention_lift:
+  <<: *ollama_role
+  prompt_suffix: *no_search_policy
+
+initial_state:
+  <<: *ollama_role

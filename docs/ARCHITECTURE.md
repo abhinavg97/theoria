@@ -12,8 +12,9 @@ pipeline.py    THE METHOD. The solve → formalize → judge → filter → repa
 llm.py         Backend plumbing. Calls the `claude` or `codex` CLI (optionally
                inside Docker), enforces JSON-schema output, streams events,
                writes per-call artifacts, and survives hangs.
-sandbox.py     One hardened Docker container per problem; mounts subscription
-               credentials; tears it down afterward.
+sandbox.py     One hardened Docker container per problem; streams only the
+               credentials/config needed by active providers into a private
+               tmpfs home; tears it down.
 harness.py     Runs many problems with bounded parallelism, saves incrementally,
                and records reproducibility metadata for each run.
 
@@ -102,14 +103,36 @@ That's the system working as intended, not a failure.
 
 ## Backends
 
-Every role runs on **Codex** except the **formalizer**, which always runs on
-**Claude** — it needs session-resume plus structured output together, which
-only the Claude path supports (`llm.py` dispatches per role from the config).
-This split — Codex solver and judges, Claude formalizer — is the single
-audited configuration, and it's the default with no
-flags (so a Claude *and* a Codex subscription are both required). Re-wiring
-roles to other backends is only possible by writing a custom `--config` YAML,
-and is unaudited.
+`llm.py` dispatches each role to the **Claude** or **Codex** CLI from its
+merged settings. The audited default uses Codex for the solver and judges and
+Claude for the formalizer, so it requires both subscriptions. The Claude
+formalizer repairs a proof by resuming its structured-output session.
+
+A config may instead put the formalizer on Codex. That path is deliberately
+stateless: every repair call includes the solution, prior proof, and failed
+verdicts in a fresh structured-output request. It does not depend on whether a
+particular Codex release accepts an output schema while resuming a session.
+
+Codex-backed roles can use OpenAI cloud models, Codex's built-in Ollama or LM
+Studio adapters, or an explicitly configured Codex `model_provider`. Keeping
+Codex as the runtime preserves the agent tool loop and artifacts; a bare HTTP
+chat-completions backend would not. The supplied OSS profiles disable search
+and take the conservative path when an external claim cannot be verified.
+Fetching a known URL is direct retrieval, not search or source discovery.
+
+Credentials are scoped to a per-problem sandbox, not to an individual role.
+The runtime therefore rejects configurations that mix an external provider
+with Claude, Codex cloud, or another external provider by default. The
+`_security.allow_mixed_provider_credentials` escape hatch requires an explicit
+acknowledgement that every role can access every credential in that run.
+External-provider host execution is also rejected by default because an
+agent's shell tools can inspect host-readable files and environment values.
+`configs/unsafe_host_provider.yaml` is the explicit development-only opt-in;
+Docker remains the supported isolation boundary.
+
+Only the default Claude/Codex configuration and published traces are audited.
+All-OSS and custom-provider configurations can change both coverage and
+precision and must not be presented as reproductions of the published result.
 
 ## What a run leaves behind
 

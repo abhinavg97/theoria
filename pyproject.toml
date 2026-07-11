@@ -7,6 +7,12 @@ requires-python = ">=3.12"
 dependencies = [
     "pyyaml>=6.0",
     "datasets>=4.0",
+    "jsonschema>=4.21",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]
@@ -23,3 +29,6 @@ py-modules = [
     "export_problem",
     "cli",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

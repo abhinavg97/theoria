@@ -9,29 +9,35 @@ Authentication
 --------------
 Claude subscription auth lives in the macOS Keychain as "Claude Code-
 credentials". The container can't reach the Keychain, so we extract the
-OAuth JSON to a temp file (mode 0644 so the non-root `node` container user
-can read it; /tmp is host-only) and bind-mount it read-only at
-/home/node/.claude/.credentials.json (claude's plaintext fallback path).
+OAuth JSON to a private temp file, then stream it into the container's
+tmpfs-backed home as the non-root `node` user.
 
-Codex subscription auth is already on disk at ~/.codex/auth.json, so a
-plain bind-mount of ~/.codex suffices.
+Codex state is already on disk at ~/.codex. Each problem receives a
+writable copy of the small subset of state files the CLI needs. OSS
+providers can use the same writable state directory without copying
+cloud authentication into the container.
 
 Hardening
 ---------
 Container runs with --cap-drop=ALL, --security-opt=no-new-privileges,
---pids-limit, memory/cpu caps, and credential mounts as :ro. This is
-reasonable for research-grade isolation without going to gVisor.
+--pids-limit, memory/cpu caps, and a private ephemeral home. This is reasonable
+for research-grade isolation without going to gVisor.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_IMAGE = "theoria-sandbox:latest"
 
@@ -46,11 +52,20 @@ _CODEX_STATE_FILES = (
     ".codex-global-state.json",
 )
 
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SENSITIVE_ENV_MARKERS = (
+    "API_KEY",
+    "AUTH",
+    "CREDENTIAL",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+)
+
 
 def refresh_claude_credentials() -> str | None:
     """Extract the Claude OAuth token from the macOS Keychain to a
-    temp file. Returns the path (mode 0644, so the non-root container user
-    can read it; /tmp is host-only) or None if we can't get it (not on
+    private temp file. Returns the path or None if we can't get it (not on
     macOS, not logged in, security CLI missing)."""
     try:
         r = subprocess.run(
@@ -67,11 +82,7 @@ def refresh_claude_credentials() -> str | None:
     try:
         with os.fdopen(fd, "w") as f:
             f.write(r.stdout)
-        # 0644 (world-readable) so the non-root container user (UID 1000)
-        # can read the file. The file contains an OAuth access token, so
-        # we rely on /tmp being host-only-readable rather than mode bits
-        # for secrecy. On shared hosts, switch to a UID-matching scheme.
-        os.chmod(path, 0o644)
+        os.chmod(path, 0o600)
     except Exception:
         try:
             os.unlink(path)
@@ -82,18 +93,17 @@ def refresh_claude_credentials() -> str | None:
 
 
 def prepare_claude_config(retries: int = 5, retry_delay: float = 0.2) -> str | None:
-    """Snapshot ~/.claude.json to a temp file the container can mount
+    """Snapshot ~/.claude.json for private transfer into the container
     without racing the host.
 
     The host may be actively running Claude Code (including the one
     running this pipeline), which writes ~/.claude.json periodically
-    via atomic rename. If the container mounts the host file directly
-    :ro, a concurrent read while the file is mid-rewrite yields a
-    corrupted-looking JSON (we've observed "Unterminated string" errors
-    at this layer). Taking a snapshot + validating + retrying avoids
+    via atomic rename. A concurrent read while the file is mid-rewrite can
+    yield corrupted-looking JSON (we've observed "Unterminated string"
+    errors at this layer). Taking a snapshot, validating, and retrying avoids
     that race entirely.
 
-    Returns the tempfile path (mode 0644) or None if we can't get a
+    Returns the private tempfile path or None if we can't get a
     readable + parseable snapshot after `retries` attempts.
     """
     src = Path(os.path.expanduser("~/.claude.json"))
@@ -104,9 +114,10 @@ def prepare_claude_config(retries: int = 5, retry_delay: float = 0.2) -> str | N
     last_err: Exception | None = None
     for _ in range(max(1, retries)):
         try:
-            shutil.copy2(str(src), path)
-            # Container user (UID 1000) needs to read this.
-            os.chmod(path, 0o644)
+            snapshot = src.read_bytes()
+            with open(path, "wb") as f:
+                f.write(snapshot)
+            os.chmod(path, 0o600)
             with open(path) as f:
                 json.load(f)
             return path
@@ -132,10 +143,19 @@ def cleanup_claude_config(path: str | None) -> None:
         pass
 
 
-def prepare_codex_state_dir() -> str | None:
-    """Copy the minimum set of codex subscription state files into a
-    fresh tempdir so the container can bind-mount it writable without
-    risking host state pollution.
+def prepare_codex_state_dir(
+    *,
+    include_auth: bool = True,
+    copy_host_state: bool = True,
+    include_config: bool = False,
+) -> str:
+    """Create a writable, isolated Codex state directory for one problem.
+
+    When host state exists, copy only the minimum files Codex needs. Fully
+    OSS/custom-provider runs set ``copy_host_state=False`` so unrelated MCP
+    settings, headers, and credentials in the user's config never enter the
+    agent container. When ~/.codex is absent, return an empty writable
+    directory for later transfer into the container's private tmpfs home.
 
     Codex writes to ~/.codex during normal operation (trusted-project
     state in config.toml, new session rollouts, etc.). Mounting the
@@ -143,28 +163,82 @@ def prepare_codex_state_dir() -> str | None:
     leaks per-problem state back to the host. This gives each problem
     a fresh, isolated writable copy that's destroyed at cleanup time.
 
-    Returns a tempdir path, or None if ~/.codex doesn't exist.
+    Returns the newly-created tempdir path.
     """
     src = Path(os.path.expanduser("~/.codex"))
-    if not src.exists():
-        return None
     dst = tempfile.mkdtemp(prefix="theoria-codex-state-")
-    for name in _CODEX_STATE_FILES:
-        f = src / name
-        if f.exists():
-            shutil.copy2(f, Path(dst) / name)
-    # Container user (UID 1000) needs to read these; files inherit the
-    # host user's UID under macOS Docker Desktop. 0644 is safe.
+    if copy_host_state and src.is_dir():
+        for name in _CODEX_STATE_FILES:
+            if name == "auth.json" and not include_auth:
+                continue
+            if name == "config.toml" and not include_config:
+                continue
+            f = src / name
+            if f.is_file():
+                shutil.copy2(f, Path(dst) / name)
     try:
-        os.chmod(dst, 0o755)
+        os.chmod(dst, 0o700)
         for f in Path(dst).iterdir():
             try:
-                os.chmod(f, 0o644)
+                os.chmod(f, 0o600)
             except OSError:
                 pass
     except OSError:
         pass
     return dst
+
+
+def validate_provider_env_names(
+    names: list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    """Validate and deduplicate explicit host environment allowlist names."""
+    validated: list[str] = []
+    seen: set[str] = set()
+    for name in names or ():
+        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"Invalid provider environment variable name: {name!r}")
+        if name not in seen:
+            validated.append(name)
+            seen.add(name)
+    return validated
+
+
+def redact_container_inspect(
+    inspect_data: dict,
+    *,
+    provider_env_names: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Return a copy of ``docker inspect`` with credential env values redacted.
+
+    Docker expands ``-e NAME`` before storing the container config, so the
+    otherwise-useful inspection artifact would contain provider secrets. We
+    retain environment variable names for reproducibility and replace values
+    for every explicitly-forwarded provider variable and common secret names.
+    """
+    redacted = deepcopy(inspect_data)
+    explicit = set(validate_provider_env_names(provider_env_names))
+    config = redacted.get("Config")
+    if not isinstance(config, dict):
+        return redacted
+    env = config.get("Env")
+    if not isinstance(env, list):
+        return redacted
+
+    safe_env: list = []
+    for entry in env:
+        if not isinstance(entry, str) or "=" not in entry:
+            safe_env.append(entry)
+            continue
+        name, value = entry.split("=", 1)
+        upper_name = name.upper()
+        is_sensitive = name in explicit or any(
+            marker in upper_name for marker in _SENSITIVE_ENV_MARKERS
+        )
+        safe_env.append(
+            f"{name}=<redacted>" if is_sensitive else f"{name}={value}"
+        )
+    config["Env"] = safe_env
+    return redacted
 
 
 def cleanup_credentials(path: str | None) -> None:
@@ -208,6 +282,69 @@ def image_digest(image: str = DEFAULT_IMAGE) -> str | None:
     return digest or None
 
 
+def _write_container_file(container_id: str, source: str, destination: str) -> None:
+    """Copy one private host snapshot through stdin as the container user."""
+    data = Path(source).read_bytes()
+    parent = str(Path(destination).parent)
+    command = (
+        "umask 077; "
+        f"mkdir -p {shlex.quote(parent)}; "
+        f"cat > {shlex.quote(destination)}"
+    )
+    result = subprocess.run(
+        ["docker", "exec", "-i", container_id, "sh", "-c", command],
+        input=data,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to initialize private container state at {destination}: "
+            f"{result.stderr.decode(errors='replace')[:300]}"
+        )
+
+
+def _initialize_container_home(
+    container_id: str,
+    *,
+    claude_creds_path: str | None,
+    claude_config_path: str | None,
+    codex_state_dir: str | None,
+) -> None:
+    """Populate the container's tmpfs-backed home with private CLI state."""
+    result = subprocess.run(
+        [
+            "docker", "exec", container_id, "sh", "-c",
+            "umask 077; mkdir -p /home/node/.claude /home/node/.codex "
+            "/home/node/.local",
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to initialize private container home: "
+            + result.stderr.decode(errors="replace")[:300]
+        )
+
+    if claude_creds_path:
+        _write_container_file(
+            container_id,
+            claude_creds_path,
+            "/home/node/.claude/.credentials.json",
+        )
+    if claude_config_path:
+        _write_container_file(
+            container_id, claude_config_path, "/home/node/.claude.json",
+        )
+    if codex_state_dir:
+        for source in sorted(Path(codex_state_dir).iterdir()):
+            if source.is_file() and not source.is_symlink():
+                _write_container_file(
+                    container_id, str(source), f"/home/node/.codex/{source.name}",
+                )
+
+
 def start_sandbox(
     pid: str,
     run_id: str,
@@ -216,6 +353,10 @@ def start_sandbox(
     claude_creds_path: str | None = None,
     claude_config_path: str | None = None,
     codex_state_dir: str | None = None,
+    enable_claude: bool = True,
+    enable_codex: bool = True,
+    provider_env_names: list[str] | tuple[str, ...] | None = None,
+    add_host_gateway: bool = False,
     workspace_host_path: str | None = None,
     memory: str = "10g",
     cpus: str = "2",
@@ -226,53 +367,12 @@ def start_sandbox(
 
     Auto-removes on stop thanks to --rm.
     """
-    home = os.path.expanduser("~")
+    forwarded_env_names = validate_provider_env_names(provider_env_names)
 
-    # We run as the `node` user inside the container (UID 1000). Claude
-    # refuses --dangerously-skip-permissions under root, and Anthropic's
-    # own devcontainer uses the same non-root pattern.
-    #
-    # IMPORTANT: mount only the specific auth files, NOT the ~/.claude
-    # directory as a whole. Claude's Bash tool writes session state
-    # under .claude/session-env/..., which would fail on a :ro mount.
-    # Letting the container create its own .claude/ in the ephemeral FS
-    # avoids that class of failure entirely.
+    # Credentials are copied into a private tmpfs home after startup. This
+    # avoids world-readable host snapshots and gives both CLIs writable state
+    # without persisting it beyond the per-problem container.
     mounts: list[str] = []
-    # Codex needs to write config.toml (trusted-project state) during
-    # exec, so we give it a per-problem writable tempdir copy of the
-    # host's minimal subscription state rather than mounting ~/.codex
-    # directly. Falls back to the host dir :ro if no tempdir was
-    # prepared (smoke tests, dev).
-    if codex_state_dir:
-        mounts += ["-v", f"{codex_state_dir}:/home/node/.codex:rw"]
-    else:
-        mounts += ["-v", f"{home}/.codex:/home/node/.codex:ro"]
-
-    if claude_creds_path:
-        # Claude's plaintext OAuth fallback. Extracted from Keychain by
-        # refresh_claude_credentials() and chmod'd 0644 so the non-root
-        # container user can read it.
-        mounts += [
-            "-v", f"{claude_creds_path}:/home/node/.claude/.credentials.json:ro",
-        ]
-
-    # ~/.claude.json holds feature flags (cachedGrowthBookFeatures) that
-    # gate behavior including --json-schema honoring. Without it claude
-    # silently returns unstructured text even when a schema is passed.
-    #
-    # We mount a SNAPSHOT of the host file, not the host file directly.
-    # Claude Code's writes to .claude.json are not always atomic (see
-    # upstream issues #29051, #29217, #29250); a concurrent container
-    # read observing a mid-write state gets "Unterminated string in
-    # JSON" and refuses to proceed. prepare_claude_config() does a
-    # validated snapshot + retry at run start to sidestep this.
-    if claude_config_path:
-        mounts += ["-v", f"{claude_config_path}:/home/node/.claude.json:ro"]
-    else:
-        # Fallback: mount the host file directly (smoke tests, dev).
-        claude_config = Path(home) / ".claude.json"
-        if claude_config.exists():
-            mounts += ["-v", f"{claude_config}:/home/node/.claude.json:ro"]
     if workspace_host_path:
         os.makedirs(workspace_host_path, exist_ok=True)
         mounts += ["-v", f"{workspace_host_path}:/workspace:rw"]
@@ -286,6 +386,18 @@ def start_sandbox(
         f"--cpus={cpus}",
     ]
 
+    # Passing ``-e NAME`` (without ``=value``) makes Docker copy the value
+    # from this process while keeping secrets out of the docker CLI argv.
+    # Missing optional variables are not forwarded.
+    provider_env_args: list[str] = []
+    for name in forwarded_env_names:
+        if name in os.environ:
+            provider_env_args += ["-e", name]
+
+    network_args: list[str] = []
+    if add_host_gateway and sys.platform.startswith("linux"):
+        network_args = ["--add-host=host.docker.internal:host-gateway"]
+
     # Container name helps operators see what's running with `docker ps`.
     # Docker name regex is [a-zA-Z0-9][a-zA-Z0-9_.-]+ so we sanitize the
     # pid in case it has characters Docker rejects.
@@ -295,9 +407,12 @@ def start_sandbox(
     cmd = [
         "docker", "run", "-d", "--rm",
         "--name", name,
+        *network_args,
+        "--tmpfs", "/home/node:rw,exec,nosuid,size=512m,uid=1000,gid=1000,mode=0700",
         *mounts,
         *hardening,
-        "-e", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=120000",
+        *(["-e", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=120000"] if enable_claude else []),
+        *provider_env_args,
         "--workdir", "/workspace",
         image,
         "sleep", "infinity",
@@ -311,6 +426,16 @@ def start_sandbox(
     container_id = r.stdout.strip()
     if not container_id:
         raise RuntimeError("docker run returned empty container id")
+    try:
+        _initialize_container_home(
+            container_id,
+            claude_creds_path=claude_creds_path if enable_claude else None,
+            claude_config_path=claude_config_path if enable_claude else None,
+            codex_state_dir=codex_state_dir if enable_codex else None,
+        )
+    except Exception:
+        stop_sandbox(container_id)
+        raise
     return container_id
 
 
@@ -338,25 +463,92 @@ def container_tool_versions(image: str = DEFAULT_IMAGE) -> dict:
 
     Returns a dict with one string per tool (or None on failure).
     """
-    def _one(argv: list[str]) -> str | None:
-        try:
-            r = subprocess.run(
-                ["docker", "run", "--rm", "--entrypoint", argv[0], image, *argv[1:]],
-                capture_output=True, text=True, timeout=30,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            return None
-        if r.returncode != 0:
-            return None
-        return (r.stdout or r.stderr).strip()
-
     return {
-        "claude": _one(["claude", "--version"]),
-        "codex": _one(["codex", "--version"]),
-        "python3": _one(["python3", "--version"]),
-        "pari_gp": _one(["gp", "--version-short"]),
-        "node": _one(["node", "--version"]),
+        "claude": command_in_image(image, ["claude", "--version"]),
+        "codex": command_in_image(image, ["codex", "--version"]),
+        "python3": command_in_image(image, ["python3", "--version"]),
+        "pari_gp": command_in_image(image, ["gp", "--version-short"]),
+        "node": command_in_image(image, ["node", "--version"]),
     }
+
+
+def command_in_image(
+    image: str, argv: list[str], *, extra_docker_args: list[str] | None = None,
+) -> str | None:
+    """Run one non-interactive command in an image and return its output."""
+    if not argv:
+        raise ValueError("argv must not be empty")
+    try:
+        r = subprocess.run(
+            [
+                "docker", "run", "--rm", *(extra_docker_args or []),
+                "--entrypoint", argv[0], image, *argv[1:],
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or r.stderr).strip()
+
+
+def codex_oss_capabilities_in_image(image: str = DEFAULT_IMAGE) -> dict:
+    """Inspect the selected image's Codex OSS command-line capabilities."""
+    output = command_in_image(image, ["codex", "exec", "--help"])
+    return {
+        "available": output is not None,
+        "oss": bool(output and "--oss" in output),
+        "local_provider": bool(output and "--local-provider" in output),
+        "output_schema": bool(output and "--output-schema" in output),
+    }
+
+
+def endpoint_reachable_from_image(
+    image: str, endpoint: str, *, add_host_gateway: bool = False,
+) -> bool:
+    """Probe a provider's /models route from the selected sandbox image."""
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+
+    hostname = parsed.hostname
+    original_hostname = hostname.lower()
+    loopback = original_hostname in {
+        "localhost", "127.0.0.1", "0.0.0.0", "::1",
+    }
+    needs_gateway = loopback or original_hostname == "host.docker.internal"
+    if loopback:
+        hostname = "host.docker.internal"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    base_url = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    target = base_url.rstrip("/") + "/models"
+
+    docker_args = []
+    if add_host_gateway and needs_gateway and sys.platform.startswith("linux"):
+        docker_args = ["--add-host=host.docker.internal:host-gateway"]
+    output = command_in_image(
+        image,
+        [
+            "curl", "--silent", "--show-error", "--output", "/dev/null",
+            "--write-out", "%{http_code}", "--max-time", "5", target,
+        ],
+        extra_docker_args=docker_args,
+    )
+    return bool(output and output.isdigit() and output != "000")
 
 
 def pip_freeze_in_container(container_id: str) -> str | None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 import pipeline
 import sandbox as sbx
@@ -72,6 +74,345 @@ def _safe_git_state() -> dict:
     return out
 
 
+_SECRET_CONFIG_KEY_PARTS = (
+    "api_key",
+    "access_token",
+    "auth_token",
+    "bearer_token",
+    "client_secret",
+    "credential",
+    "password",
+    "private_key",
+    "provider_token",
+    "authorization",
+    "access_key",
+    "secret_key",
+)
+
+_SECRET_CONFIG_KEY_SEGMENTS = {
+    "authorization", "key", "password", "secret", "token",
+}
+
+_NON_SECRET_METADATA_KEYS = {
+    "allow_external_provider_host_access",
+    "allow_mixed_provider_credentials",
+    "claude_credentials",
+    "credential_domains",
+    "mixed_provider_credentials",
+}
+
+
+def _sanitize_endpoint(value: str) -> str:
+    """Remove URL credentials, query parameters, and fragments for metadata."""
+    try:
+        parsed = urlsplit(value)
+    except (TypeError, ValueError):
+        return "<invalid endpoint>"
+    if not parsed.scheme or not parsed.netloc:
+        return "<invalid endpoint>"
+
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ""
+    query = "<redacted>" if parsed.query else ""
+    return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, query, ""))
+
+
+def _is_env_reference_key(key: str) -> bool:
+    lower = key.lower()
+    return (
+        lower == "provider_env"
+        or lower.endswith("_env")
+        or lower.endswith("_env_var")
+        or lower.endswith("_env_name")
+        or lower.endswith(".env_key")
+    )
+
+
+def _sanitize_for_metadata(value, *, key: str = ""):
+    """Deep-copy config/runtime data while removing likely secret values."""
+    lower_key = key.lower()
+    key_segments = set(re.split(r"[._-]", lower_key))
+    if (
+        key
+        and lower_key not in _NON_SECRET_METADATA_KEYS
+        and not _is_env_reference_key(key)
+        and (
+        any(marker in lower_key for marker in _SECRET_CONFIG_KEY_PARTS)
+        or bool(key_segments & _SECRET_CONFIG_KEY_SEGMENTS)
+        )
+    ):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_for_metadata(v, key=str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_for_metadata(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_metadata(v) for v in value]
+    if isinstance(value, str) and (
+        lower_key.endswith("base_url")
+        or lower_key.endswith("endpoint")
+        or lower_key.endswith(".base_url")
+    ):
+        return _sanitize_endpoint(value)
+    return value
+
+
+def _role_settings(config: dict):
+    """Yield effective role settings, excluding shared top-level blocks."""
+    for role, settings in config.items():
+        if str(role).startswith("_") or not isinstance(settings, dict):
+            continue
+        yield str(role), settings
+
+
+def _codex_model_provider(settings: dict) -> str | None:
+    local_provider = settings.get("local_provider")
+    if isinstance(local_provider, str) and local_provider:
+        return local_provider
+    codex_config = settings.get("codex_config")
+    if not isinstance(codex_config, dict):
+        return None
+    for key, value in codex_config.items():
+        if str(key).split(".")[-1] == "model_provider" and isinstance(value, str):
+            return value
+    return None
+
+
+def _uses_external_codex_provider(settings: dict) -> bool:
+    provider = _codex_model_provider(settings)
+    configured_env = settings.get("provider_env")
+    has_provider_env = bool(configured_env)
+    has_custom_endpoint = any(
+        True for _ in _codex_config_endpoints(settings.get("codex_config", {}))
+    )
+    return (
+        bool(settings.get("oss", False))
+        or (provider is not None and provider.lower() != "openai")
+        or has_provider_env
+        or has_custom_endpoint
+    )
+
+
+def _external_provider_domain(
+    *,
+    provider: str | None,
+    endpoints: list[str],
+    provider_env: list[str],
+    credential_refs: list[str],
+) -> str:
+    """Return a non-secret identity for one external provider trust domain."""
+    identity = json.dumps(
+        {
+            "provider": provider or "external",
+            "endpoints": sorted(set(endpoints)),
+            "provider_env": sorted(set(provider_env)),
+            "credential_refs": sorted(set(credential_refs)),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:12]
+    return f"codex:{provider or 'external'}:{fingerprint}"
+
+
+def _codex_config_endpoints(value, *, key: str = ""):
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            yield from _codex_config_endpoints(child_value, key=str(child_key))
+    elif isinstance(value, str) and key.split(".")[-1] == "base_url":
+        yield value
+
+
+def _codex_config_credential_refs(value, *, key: str = ""):
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            yield from _codex_config_credential_refs(
+                child_value, key=str(child_key),
+            )
+    elif isinstance(value, str) and key.lower().endswith((
+        ".env_key", ".env_var", ".bearer_token_env_var",
+    )):
+        yield value
+
+
+def _endpoint_needs_host_gateway(endpoint: str) -> bool:
+    try:
+        hostname = (urlsplit(endpoint).hostname or "").lower()
+    except (TypeError, ValueError):
+        return False
+    return hostname in {
+        "localhost", "127.0.0.1", "0.0.0.0", "::1",
+        "host.docker.internal",
+    }
+
+
+def _provider_env_names(config: dict) -> list[str]:
+    names: list[str] = []
+    has_local_oss = False
+    for _, settings in _role_settings(config):
+        if settings.get("backend", "claude") != "codex":
+            continue
+        has_local_oss = has_local_oss or bool(settings.get("oss", False))
+        configured = settings.get("provider_env", [])
+        if isinstance(configured, str):
+            configured = [configured]
+        if configured is None:
+            configured = []
+        if not isinstance(configured, (list, tuple)):
+            raise ValueError("provider_env must be a list of environment variable names")
+        names.extend(configured)
+    # CODEX_OSS_BASE_URL is the standard process-level override. Preserve its
+    # value only in the environment; metadata records the name and presence.
+    if has_local_oss and "CODEX_OSS_BASE_URL" in os.environ:
+        names.append("CODEX_OSS_BASE_URL")
+    return sbx.validate_provider_env_names(names)
+
+
+def resolve_runtime(config: dict | None = None) -> dict:
+    """Resolve active backends and provider requirements from merged config."""
+    resolved_config = CONFIG if config is None else config
+    roles: dict[str, dict] = {}
+    needs_claude = False
+    needs_codex = False
+    needs_codex_cloud_auth = False
+    needs_host_gateway = False
+    credential_domains: set[str] = set()
+
+    env_override = os.environ.get("CODEX_OSS_BASE_URL")
+    for role, settings in _role_settings(resolved_config):
+        backend = settings.get("backend", "claude")
+        role_runtime: dict = {
+            "backend": backend,
+            "model": settings.get("model"),
+            "effort": settings.get("effort"),
+        }
+        if backend == "claude":
+            needs_claude = True
+            credential_domains.add("claude")
+        elif backend == "codex":
+            needs_codex = True
+            oss = bool(settings.get("oss", False))
+            provider = _codex_model_provider(settings)
+            endpoint = settings.get("oss_base_url")
+            endpoints = []
+            if isinstance(endpoint, str) and endpoint:
+                endpoints.append(endpoint)
+                role_runtime["endpoint"] = _sanitize_endpoint(endpoint)
+            config_endpoints = list(
+                _codex_config_endpoints(settings.get("codex_config", {}))
+            )
+            endpoints.extend(config_endpoints)
+            if "endpoint" not in role_runtime and config_endpoints:
+                role_runtime["endpoint"] = _sanitize_endpoint(config_endpoints[0])
+            if env_override and oss:
+                endpoints.append(env_override)
+            if any(_endpoint_needs_host_gateway(item) for item in endpoints):
+                needs_host_gateway = True
+            if oss and settings.get("local_provider") and not endpoints:
+                needs_host_gateway = True
+
+            configured_env = settings.get("provider_env", [])
+            if isinstance(configured_env, str):
+                configured_env = [configured_env]
+            elif configured_env is None:
+                configured_env = []
+            elif not isinstance(configured_env, (list, tuple)):
+                raise ValueError(
+                    "provider_env must be a list of environment variable names"
+                )
+            credential_refs = list(_codex_config_credential_refs(
+                settings.get("codex_config", {}),
+            ))
+            missing_credential_refs = sorted(
+                set(credential_refs) - set(configured_env)
+            )
+            if missing_credential_refs:
+                raise ValueError(
+                    "Codex provider credential environment references must "
+                    "also appear in provider_env: "
+                    + ", ".join(missing_credential_refs)
+                )
+
+            external_provider = _uses_external_codex_provider(settings)
+            if not external_provider:
+                needs_codex_cloud_auth = True
+                credential_domains.add("codex:openai")
+            else:
+                credential_domains.add(_external_provider_domain(
+                    provider=provider,
+                    endpoints=(
+                        [env_override]
+                        if env_override and oss
+                        else endpoints
+                    ),
+                    provider_env=list(configured_env),
+                    credential_refs=credential_refs,
+                ))
+
+            role_runtime.update({
+                "oss": oss,
+                "model_provider": provider or "openai",
+                "search": settings.get("search"),
+                "provider_env": list(configured_env),
+            })
+        roles[role] = role_runtime
+
+    provider_env_names = _provider_env_names(resolved_config)
+    security = resolved_config.get("_security") or {}
+    if not isinstance(security, dict):
+        raise ValueError("_security must be a mapping")
+    allow_mixed_credentials = security.get(
+        "allow_mixed_provider_credentials", False,
+    )
+    if not isinstance(allow_mixed_credentials, bool):
+        raise ValueError(
+            "_security.allow_mixed_provider_credentials must be a boolean"
+        )
+    allow_external_host = security.get(
+        "allow_external_provider_host_access", False,
+    )
+    if not isinstance(allow_external_host, bool):
+        raise ValueError(
+            "_security.allow_external_provider_host_access must be a boolean"
+        )
+    external_domains = {
+        domain for domain in credential_domains
+        if domain not in {"claude", "codex:openai"}
+    }
+    mixed_provider_credentials = bool(
+        external_domains and len(credential_domains) > 1
+    )
+    return {
+        "active_backends": sorted({r["backend"] for r in roles.values()}),
+        "roles": roles,
+        "requirements": {
+            "claude_credentials": needs_claude,
+            "codex_state": needs_codex,
+            "codex_cloud_auth": needs_codex_cloud_auth,
+            "linux_host_gateway": (
+                needs_host_gateway and sys.platform.startswith("linux")
+            ),
+            "mixed_provider_credentials": mixed_provider_credentials,
+            "allow_mixed_provider_credentials": allow_mixed_credentials,
+            "external_provider": bool(external_domains),
+            "allow_external_provider_host_access": allow_external_host,
+        },
+        "credential_domains": sorted(credential_domains),
+        "provider_env": [
+            {"name": name, "present": name in os.environ}
+            for name in provider_env_names
+        ],
+    }
+
+
 def make_artifact_root(save_path: str) -> str:
     """Create runs/artifacts/<run_id>/ and write meta.json.
 
@@ -90,6 +431,7 @@ def make_artifact_root(save_path: str) -> str:
     os.makedirs(root, exist_ok=True)
 
     meta_path = os.path.join(root, "meta.json")
+    runtime = resolve_runtime()
     new_meta = {
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -98,7 +440,8 @@ def make_artifact_root(save_path: str) -> str:
         "hostname": __import__("socket").gethostname(),
         "python_version": sys.version,
         "save_path": save_path,
-        "config": dict(CONFIG),
+        "config": _sanitize_for_metadata(CONFIG),
+        "runtime": _sanitize_for_metadata(runtime),
         "cli_versions": {
             "claude": _safe_version("claude"),
             "codex": _safe_version("codex"),
@@ -118,6 +461,7 @@ def make_artifact_root(save_path: str) -> str:
                 "argv": new_meta["argv"],
                 "cli_versions": new_meta["cli_versions"],
                 "git": new_meta["git"],
+                "runtime": new_meta["runtime"],
             })
             existing["resumes"] = resumes
             with open(meta_path, "w") as f:
@@ -166,9 +510,9 @@ def apply_args(args) -> None:
     """Load config and apply the backend + --codex-model overrides from the
     args namespace (cli.py sets args.backend to "codex" — the audited setup).
 
-    The formalizer always stays on claude — it needs session resume +
-    structured output, which only claude supports together. Override with
-    an explicit config that sets formalizer.backend if you really want.
+    The CLI-wide backend override does not overwrite the formalizer. An
+    explicit config can still select Codex, which uses the pipeline's
+    stateless formalizer path.
 
     --codex-model is applied after the backend, so it overrides the model
     for any role currently on codex (regardless of how it got there).
@@ -226,6 +570,11 @@ async def run_one(
     run_id: str | None = None,
     claude_creds_path: str | None = None,
     claude_config_path: str | None = None,
+    enable_claude: bool = True,
+    enable_codex: bool = True,
+    codex_cloud_auth: bool = True,
+    provider_env_names: list[str] | tuple[str, ...] | None = None,
+    add_host_gateway: bool = False,
     use_docker: bool = False,
     sandbox_image: str = sbx.DEFAULT_IMAGE,
     sandbox_image_digest: str | None = None,
@@ -290,7 +639,12 @@ async def run_one(
     # escaping run_one and aborting the whole batch.
     try:
         if use_docker:
-            codex_state_dir = sbx.prepare_codex_state_dir()
+            if enable_codex:
+                codex_state_dir = sbx.prepare_codex_state_dir(
+                    include_auth=codex_cloud_auth,
+                    copy_host_state=codex_cloud_auth,
+                    include_config=False,
+                )
             container_id = sbx.start_sandbox(
                 pid=pid,
                 run_id=run_id or "run",
@@ -298,6 +652,10 @@ async def run_one(
                 claude_creds_path=claude_creds_path,
                 claude_config_path=claude_config_path,
                 codex_state_dir=codex_state_dir,
+                enable_claude=enable_claude,
+                enable_codex=enable_codex,
+                provider_env_names=provider_env_names,
+                add_host_gateway=add_host_gateway,
             )
             print(f"[{pid}] sandbox container: {container_id[:12]}")
             sandbox_token = sandbox_container.set(container_id)
@@ -364,6 +722,10 @@ async def run_one(
                     pass
             container_inspect = sbx.inspect_container(container_id)
             if container_inspect is not None:
+                container_inspect = sbx.redact_container_inspect(
+                    container_inspect,
+                    provider_env_names=provider_env_names,
+                )
                 try:
                     with open(
                         os.path.join(prob_art_dir, "docker_inspect.json"), "w",
@@ -481,53 +843,95 @@ async def run_problems(
     through to each run_one so every LLM call writes full artifacts.
 
     If apply_args() recorded --docker, also:
-      - extracts claude subscription creds from the macOS Keychain
-        into a tempfile so the sandbox containers can mount it;
+      - extracts Claude subscription credentials only when an active role
+        uses the Claude backend;
+      - prepares isolated writable Codex state only when Codex is active;
       - looks up the local sandbox image digest for call metadata;
       - tells each run_one to spin up its own per-problem container.
     """
+    runtime = resolve_runtime()
+    requirements = runtime["requirements"]
+    if (
+        requirements["mixed_provider_credentials"]
+        and not requirements["allow_mixed_provider_credentials"]
+    ):
+        raise RuntimeError(
+            "External model providers cannot share a run with Claude, Codex "
+            "cloud, or another external provider because every role can access "
+            "the run's credentials. Use one provider trust domain, or set "
+            "_security.allow_mixed_provider_credentials: true only after "
+            "accepting that exposure."
+        )
+    missing_provider_env = [
+        item["name"] for item in runtime["provider_env"] if not item["present"]
+    ]
+    if missing_provider_env:
+        raise RuntimeError(
+            "Required provider environment variable(s) are not set: "
+            + ", ".join(missing_provider_env)
+        )
+    use_docker = _args_ref.get("docker", False)
+    if (
+        requirements["external_provider"]
+        and not use_docker
+        and not requirements["allow_external_provider_host_access"]
+    ):
+        raise RuntimeError(
+            "External providers can inspect host files and environment values "
+            "when Docker is disabled. Use Docker, or explicitly accept that "
+            "access with _security.allow_external_provider_host_access: true."
+        )
     artifact_root = make_artifact_root(save_path)
     print(f"Artifact root: {artifact_root}")
 
-    use_docker = _args_ref.get("docker", False)
     sandbox_image = _args_ref.get("image") or sbx.DEFAULT_IMAGE
     claude_creds_path: str | None = None
     claude_config_path: str | None = None
     image_digest: str | None = None
+    enable_claude = bool(requirements["claude_credentials"])
+    enable_codex = bool(requirements["codex_state"])
+    codex_cloud_auth = bool(requirements["codex_cloud_auth"])
+    add_host_gateway = bool(requirements["linux_host_gateway"])
+    provider_env_names = [item["name"] for item in runtime["provider_env"]]
     run_id = os.path.basename(save_path)
     if run_id.endswith(".json"):
         run_id = run_id[:-5]
 
     if use_docker:
-        claude_creds_path = sbx.refresh_claude_credentials()
-        claude_config_path = sbx.prepare_claude_config()
         image_digest = sbx.image_digest(sandbox_image)
-        print(f"Docker mode: image={sandbox_image} "
-              f"image_digest={image_digest} "
-              f"creds={'present' if claude_creds_path else 'MISSING'} "
-              f"config_snapshot={'present' if claude_config_path else 'MISSING'}")
-        if claude_creds_path is None:
-            raise RuntimeError(
-                "Docker mode requested but could not read Claude credentials "
-                "from the macOS Keychain (not logged in, or not on macOS). "
-                "The formalizer needs them — without them a run would burn a "
-                "solver call and then fail. Run `claude` and sign in, then "
-                "retry (`theoria doctor` checks this)."
-            )
         if image_digest is None:
             raise RuntimeError(
                 f"Docker mode requested but image {sandbox_image} is "
                 f"not available locally. Build it first with the "
                 f"appropriate Dockerfile (see sandbox/ or sandbox-sage/)."
             )
-        if claude_config_path is None:
-            raise RuntimeError(
-                "Docker mode requested but could not snapshot "
-                "~/.claude.json (file missing or repeatedly corrupted "
-                "mid-snapshot). Claude calls would fail inside the "
-                "container without it. Pause other Claude Code instances "
-                "if you have them running and retry."
-            )
+        if enable_claude:
+            claude_creds_path = sbx.refresh_claude_credentials()
+            claude_config_path = sbx.prepare_claude_config()
+            if claude_creds_path is None or claude_config_path is None:
+                if claude_creds_path:
+                    sbx.cleanup_credentials(claude_creds_path)
+                    claude_creds_path = None
+                if claude_config_path:
+                    sbx.cleanup_claude_config(claude_config_path)
+                    claude_config_path = None
+                raise RuntimeError(
+                    "Docker mode has active Claude roles but could not prepare "
+                    "Claude subscription credentials and ~/.claude.json. Run "
+                    "`claude` and sign in on macOS, then retry (`theoria doctor` "
+                    "checks this). Fully Codex OSS configurations do not require "
+                    "Claude credentials."
+                )
+        env_status = ", ".join(
+            f"{item['name']}={'present' if item['present'] else 'missing'}"
+            for item in runtime["provider_env"]
+        ) or "none"
+        print(
+            f"Docker mode: image={sandbox_image} "
+            f"image_digest={image_digest} backends={runtime['active_backends']} "
+            f"claude_auth={'present' if claude_creds_path else 'not-required'} "
+            f"provider_env={env_status}"
+        )
         # Gap-close #1 + #4: record the image digest and the tool
         # versions as they exist INSIDE the container. These drift
         # from the host over time — for a paper, the container
@@ -541,9 +945,16 @@ async def run_problems(
                 "image_digest": image_digest,
                 "container_tool_versions": container_versions,
                 "claude_creds_source": (
-                    "macOS Keychain → plaintext temp mount"
-                    if claude_creds_path else "none"
+                    "macOS Keychain -> private container tmpfs"
+                    if claude_creds_path else "not required"
                 ),
+                "codex_state": (
+                    "isolated writable container tmpfs"
+                    if enable_codex else "disabled"
+                ),
+                "codex_cloud_auth_required": codex_cloud_auth,
+                "provider_env": runtime["provider_env"],
+                "linux_host_gateway_requested": add_host_gateway,
             },
         })
 
@@ -559,6 +970,11 @@ async def run_problems(
                 run_id=run_id,
                 claude_creds_path=claude_creds_path,
                 claude_config_path=claude_config_path,
+                enable_claude=enable_claude,
+                enable_codex=enable_codex,
+                codex_cloud_auth=codex_cloud_auth,
+                provider_env_names=provider_env_names,
+                add_host_gateway=add_host_gateway,
                 use_docker=use_docker,
                 sandbox_image=sandbox_image,
                 sandbox_image_digest=image_digest,

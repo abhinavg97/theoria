@@ -13,8 +13,7 @@ One entry point for everything:
 Run commands (custom / hle) share one set of options. There is a single
 configuration — the audited HLE setup — and it is the default:
 
-    Codex backend    (every role runs on Codex except the formalizer,
-                      which always stays on Claude)
+    Codex backend    (every role runs on Codex except the Claude formalizer)
     --docker         (each problem in its own hardened container)
     --image theoria-sandbox-sage:latest   (the Sage math/science sandbox)
     default prompts  (configs/defaults.yaml)
@@ -28,10 +27,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import harness
@@ -103,8 +105,9 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
 def _resolve(args) -> None:
     """Apply the audited HLE setup, letting the remaining knobs (--image /
     --no-docker / --config / ...) override, then hand off to the harness."""
-    # The audited configuration is the only one: Codex on every role except
-    # the formalizer, which apply_args pins to Claude.
+    # The audited configuration uses Codex on every role except the
+    # formalizer. A config that explicitly rewires the formalizer survives
+    # apply_args because the global backend override intentionally skips it.
     backend, docker, image = "codex", True, SAGE_IMAGE
 
     if args.docker is not None:
@@ -231,11 +234,13 @@ def cmd_show(args) -> None:
 
 def cmd_grade(args) -> None:
     import grade
-    asyncio.run(grade.grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade.grade_run(
+        args.run_file, args.config, args.out, codex_model=args.codex_model,
+    ))
 
 
 def cmd_doctor(args) -> None:
-    """Check that everything needed to run is present."""
+    """Check only the dependencies required by the selected config."""
     ok = True
 
     def check(label, passed, hint=""):
@@ -257,7 +262,138 @@ def cmd_doctor(args) -> None:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    def is_external_codex_provider(settings):
+        return harness._uses_external_codex_provider(settings)
+
+    def provider_endpoint(settings):
+        if settings.get("oss"):
+            endpoint = os.environ.get("CODEX_OSS_BASE_URL")
+            if endpoint:
+                return endpoint
+        endpoint = settings.get("oss_base_url")
+        if endpoint:
+            return endpoint
+        codex_config = settings.get("codex_config") or {}
+        if not isinstance(codex_config, dict):
+            return None
+        provider = codex_config.get("model_provider")
+        if provider:
+            return codex_config.get(f"model_providers.{provider}.base_url")
+        return None
+
+    def endpoint_reachable(url):
+        """Probe an OpenAI-compatible endpoint without printing its URL."""
+        target = url.rstrip("/") + "/models"
+        try:
+            request = urllib.request.Request(target, method="GET")
+            with urllib.request.urlopen(request, timeout=5):
+                return True
+        except urllib.error.HTTPError:
+            # Authentication failures and other HTTP responses still prove
+            # that a server is listening at the configured endpoint.
+            return True
+        except (OSError, ValueError, urllib.error.URLError):
+            return False
+
     print("Theoria setup check\n")
+
+    try:
+        config = harness.load_config(args.config)
+    except Exception as exc:
+        sys.exit(f"Could not load doctor config: {exc}")
+
+    roles = {}
+    for role, raw_settings in config.items():
+        if role.startswith("_") or not isinstance(raw_settings, dict):
+            continue
+        settings = dict(raw_settings)
+        # Mirror the preset applied by harness.apply_args(): the CLI's global
+        # backend forces every non-formalizer role to Codex. Only an explicit
+        # formalizer backend in a stacked config survives that override.
+        if role == "formalizer":
+            settings.setdefault("backend", "claude")
+        else:
+            settings["backend"] = "codex"
+        if args.codex_model and settings["backend"] == "codex":
+            settings["model"] = args.codex_model
+        roles[role] = settings
+
+    backends = {settings["backend"] for settings in roles.values()}
+    unsupported = sorted(
+        str(backend) for backend in backends
+        if backend not in {"claude", "codex"}
+    )
+    check("configured backends are supported", not unsupported,
+          "unsupported backend(s): " + ", ".join(unsupported))
+
+    claude_roles = {
+        role: settings for role, settings in roles.items()
+        if settings["backend"] == "claude"
+    }
+    codex_roles = {
+        role: settings for role, settings in roles.items()
+        if settings["backend"] == "codex"
+    }
+    cloud_codex_roles = {
+        role: settings for role, settings in codex_roles.items()
+        if not is_external_codex_provider(settings)
+    }
+    provider_roles = {
+        role: settings for role, settings in codex_roles.items()
+        if is_external_codex_provider(settings)
+    }
+
+    effective_config = {
+        key: value for key, value in config.items()
+        if str(key).startswith("_")
+    }
+    effective_config.update(roles)
+    try:
+        runtime = harness.resolve_runtime(effective_config)
+    except ValueError as exc:
+        check("provider security configuration is valid", False, str(exc))
+    else:
+        requirements = runtime["requirements"]
+        mixed_credentials = requirements["mixed_provider_credentials"]
+        mixed_credentials_allowed = requirements[
+            "allow_mixed_provider_credentials"
+        ]
+        check(
+            "provider credential trust domains are isolated",
+            not mixed_credentials or mixed_credentials_allowed,
+            "use one external provider trust domain per run; only set "
+            "_security.allow_mixed_provider_credentials: true after accepting "
+            "that every role can access all run credentials",
+        )
+        if not args.docker and requirements["external_provider"]:
+            check(
+                "external provider host access is explicitly allowed",
+                requirements["allow_external_provider_host_access"],
+                "use Docker, or stack configs/unsafe_host_provider.yaml only "
+                "after accepting that the provider can inspect host files and "
+                "environment values",
+            )
+
+    if codex_roles:
+        invalid_codex_config = sorted(
+            role for role, settings in codex_roles.items()
+            if not isinstance(settings.get("codex_config", {}), dict)
+        )
+        check("Codex provider config is a mapping", not invalid_codex_config,
+              "fix codex_config for: " + ", ".join(invalid_codex_config))
+
+    local_oss_roles = {
+        role: settings for role, settings in codex_roles.items()
+        if settings.get("oss")
+    }
+    if local_oss_roles:
+        invalid_local_providers = sorted(
+            role for role, settings in local_oss_roles.items()
+            if settings.get("local_provider") not in {"ollama", "lmstudio"}
+        )
+        check("local OSS providers are supported", not invalid_local_providers,
+              "set local_provider to ollama or lmstudio for: "
+              + ", ".join(invalid_local_providers))
 
     check(f"Python {sys.version_info.major}.{sys.version_info.minor} (need ≥ 3.12)",
           sys.version_info >= (3, 12))
@@ -269,60 +405,178 @@ def cmd_doctor(args) -> None:
         check("datasets package (for HLE)", False,
               "pip install -e .  (installs datasets)")
 
-    cv = cli_version("claude")
-    check(f"claude CLI {('(' + cv + ')') if cv else ''}", cv is not None,
-          "install Claude Code and run `claude` to log in")
+    if claude_roles and not args.docker:
+        cv = cli_version("claude")
+        check(f"claude CLI {('(' + cv + ')') if cv else ''}", cv is not None,
+              "install Claude Code and run `claude` to log in")
 
-    cv = cli_version("codex")
-    check(f"codex CLI {('(' + cv + ')') if cv else ''}", cv is not None,
-          "install Codex and run `codex` to log in (runs the solver + judges)")
+    if codex_roles and not args.docker:
+        cv = cli_version("codex")
+        check(f"codex CLI {('(' + cv + ')') if cv else ''}", cv is not None,
+              "install the Codex CLI")
+        if cv is not None and provider_roles:
+            try:
+                help_result = subprocess.run(
+                    ["codex", "exec", "--help"], capture_output=True,
+                    text=True, timeout=10,
+                )
+                help_text = help_result.stdout or help_result.stderr
+            except (OSError, subprocess.TimeoutExpired):
+                help_text = ""
+            required_flags = {"--output-schema"}
+            if local_oss_roles:
+                required_flags.update({"--oss", "--local-provider"})
+            check(
+                "host Codex supports selected provider features",
+                all(flag in help_text for flag in required_flags),
+                "install a Codex release supporting "
+                + ", ".join(sorted(required_flags)),
+            )
 
     # Login state — this is the actual credential setup. Both are populated
     # by logging into the CLIs once; sandbox.py mounts them into the container.
-    if sys.platform == "darwin":
-        logged_in = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-w"],
-            capture_output=True,
-        ).returncode == 0
-        check("Claude logged in (macOS Keychain credential)", logged_in,
-              "run `claude` and sign in with your Claude subscription")
-    # Docker mode snapshots ~/.claude.json into the container and run_problems
-    # hard-fails if it's missing — surface it here instead of mid-run.
-    claude_config = (Path.home() / ".claude.json").exists()
-    check("Claude config (~/.claude.json — required for Docker runs)",
-          claude_config,
-          "run `claude` once to generate it (and pause other Claude Code "
-          "instances during a run to avoid a mid-snapshot race)")
-    codex_auth = (Path.home() / ".codex" / "auth.json").exists()
-    check("Codex logged in (~/.codex/auth.json)", codex_auth,
-          "run `codex` and sign in with your ChatGPT subscription")
-
-    docker_ok = shutil.which("docker") is not None
-    daemon_ok = False
-    if docker_ok:
-        try:
-            daemon_ok = subprocess.run(
-                ["docker", "info"], capture_output=True, timeout=15
+    if claude_roles:
+        if sys.platform == "darwin":
+            logged_in = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True,
             ).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            daemon_ok = False
-    check("Docker installed", docker_ok, "install Docker Desktop")
-    check("Docker daemon running", daemon_ok, "start Docker")
+            check("Claude logged in (macOS Keychain credential)", logged_in,
+                  "run `claude` and sign in with your Claude subscription")
+        else:
+            check("Claude subscription auth is available on this OS", False,
+                  "the current Claude subscription path requires macOS; "
+                  "use an all-Codex OSS config on other platforms")
+        if args.docker:
+            claude_config = (Path.home() / ".claude.json").exists()
+            check("Claude config (~/.claude.json, required for Docker)",
+                  claude_config,
+                  "run `claude` once to generate it (and pause other "
+                  "Claude Code instances during a run)")
 
-    # Use the SAME detection the run path uses (docker images -q), which
-    # works on containerd-backed daemons where `docker image inspect` fails
-    # for locally-built tags.
-    for img in (SAGE_IMAGE, STD_IMAGE):
-        present = bool(daemon_ok and sandbox.image_digest(img))
-        check(f"image {img}", present, f"theoria build  (builds {img})")
+    if cloud_codex_roles:
+        codex_auth = (Path.home() / ".codex" / "auth.json").exists()
+        check("Codex logged in (~/.codex/auth.json)", codex_auth,
+              "run `codex` and sign in with your ChatGPT subscription")
 
-    if sys.platform != "darwin":
-        print("\n  ! Note: the subscription auth path extracts Claude "
-              "credentials from the macOS Keychain, so it currently "
-              "requires macOS.")
+    env_name_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    if provider_roles:
+        invalid_provider_env = sorted(
+            role for role, settings in provider_roles.items()
+            if not isinstance(settings.get("provider_env", []), list)
+            or any(
+                not isinstance(name, str) or not env_name_pattern.fullmatch(name)
+                for name in (
+                    settings.get("provider_env")
+                    if isinstance(settings.get("provider_env", []), list)
+                    else []
+                )
+            )
+        )
+        check("provider_env contains environment-variable names",
+              not invalid_provider_env,
+              "fix provider_env for: " + ", ".join(invalid_provider_env))
+    required_env = sorted({
+        name
+        for settings in provider_roles.values()
+        for name in (
+            settings.get("provider_env")
+            if isinstance(settings.get("provider_env", []), list)
+            else []
+        )
+        if isinstance(name, str) and env_name_pattern.fullmatch(name)
+    })
+    for name in required_env:
+        check(f"provider environment variable {name}", bool(os.environ.get(name)),
+              f"set {name} in the environment before running Theoria")
 
-    print("\n" + ("All set — try `theoria hle 1`  or  `theoria custom \"What is 2+2?\"`."
+    placeholder_models = {
+        "CHANGE_ME", "YOUR_MODEL", "YOUR_MODEL_ID",
+        "REPLACE_WITH_MODEL", "REPLACE_WITH_OLLAMA_MODEL",
+    }
+    if provider_roles:
+        unresolved_models = sorted(
+            role for role, settings in provider_roles.items()
+            if not settings.get("model")
+            or str(settings["model"]).upper() in placeholder_models
+        )
+        check("OSS provider model is explicit", not unresolved_models,
+              "set each OSS role's model or pass --codex-model MODEL "
+              "(unresolved: " + ", ".join(unresolved_models) + ")")
+
+    if args.check_endpoint:
+        endpoint_groups = {}
+        for role, settings in provider_roles.items():
+            endpoint = provider_endpoint(settings)
+            if isinstance(endpoint, str) and endpoint:
+                provider = settings.get("local_provider") or (
+                    (settings.get("codex_config") or {}).get("model_provider")
+                ) or "custom"
+                endpoint_groups.setdefault((provider, endpoint), []).append(role)
+            else:
+                check(f"endpoint configured for provider role {role}", False,
+                      "set oss_base_url or CODEX_OSS_BASE_URL")
+        for (provider, endpoint), endpoint_roles in endpoint_groups.items():
+            reachable = (
+                sandbox.endpoint_reachable_from_image(
+                    args.image, endpoint, add_host_gateway=True,
+                )
+                if args.docker
+                else endpoint_reachable(endpoint)
+            )
+            check(f"{provider} endpoint reachable ({len(endpoint_roles)} role(s))",
+                  reachable,
+                  "start the provider server and verify its configured base URL")
+
+    daemon_ok = False
+    if args.docker:
+        docker_ok = shutil.which("docker") is not None
+        if docker_ok:
+            try:
+                daemon_ok = subprocess.run(
+                    ["docker", "info"], capture_output=True, timeout=15
+                ).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                daemon_ok = False
+        check("Docker installed", docker_ok, "install Docker Desktop")
+        check("Docker daemon running", daemon_ok, "start Docker")
+
+        # Use the SAME detection the run path uses (docker images -q), which
+        # works on containerd-backed daemons where `docker image inspect`
+        # fails for locally-built tags.
+        present = bool(daemon_ok and sandbox.image_digest(args.image))
+        check(f"image {args.image}", present,
+              f"theoria build  (or build/tag {args.image})")
+        if present:
+            if claude_roles:
+                version = sandbox.command_in_image(
+                    args.image, ["claude", "--version"],
+                )
+                check(
+                    f"container Claude CLI {('(' + version + ')') if version else ''}",
+                    version is not None,
+                    "rebuild the selected sandbox image",
+                )
+            if codex_roles:
+                version = sandbox.command_in_image(
+                    args.image, ["codex", "--version"],
+                )
+                check(
+                    f"container Codex CLI {('(' + version + ')') if version else ''}",
+                    version is not None,
+                    "rebuild the selected sandbox image",
+                )
+            if provider_roles:
+                capabilities = sandbox.codex_oss_capabilities_in_image(args.image)
+                check(
+                    "container Codex supports OSS providers and schemas",
+                    all(capabilities.values()),
+                    "rebuild with a Codex release supporting --oss, "
+                    "--local-provider, and --output-schema",
+                )
+
+    print("\n" + ("All selected checks passed."
                   if ok else "Some checks failed (see hints above)."))
     sys.exit(0 if ok else 1)
 
@@ -389,10 +643,32 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("run_file", help="Path to a run JSON.")
     g.add_argument("--config", action="append", default=None,
                    help="Grader config YAML (default: configs/audit_grader.yaml).")
+    g.add_argument("--codex-model", default=None,
+                   help="Override the model for a Codex-backed grader.")
     g.add_argument("--out", default=None, help="Output grades JSON path.")
     g.set_defaults(func=cmd_grade)
 
     d = sub.add_parser("doctor", help="Check your setup.")
+    d.add_argument(
+        "--config", action="append", default=None,
+        help="Config YAML to check, stacked on defaults.yaml (repeatable).",
+    )
+    d.add_argument(
+        "--codex-model", default=None,
+        help="Model override used when checking Codex-backed roles.",
+    )
+    d.add_argument(
+        "--docker", action=argparse.BooleanOptionalAction, default=True,
+        help="Check Docker requirements (default: on).",
+    )
+    d.add_argument(
+        "--image", default=SAGE_IMAGE,
+        help=f"Docker image to check (default: {SAGE_IMAGE}).",
+    )
+    d.add_argument(
+        "--check-endpoint", action="store_true",
+        help="Probe configured OSS provider endpoints without displaying URLs.",
+    )
     d.set_defaults(func=cmd_doctor)
 
     bl = sub.add_parser("build", help="Build the Docker sandbox images.")

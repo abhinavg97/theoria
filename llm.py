@@ -17,6 +17,7 @@ import contextvars
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -25,6 +26,10 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
+
+from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.validators import validator_for
 
 
 SUBPROCESS_STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
@@ -125,6 +130,7 @@ WATCHDOG_SILENCE_SECS = 90             # 90s of zero CPU ticks → hung
 WATCHDOG_HARD_WALL_SECS = 4 * 60 * 60  # 4h absolute ceiling
 WATCHDOG_POLL_SECS = 30                # how often the watchdog wakes
 WATCHDOG_RETRY_MAX = 3                 # retry attempts after kill
+SCHEMA_RETRY_MAX = 3                   # hard cap for opt-in format retries
 
 
 class WatchdogKilled(RuntimeError):
@@ -133,6 +139,42 @@ class WatchdogKilled(RuntimeError):
     can treat it as a transient failure (codex CLI hang on a specific
     HTTP connection) rather than a real error."""
     pass
+
+
+class StructuredOutputError(RuntimeError):
+    """A provider response was not valid for the requested JSON schema."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_stdout: bytes = b"",
+        raw_stderr: bytes = b"",
+        events: list[dict] | None = None,
+        provider_meta: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
+        self.events = events or []
+        self.provider_meta = provider_meta or {}
+
+
+class ProviderProcessError(RuntimeError):
+    """A streaming provider process failed after emitting useful evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_stdout: bytes = b"",
+        raw_stderr: bytes = b"",
+        events: list[dict] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
+        self.events = events or []
 
 
 async def _find_subprocess_pid(
@@ -332,7 +374,8 @@ def _try_resume_from_cache(
     if schema:
         try:
             response = json.loads(response_text)
-        except json.JSONDecodeError:
+            _validate_structured_output(response, schema)
+        except (json.JSONDecodeError, StructuredOutputError):
             return None
     else:
         response = response_text
@@ -427,6 +470,42 @@ def _extract_codex_metadata(events: list) -> dict:
         "cached_input_tokens": cached_input_tokens,
         "total_cost_usd": None,  # codex doesn't expose cost
     }
+
+
+_ADDITIVE_PROVIDER_META_FIELDS = {
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_cost_usd",
+    "num_turns",
+    "duration_api_ms",
+    "web_search_requests",
+    "web_fetch_requests",
+}
+
+
+def _aggregate_provider_attempts(attempts: list[dict]) -> dict:
+    """Combine usage/tool metadata across schema-retry subprocesses."""
+    if not attempts:
+        return {}
+    combined = dict(attempts[-1])
+    for key in _ADDITIVE_PROVIDER_META_FIELDS:
+        values = [item.get(key) for item in attempts]
+        numeric = [value for value in values if isinstance(value, (int, float))]
+        if numeric:
+            combined[key] = sum(numeric)
+        elif key in combined:
+            combined[key] = None
+    tool_calls = [
+        call
+        for item in attempts
+        for call in (item.get("tool_calls") or [])
+    ]
+    if tool_calls:
+        combined["tool_calls"] = tool_calls
+    return combined
 
 
 def _truncate(s, limit: int) -> str:
@@ -618,13 +697,15 @@ def _parse_claude_output(stdout, schema):
     if schema:
         if "structured_output" not in result_event:
             # Diagnostic: dump everything we know about the failed result
-            raise RuntimeError(
+            raise StructuredOutputError(
                 "claude returned a result event without 'structured_output'. "
                 f"is_error={result_event.get('is_error')!r} "
                 f"subtype={result_event.get('subtype')!r} "
                 f"stop_reason={result_event.get('stop_reason')!r} "
                 f"result={(result_event.get('result') or '')[:500]!r} "
-                f"keys={list(result_event.keys())}"
+                f"keys={list(result_event.keys())}",
+                events=events,
+                provider_meta=metadata,
             )
         return _sanitize_llm_output(result_event["structured_output"]), session_id, metadata, events
     return _sanitize_llm_output(result_event.get("result", "")), session_id, metadata, events
@@ -697,22 +778,40 @@ async def _run_claude_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("claude", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("claude", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if result_event is None:
-        raise RuntimeError("claude stream ended without result event")
+        if schema:
+            raise StructuredOutputError(
+                "claude stream ended without result event",
+                raw_stdout=raw_stdout,
+                events=events,
+            )
+        raise ProviderProcessError(
+            "claude stream ended without result event",
+            raw_stdout=raw_stdout,
+            events=events,
+        )
 
     metadata = _extract_claude_metadata(result_event)
     metadata["tool_calls"] = _extract_claude_tool_calls(events)
     if schema:
         if "structured_output" not in result_event:
-            raise RuntimeError(
+            raise StructuredOutputError(
                 "claude returned a result event without 'structured_output'. "
                 f"is_error={result_event.get('is_error')!r} "
                 f"subtype={result_event.get('subtype')!r} "
                 f"stop_reason={result_event.get('stop_reason')!r} "
                 f"result={(result_event.get('result') or '')[:500]!r} "
-                f"keys={list(result_event.keys())}"
+                f"keys={list(result_event.keys())}",
+                raw_stdout=raw_stdout,
+                events=events,
+                provider_meta=metadata,
             )
         return _sanitize_llm_output(result_event["structured_output"]), session_id, metadata, events, raw_stdout
     return _sanitize_llm_output(result_event.get("result", "")), session_id, metadata, events, raw_stdout
@@ -728,12 +827,230 @@ async def _run_claude_streaming(proc, schema, *, last_event_ref=None):
 # concurrent processes corrupting each other's SQLite state.
 _RESUMABLE_CODEX_ROLES = {"solver", "formalizer"}
 
+_CLAUDE_MODEL_ALIASES = {"opus", "sonnet", "haiku"}
+_CODEX_LOCAL_PROVIDERS = {"ollama", "lmstudio"}
+_CODEX_CONFIG_KEY = re.compile(
+    r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"
+)
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SENSITIVE_CODEX_CONFIG_PARTS = {
+    "api_key", "authorization", "bearer_token", "cookie", "credential",
+    "key", "password", "secret", "token",
+}
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _toml_scalar(value) -> str:
+    """Serialize a scalar for Codex's TOML-parsed `-c key=value` flag."""
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return repr(value)
+    raise ValueError(
+        "codex_config values must be TOML scalars "
+        "(string, boolean, finite number); "
+        f"got {type(value).__name__}"
+    )
+
+
+def _is_sensitive_codex_config_key(key: str) -> bool:
+    """Return whether an override would put secret material in argv."""
+    lower = key.lower()
+    if lower.endswith((
+        ".env_key", ".env_var", ".env_vars", ".bearer_token_env_var",
+    )):
+        return False
+    parts = set(re.split(r"[._-]", lower))
+    if (parts & _SENSITIVE_CODEX_CONFIG_PARTS
+            or {"api", "key"}.issubset(parts)):
+        return True
+    return False
+
+
+def _codex_config_items(settings: dict) -> list[tuple[str, object]]:
+    """Validate and return structured Codex CLI configuration overrides."""
+    raw = settings.get("codex_config")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("codex_config must be a mapping of dotted keys to scalars")
+
+    items = []
+    for key, value in raw.items():
+        if not isinstance(key, str) or not _CODEX_CONFIG_KEY.fullmatch(key):
+            raise ValueError(
+                "codex_config keys must be non-empty dotted identifiers; "
+                f"got {key!r}"
+            )
+        if _is_sensitive_codex_config_key(key):
+            raise ValueError(
+                f"codex_config.{key} would expose a secret in process argv; "
+                "configure the provider's env_key and list the variable in "
+                "provider_env instead"
+            )
+        _toml_scalar(value)  # validate before constructing any subprocess
+        if key.endswith("base_url"):
+            _route_oss_base_url(value, sandboxed=False)
+        if key == "model_provider" and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ValueError("codex_config.model_provider must be a non-empty string")
+        items.append((key, value))
+    return items
+
+
+def _codex_config_override(key: str, value, *, sandboxed: bool) -> str:
+    """Serialize one override, routing custom-provider loopback URLs."""
+    if key.startswith("model_providers.") and key.endswith(".base_url"):
+        value = _route_oss_base_url(value, sandboxed=sandboxed)
+    return f"{key}={_toml_scalar(value)}"
+
+
+def _route_oss_base_url(value, *, sandboxed: bool) -> str | None:
+    """Validate an OSS endpoint and route host loopback from Docker."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("oss_base_url must be a non-empty http(s) URL")
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as e:
+        raise ValueError(f"invalid oss_base_url: {e}") from e
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("oss_base_url must be an absolute http(s) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "oss_base_url cannot contain credentials, a query, or a fragment; "
+            "pass provider credentials through provider_env"
+        )
+
+    hostname = parsed.hostname
+    if sandboxed and hostname.lower() in _LOOPBACK_HOSTS:
+        hostname = "host.docker.internal"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _codex_provider(settings: dict) -> str | None:
+    """Return the effective configured provider without exposing secrets."""
+    if settings.get("oss"):
+        return settings.get("local_provider")
+    for key, value in _codex_config_items(settings):
+        if key == "model_provider" and isinstance(value, str):
+            return value
+    return "openai"
+
+
+def _configured_codex_base_url(settings: dict) -> str | None:
+    """Return a validated base URL from OSS or custom-provider settings."""
+    if settings.get("oss_base_url") is not None:
+        return _route_oss_base_url(
+            settings.get("oss_base_url"), sandboxed=False,
+        )
+    provider = _codex_provider(settings)
+    key = f"model_providers.{provider}.base_url"
+    for config_key, value in _codex_config_items(settings):
+        if config_key == key:
+            return _route_oss_base_url(value, sandboxed=False)
+    return None
+
+
+def _schema_retry_limit(settings: dict) -> int:
+    value = settings.get("schema_retries", 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("schema_retries must be an integer")
+    if not 0 <= value <= SCHEMA_RETRY_MAX:
+        raise ValueError(
+            f"schema_retries must be between 0 and {SCHEMA_RETRY_MAX}"
+        )
+    return value
+
+
+def _provider_env_names(settings: dict) -> list[str]:
+    value = settings.get("provider_env", [])
+    if isinstance(value, str):
+        value = [value]
+    if value is None:
+        value = []
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(name, str) or not _ENV_NAME.fullmatch(name)
+        for name in value
+    ):
+        raise ValueError(
+            "provider_env must contain only environment-variable names"
+        )
+    return list(dict.fromkeys(value))
+
 
 def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
                       sandboxed: bool = False, role: str | None = None):
-    model = settings.get("model", "gpt-5.5")
+    oss = settings.get("oss", False)
+    if not isinstance(oss, bool):
+        raise ValueError("oss must be a boolean")
+
+    model = settings.get("model")
+    if oss and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("OSS Codex roles require an explicit model")
+    if model is None:
+        model = "gpt-5.5"
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Codex model must be a non-empty string")
     sandbox = settings.get("sandbox", "read-only")
     effort = settings.get("effort", "xhigh")
+    local_provider = settings.get("local_provider")
+    if oss:
+        if local_provider not in _CODEX_LOCAL_PROVIDERS:
+            allowed = ", ".join(sorted(_CODEX_LOCAL_PROVIDERS))
+            raise ValueError(
+                f"OSS Codex roles require local_provider to be one of: {allowed}"
+            )
+        if model in _CLAUDE_MODEL_ALIASES:
+            raise ValueError(
+                f"OSS Codex model {model!r} is a Claude alias; "
+                "configure the explicit local model id"
+            )
+    elif local_provider is not None:
+        raise ValueError("local_provider requires oss: true")
+    if not oss and settings.get("oss_base_url") is not None:
+        raise ValueError("oss_base_url requires oss: true")
+
+    config_items = _codex_config_items(settings)
+    provider_env = _provider_env_names(settings)
+    credential_refs = {
+        value
+        for key, value in config_items
+        if key.lower().endswith((
+            ".env_key", ".env_var", ".bearer_token_env_var",
+        ))
+    }
+    missing_credential_refs = sorted(credential_refs - set(provider_env))
+    if missing_credential_refs:
+        raise ValueError(
+            "Codex provider credential environment references must also "
+            "appear in provider_env: " + ", ".join(missing_credential_refs)
+        )
+    configured_provider = next(
+        (value for key, value in config_items if key == "model_provider"),
+        None,
+    )
+    if oss and configured_provider not in (None, local_provider):
+        raise ValueError(
+            "codex_config.model_provider conflicts with local_provider"
+        )
+    if (configured_provider not in (None, "openai")
+            and model in _CLAUDE_MODEL_ALIASES):
+        raise ValueError(
+            f"Codex model {model!r} is a Claude alias; configure the "
+            "explicit provider model id"
+        )
 
     # Defense-in-depth: never let a null byte reach subprocess argv.
     prompt = _BAD_CTRL.sub("", prompt) if isinstance(prompt, str) else prompt
@@ -745,14 +1062,15 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
 
     # claude uses "opus"/"sonnet"/"haiku" aliases; if the config has a claude
     # model but backend is codex, fall back to a codex model
-    if model in ("opus", "sonnet", "haiku"):
+    if model in _CLAUDE_MODEL_ALIASES:
         model = "gpt-5.5"
 
     if resume:
-        # `codex exec resume` only accepts a subset of flags. It does NOT
-        # support --sandbox or --output-schema. The sandbox setting is
-        # inherited from the original session. Schema-on-resume is not
-        # supported at all (separate code path handles this).
+        # `codex exec resume` accepts config/model/schema flags but not
+        # --oss, --local-provider, or --sandbox. Preserve the local provider
+        # explicitly through model_provider; the sandbox is inherited from
+        # the original session. The pipeline keeps Codex formalization
+        # stateless even though current pinned Codex supports schema resume.
         #
         # It DOES require --skip-git-repo-check and
         # --dangerously-bypass-approvals-and-sandbox when running
@@ -767,11 +1085,24 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
         if sandboxed:
             cmd += ["--dangerously-bypass-approvals-and-sandbox"]
             cmd += ["--skip-git-repo-check"]
-        cmd += ["-c", f"model_reasoning_effort={effort}"]
+        for key, value in config_items:
+            cmd += ["-c", _codex_config_override(
+                key, value, sandboxed=sandboxed,
+            )]
+        if oss and configured_provider is None:
+            cmd += ["-c", f"model_provider={_toml_scalar(local_provider)}"]
+        elif configured_provider is None:
+            cmd += ["-c", 'model_provider="openai"']
+        if effort is not None:
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
         cmd += ["--json"]
+        if schema_file:
+            cmd += ["--output-schema", schema_file]
     else:
         cmd = ["codex", "exec"]
         cmd += ["--model", model]
+        if oss:
+            cmd += ["--oss", "--local-provider", local_provider]
         # Inside a Docker container we trust the container as the
         # sandbox and drop codex's internal Seatbelt/bubblewrap +
         # approval checks. Outside, keep the native sandbox (default
@@ -784,7 +1115,14 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
             cmd += ["--skip-git-repo-check"]
         else:
             cmd += ["--sandbox", sandbox]
-        cmd += ["-c", f"model_reasoning_effort={effort}"]
+        for key, value in config_items:
+            cmd += ["-c", _codex_config_override(
+                key, value, sandboxed=sandboxed,
+            )]
+        if not oss and configured_provider is None:
+            cmd += ["-c", 'model_provider="openai"']
+        if effort is not None:
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
         cmd += ["--json"]
         if settings.get("full_auto") and not sandboxed:
             # --full-auto is shorthand for --sandbox workspace-write.
@@ -793,8 +1131,11 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
         if schema_file:
             cmd += ["--output-schema", schema_file]
 
-    if settings.get("search"):
-        cmd += ["-c", "tools.web_search=true"]
+    search = settings.get("search")
+    if search is not None:
+        if not isinstance(search, bool):
+            raise ValueError("search must be a boolean")
+        cmd += ["-c", f"tools.web_search={'true' if search else 'false'}"]
 
     if system and not resume:
         # System prompt only on initial call; resume continues existing context
@@ -840,7 +1181,18 @@ def _parse_codex_output(stdout, schema):
     Returns (response, session_id, metadata, events) — events is the
     parsed JSONL list, kept so callers can save it as an artifact.
     """
-    lines = [json.loads(line) for line in stdout.strip().split("\n") if line.strip()]
+    try:
+        lines = [
+            json.loads(line)
+            for line in stdout.strip().split("\n")
+            if line.strip()
+        ]
+    except json.JSONDecodeError as e:
+        if schema:
+            raise StructuredOutputError(
+                f"codex emitted invalid JSONL while schema output was requested: {e}"
+            ) from e
+        raise
     metadata = _extract_codex_metadata(lines)
     metadata["tool_calls"] = _extract_codex_tool_calls(lines)
 
@@ -859,14 +1211,20 @@ def _parse_codex_output(stdout, schema):
                     try:
                         return _sanitize_llm_output(json.loads(text)), session_id, metadata, lines
                     except json.JSONDecodeError as e:
-                        raise RuntimeError(
+                        raise StructuredOutputError(
                             f"codex returned non-JSON when schema was requested. "
-                            f"This usually means a session was resumed (codex exec resume "
-                            f"does not support --output-schema). "
-                            f"text={text[:500]!r} error={e}"
-                        )
+                            f"text={text[:500]!r} error={e}",
+                            events=lines,
+                            provider_meta=metadata,
+                        ) from e
                 return _sanitize_llm_output(text), session_id, metadata, lines
 
+    if schema:
+        raise StructuredOutputError(
+            "No response found in codex output",
+            events=lines,
+            provider_meta=metadata,
+        )
     raise RuntimeError("No response found in codex output")
 
 
@@ -930,15 +1288,41 @@ async def _run_codex_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("codex", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("codex", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if last_message_text is None:
-        raise RuntimeError("codex stream ended without agent message")
+        if schema:
+            raise StructuredOutputError(
+                "codex stream ended without agent message",
+                raw_stdout=raw_stdout,
+                events=events,
+                provider_meta=_extract_codex_metadata(events),
+            )
+        raise ProviderProcessError(
+            "codex stream ended without agent message",
+            raw_stdout=raw_stdout,
+            events=events,
+        )
 
     metadata = _extract_codex_metadata(events)
     metadata["tool_calls"] = _extract_codex_tool_calls(events)
     if schema:
-        return _sanitize_llm_output(json.loads(last_message_text)), session_id, metadata, events, raw_stdout
+        try:
+            response = json.loads(last_message_text)
+        except json.JSONDecodeError as e:
+            raise StructuredOutputError(
+                "codex returned non-JSON when schema was requested. "
+                f"text={last_message_text[:500]!r} error={e}",
+                raw_stdout=raw_stdout,
+                events=events,
+                provider_meta=metadata,
+            ) from e
+        return _sanitize_llm_output(response), session_id, metadata, events, raw_stdout
     return _sanitize_llm_output(last_message_text), session_id, metadata, events, raw_stdout
 
 
@@ -960,6 +1344,25 @@ def _add_additional_properties(schema):
                 else:
                     out[key] = {k: _add_additional_properties(v) for k, v in val.items()}
     return out
+
+
+def _validate_structured_output(value, schema: dict) -> None:
+    """Fail explicitly when parsed provider output violates its schema."""
+    validator_cls = validator_for(schema)
+    try:
+        validator_cls.check_schema(schema)
+    except SchemaError as e:
+        raise ValueError(f"invalid output schema: {e.message}") from e
+    try:
+        validator_cls(schema).validate(value)
+    except ValidationError as e:
+        path = "$" + "".join(
+            f"[{part}]" if isinstance(part, int) else f".{part}"
+            for part in e.absolute_path
+        )
+        raise StructuredOutputError(
+            f"structured output violates schema at {path}: {e.message}"
+        ) from e
 
 
 # ── Main entry point ────────────────────────────────────────────
@@ -996,15 +1399,20 @@ async def llm(
     The call_log entry keeps its existing truncated fields as previews;
     full source of truth is the files on disk.
     """
-    settings = config.get(role, {})
+    role_settings = config.get(role, {})
+    if not isinstance(role_settings, dict):
+        raise ValueError(f"config for role {role!r} must be a mapping")
+    # Defaults are per-call; do not mutate the merged run configuration.
+    settings = dict(role_settings)
     backend = settings.get("backend", "claude")
 
     # Apply backend-specific defaults (config values take precedence)
     if backend == "codex":
-        settings.setdefault("model", "gpt-5.5")
+        if not settings.get("oss", False):
+            settings.setdefault("model", "gpt-5.5")
         settings.setdefault("effort", "xhigh")
         settings.setdefault("sandbox", "read-only")
-        settings.setdefault("search", True)
+        settings.setdefault("search", not settings.get("oss", False))
     elif backend == "claude":
         settings.setdefault("model", "opus")
         settings.setdefault("effort", "max")
@@ -1072,10 +1480,24 @@ async def llm(
     container_call_cwd: str | None = "/workspace" if sandboxed else None
 
     schema_file = None
+    child_env = None
+    codex_provider = None
+    configured_base_url = None
+    effective_base_url = None
+    oss_env_base_url = None
     raw_stdout: bytes = b""
     raw_stderr: bytes = b""
     events: list[dict] = []
+    provider_meta: dict = {}
+    failed_provider_attempts: list[dict] = []
     cmd: list[str] = []
+    proc = None
+    process_attempts = 0
+    schema_retries = 0
+    retry_artifacts: list[str] = []
+    last_attempt_duration_ms = 0
+    started_at = _utc_now_iso()
+    call_started = time.perf_counter()
     try:
         # Build command
         if backend == "claude":
@@ -1084,6 +1506,46 @@ async def llm(
                 sandboxed=sandboxed,
             )
         elif backend == "codex":
+            codex_provider = _codex_provider(settings)
+            configured_base_url = _configured_codex_base_url(settings)
+            provider_env = _provider_env_names(settings)
+            external_provider = (
+                bool(settings.get("oss"))
+                or codex_provider not in (None, "openai")
+                or configured_base_url is not None
+                or bool(provider_env)
+            )
+            security = config.get("_security") or {}
+            if not isinstance(security, dict):
+                raise ValueError("_security must be a mapping")
+            allow_external_host = security.get(
+                "allow_external_provider_host_access", False,
+            )
+            if not isinstance(allow_external_host, bool):
+                raise ValueError(
+                    "_security.allow_external_provider_host_access must be a boolean"
+                )
+            if external_provider and not sandboxed and not allow_external_host:
+                raise RuntimeError(
+                    "External Codex providers require Docker isolation by "
+                    "default. To run this provider on the host, explicitly set "
+                    "_security.allow_external_provider_host_access: true."
+                )
+            if configured_base_url is not None:
+                effective_base_url = _route_oss_base_url(
+                    configured_base_url, sandboxed=sandboxed,
+                )
+            if settings.get("oss"):
+                env_base_url = os.environ.get("CODEX_OSS_BASE_URL")
+                oss_base_url = env_base_url or settings.get("oss_base_url")
+                if oss_base_url is not None:
+                    oss_env_base_url = _route_oss_base_url(
+                        oss_base_url, sandboxed=sandboxed,
+                    )
+                    effective_base_url = oss_env_base_url
+                child_env = os.environ.copy()
+                if oss_env_base_url is not None:
+                    child_env["CODEX_OSS_BASE_URL"] = oss_env_base_url
             if schema:
                 codex_schema = _add_additional_properties(schema)
                 schema_json = json.dumps(codex_schema).encode("utf-8")
@@ -1127,10 +1589,15 @@ async def llm(
         # sandboxed. The CLI's own cwd becomes the per-call subdir, so
         # scratch files land there.
         if sandboxed:
-            cmd = [
-                "docker", "exec",
-                "-w", container_call_cwd,
-                container_id,
+            docker_prefix = ["docker", "exec"]
+            if oss_env_base_url is not None:
+                # URL validation above forbids credentials/query parameters;
+                # provider secrets travel separately through provider_env.
+                docker_prefix += [
+                    "--env", f"CODEX_OSS_BASE_URL={oss_env_base_url}",
+                ]
+            cmd = docker_prefix + [
+                "-w", container_call_cwd, container_id,
             ] + cmd
 
         # ── Save pre-call artifacts ──────────────────────────────
@@ -1155,14 +1622,18 @@ async def llm(
         # sometimes hangs indefinitely on a specific HTTP connection;
         # the watchdog kills it, and we retry from scratch with a
         # fresh subprocess (and therefore fresh codex/claude session).
-        # Up to WATCHDOG_RETRY_MAX retries; non-watchdog failures are
-        # raised immediately without retry.
+        # Up to WATCHDOG_RETRY_MAX watchdog retries. Structured-output
+        # retries are separately bounded and opt-in per role.
         watchdog_attempts = 0
+        schema_retry_limit = (
+            _schema_retry_limit(settings) if schema is not None else 0
+        )
         call_label = (f"call_{call_index:03d}_{role}"
                       if call_index is not None else role)
         while True:
-            started_at = _utc_now_iso()
-            started = time.perf_counter()
+            process_attempts += 1
+            attempt_started = time.perf_counter()
+            retrying = False
 
             # Run
             proc = await asyncio.create_subprocess_exec(
@@ -1170,6 +1641,7 @@ async def llm(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=SUBPROCESS_STREAM_LIMIT,
+                env=child_env,
             )
 
             # Hang detection. Sandboxed-only: we monitor per-process
@@ -1191,6 +1663,8 @@ async def llm(
 
             raw_stdout = b""
             raw_stderr = b""
+            events = []
+            provider_meta = {}
             try:
                 if watch:
                     # Stream mode: read line by line, print events
@@ -1224,14 +1698,49 @@ async def llm(
                     else:
                         response, session_id, provider_meta, events = \
                             _parse_codex_output(output, schema)
+                if schema is not None:
+                    _validate_structured_output(response, schema)
                 # Success — exit retry loop.
                 break
-            except Exception:
+            except StructuredOutputError as e:
+                if e.raw_stdout:
+                    raw_stdout = e.raw_stdout
+                if e.raw_stderr:
+                    raw_stderr = e.raw_stderr
+                if e.events:
+                    events = e.events
+                if e.provider_meta:
+                    provider_meta = e.provider_meta
+                failed_provider_attempts.append(dict(provider_meta))
+                if schema_retries < schema_retry_limit:
+                    schema_retries += 1
+                    retrying = True
+                    print(
+                        f"[retry] invalid structured output from {call_label}; "
+                        f"retrying attempt {schema_retries + 1}/"
+                        f"{schema_retry_limit + 1}: {e}",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise StructuredOutputError(
+                    f"{backend} failed to return valid structured output "
+                    f"after {schema_retries + 1} attempt(s): {e}",
+                    raw_stdout=raw_stdout,
+                    raw_stderr=raw_stderr,
+                    events=events,
+                    provider_meta=provider_meta,
+                ) from e
+            except Exception as e:
+                if isinstance(e, ProviderProcessError):
+                    raw_stdout = e.raw_stdout
+                    raw_stderr = e.raw_stderr
+                    events = e.events
                 # Was this a watchdog kill (transient hang) and do we
                 # have retries left? If so, swallow and retry.
                 if (watchdog_killed[0]
                         and watchdog_attempts < WATCHDOG_RETRY_MAX):
                     watchdog_attempts += 1
+                    retrying = True
                     print(
                         f"[retry] watchdog killed {call_label}; "
                         f"retrying attempt {watchdog_attempts + 1}/"
@@ -1250,23 +1759,36 @@ async def llm(
                         await watchdog_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                # Save raw stdout/stderr for the most recent attempt.
-                # On retry the previous attempt's data is overwritten —
-                # last attempt wins. The retry message printed above
-                # is the only signal that earlier attempts existed.
+                last_attempt_duration_ms = int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                ))
+                # Preserve failed-attempt evidence separately. The final
+                # attempt keeps the stable stdout/stderr artifact names used
+                # by existing audit tooling.
                 if call_dir:
+                    suffix = (
+                        f"_attempt_{process_attempts:03d}" if retrying else ""
+                    )
                     if raw_stdout:
-                        _write_artifact(
-                            os.path.join(call_dir, "stdout.jsonl"),
+                        path = _write_artifact(
+                            os.path.join(call_dir, f"stdout{suffix}.jsonl"),
                             raw_stdout, gzip_it=True,
                         )
+                        if retrying:
+                            retry_artifacts.append(path)
                     if raw_stderr:
-                        _write_artifact(
-                            os.path.join(call_dir, "stderr.txt"),
+                        path = _write_artifact(
+                            os.path.join(call_dir, f"stderr{suffix}.txt"),
                             raw_stderr, gzip_it=True,
                         )
+                        if retrying:
+                            retry_artifacts.append(path)
 
-        duration_ms = int(round((time.perf_counter() - started) * 1000))
+        duration_ms = int(round((time.perf_counter() - call_started) * 1000))
+        if failed_provider_attempts:
+            provider_meta = _aggregate_provider_attempts(
+                [*failed_provider_attempts, provider_meta],
+            )
 
         # ── Save post-parse artifacts ────────────────────────────
         artifact_paths: dict[str, str] = {}
@@ -1281,6 +1803,8 @@ async def llm(
                 artifact_paths["stdout_path"] = os.path.join(call_dir, "stdout.jsonl.gz")
             if raw_stderr:
                 artifact_paths["stderr_path"] = os.path.join(call_dir, "stderr.txt.gz")
+            if retry_artifacts:
+                artifact_paths["retry_artifact_paths"] = retry_artifacts
 
             _write_artifact(
                 os.path.join(call_dir, "response.txt"), response_text,
@@ -1326,9 +1850,12 @@ async def llm(
                 "started_at": started_at,
                 "ended_at": _utc_now_iso(),
                 "duration_ms": duration_ms,
+                "last_attempt_duration_ms": last_attempt_duration_ms,
+                "process_attempts": process_attempts,
                 "session_id": session_id,
                 "resumed": bool(resume),
                 "has_schema": schema is not None,
+                "schema_retries": schema_retries,
                 "returncode": proc.returncode,
                 "argv_hash": _cmd_hash(cmd),
                 # Which sandbox this call ran in (if any). Enables
@@ -1337,6 +1864,10 @@ async def llm(
                 "container_id": container_id,
                 "container_cwd": container_call_cwd,
                 "image_id": image_id,
+                "oss": bool(settings.get("oss", False)),
+                "model_provider": codex_provider,
+                "base_url": configured_base_url,
+                "effective_base_url": effective_base_url,
                 "prompt": _truncate(prompt, 8000),
                 "system": _truncate(system or "", 8000),
                 "response": _truncate(response_text, 8000),
@@ -1361,25 +1892,55 @@ async def llm(
         # happened. Raw stdout/stderr were already saved in the inner
         # finally. Write a failure meta.json so the call dir is
         # self-describing for post-mortem.
+        duration_ms = int(round((time.perf_counter() - call_started) * 1000))
+        returncode = getattr(proc, "returncode", None)
+        failure_provider_meta = _aggregate_provider_attempts(
+            failed_provider_attempts,
+        ) or provider_meta
+        failure_meta = {
+            "role": role,
+            "backend": backend,
+            "model": settings.get("model"),
+            "effort": settings.get("effort"),
+            "started_at": started_at,
+            "ended_at": _utc_now_iso(),
+            "duration_ms": duration_ms,
+            "last_attempt_duration_ms": last_attempt_duration_ms,
+            "process_attempts": process_attempts,
+            "schema_retries": schema_retries,
+            "returncode": returncode,
+            "argv_hash": _cmd_hash(cmd) if cmd else None,
+            "sandboxed": sandboxed,
+            "container_id": container_id,
+            "image_id": image_id,
+            "oss": bool(settings.get("oss", False)),
+            "model_provider": codex_provider,
+            "base_url": configured_base_url,
+            "effective_base_url": effective_base_url,
+            "retry_artifact_paths": retry_artifacts,
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "failed": True,
+            **failure_provider_meta,
+        }
+        if raw_stdout and call_dir:
+            failure_meta["stdout_path"] = os.path.join(
+                call_dir, "stdout.jsonl.gz",
+            )
+        if raw_stderr and call_dir:
+            failure_meta["stderr_path"] = os.path.join(
+                call_dir, "stderr.txt.gz",
+            )
+        if log is not None and call_index is not None:
+            log[call_index] = failure_meta
         if call_dir:
             try:
                 _write_artifact(
                     os.path.join(call_dir, "meta.json"),
-                    json.dumps({
-                        "role": role,
-                        "backend": backend,
-                        "model": settings.get("model"),
-                        "effort": settings.get("effort"),
-                        "argv": cmd,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                        "failed": True,
-                    }, indent=2, default=str),
+                    json.dumps(failure_meta, indent=2, default=str),
                 )
             except Exception:
                 pass
-        # Leave the placeholder None in call_log so an operator can
-        # spot it (and the partial save will persist it).
         raise
 
     finally:

@@ -1,0 +1,10 @@
+# Explicit opt-in for running an external model provider without Docker.
+#
+# The provider-controlled agent can inspect host-readable files and environment
+# values through shell tools. Prefer Docker. Stack this file only for deliberate
+# local development or provider compatibility tests:
+#   --config configs/ollama.yaml \
+#   --config configs/unsafe_host_provider.yaml --no-docker
+
+_security:
+  allow_external_provider_host_access: true

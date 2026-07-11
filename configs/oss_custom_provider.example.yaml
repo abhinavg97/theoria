@@ -1,0 +1,63 @@
+# Unaudited template for a hosted or self-hosted provider configured through
+# Codex model_providers. This is not Codex's `--oss` local-adapter mode.
+#
+# Replace the model, URL, provider id/name, and environment-variable name.
+# The provider must support the API surface Codex needs for agent tools and
+# structured output; basic Chat Completions compatibility is not sufficient.
+# Never put the credential value in this file.
+
+_no_search_policy: &no_search_policy |
+  Live web search is disabled for this profile. Retrieving a known URL is
+  direct fetch, not search or source discovery. You may fetch and check an
+  authoritative source when its URL is already known. For any material
+  external claim that cannot be verified with the available tools, take this
+  role's conservative failure path rather than relying on memory.
+
+_custom_provider_config: &custom_provider_config
+  model_provider: oss_custom
+  model_providers.oss_custom.name: OSS custom provider
+  model_providers.oss_custom.base_url: https://provider.example/v1
+  model_providers.oss_custom.env_key: OSS_API_KEY
+  model_providers.oss_custom.wire_api: responses
+
+_custom_role: &custom_role
+  backend: codex
+  model: REPLACE_WITH_MODEL
+  effort: null
+  codex_config: *custom_provider_config
+  provider_env:
+    - OSS_API_KEY
+  search: false
+  schema_retries: 1
+
+solver:
+  <<: *custom_role
+  prompt_suffix: *no_search_policy
+
+interpreter:
+  <<: *custom_role
+
+formalizer:
+  <<: *custom_role
+  prompt_suffix: *no_search_policy
+
+citation:
+  <<: *custom_role
+  prompt_suffix: *no_search_policy
+
+problem_given:
+  <<: *custom_role
+
+computation:
+  <<: *custom_role
+
+pedantry:
+  <<: *custom_role
+  prompt_suffix: *no_search_policy
+
+convention_lift:
+  <<: *custom_role
+  prompt_suffix: *no_search_policy
+
+initial_state:
+  <<: *custom_role

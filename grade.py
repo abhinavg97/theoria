@@ -201,6 +201,7 @@ async def grade_run(
     run_file: str,
     config_paths: list[str] | None = None,
     out_path: str | None = None,
+    codex_model: str | None = None,
 ) -> dict:
     """Grade every problem in a run JSON. Writes a grades JSON and returns a
     summary dict. Defaults the output to runs/grades/<run-stem>.json."""
@@ -214,8 +215,41 @@ async def grade_run(
             "No 'audit_grader' role in the loaded config. Pass "
             "--config configs/audit_grader.yaml."
         )
-    prompt_text, prompt_sha = load_prompt()
     settings = config["audit_grader"]
+    if codex_model and settings.get("backend", "claude") == "codex":
+        settings["model"] = codex_model
+    if settings.get("backend", "claude") == "codex":
+        codex_config = settings.get("codex_config") or {}
+        provider = (
+            codex_config.get("model_provider")
+            if isinstance(codex_config, dict)
+            else None
+        )
+        external_provider = (
+            bool(settings.get("oss"))
+            or (provider is not None and str(provider).lower() != "openai")
+            or bool(settings.get("provider_env"))
+            or (
+                isinstance(codex_config, dict)
+                and any(str(key).endswith(".base_url") for key in codex_config)
+            )
+        )
+        security = config.get("_security") or {}
+        allow_external_host = (
+            isinstance(security, dict)
+            and security.get("allow_external_provider_host_access") is True
+        )
+        if external_provider and not allow_external_host:
+            raise SystemExit(
+                "External-provider grading runs on the host. Stack "
+                "configs/unsafe_host_provider.yaml only after accepting that "
+                "the provider-controlled agent can inspect host-readable data."
+            )
+    prompt_text, prompt_sha = load_prompt()
+    prompt_suffix = settings.get("prompt_suffix", "")
+    if prompt_suffix:
+        prompt_text = f"{prompt_text.rstrip()}\n\n{prompt_suffix}\n"
+        prompt_sha = hashlib.sha256(prompt_text.encode()).hexdigest()[:16]
     grader_model = (
         f"{settings.get('backend', 'claude')}:"
         f"{settings.get('model')}:{settings.get('effort')}"
@@ -288,5 +322,11 @@ if __name__ == "__main__":
                         help="Grader config YAML (repeatable). "
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
+    parser.add_argument(
+        "--codex-model", default=None,
+        help="Override the model when the grader uses the Codex backend.",
+    )
     args = parser.parse_args()
-    asyncio.run(grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade_run(
+        args.run_file, args.config, args.out, codex_model=args.codex_model,
+    ))

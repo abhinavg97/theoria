@@ -8,8 +8,8 @@
 # Claude's --dangerously-skip-permissions refuses to run as root by
 # design, and Anthropic's own devcontainer uses the node user too.
 #
-# Auth: host bind-mounts ~/.codex and a Keychain-extracted claude
-# credentials file into /home/node/. Subscription tokens, no API keys.
+# Auth: the harness streams provider state into a private tmpfs home after
+# startup. Subscription tokens and provider keys are not baked into the image.
 #
 # Layer order: heavy/stable layers first (apt, venv, pip), CLI install
 # LAST. claude-code and codex release every few days; keeping them on
@@ -91,9 +91,9 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 # ── Runtime user + directories ──────────────────────────────────
 # /workspace is node-owned so agents can write there. We pre-create
-# /home/node/.claude so the credential bind-mount has a proper
-# parent. The venv is chowned so agents can install packages into it
-# at runtime (see note above).
+# /home/node/.claude for non-Docker development. The runtime replaces the
+# container home with a private tmpfs. The venv is chowned so agents can
+# install packages into it at runtime (see note above).
 RUN mkdir -p /workspace /home/node/.claude /home/node/.local \
  && chown -R node:node /workspace /home/node/.claude /home/node/.local ${VIRTUAL_ENV}
 
