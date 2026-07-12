@@ -144,6 +144,17 @@ Stackable config presets in `configs/`: `defaults.yaml` (base — every role's p
 
 ---
 
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest tests/
+```
+
+The test suite covers the pure-Python logic (config merging, proof serialization, run-file parsing) that doesn't need Docker, a Claude/Codex subscription, or network access — it runs in CI on every PR. It does not exercise the pipeline itself; that still needs a real run (`theoria custom "..."`).
+
+---
+
 ## Scope and honesty notes
 
 - **The judges are LLMs.** Verification is looped LLM auditing plus real tool/code execution in the sandbox — not a fixed formal proof checker. It raises the bar far above a single model's say-so; it is not a theorem prover.
