@@ -51,6 +51,7 @@ def test_oss_codex_initial_command_uses_local_provider_without_effort():
     assert 'web_search="disabled"' in _config_values(command)
     assert "features.multi_agent=false" in _config_values(command)
     assert "features.multi_agent_v2=false" in _config_values(command)
+    assert "features.unified_exec=false" in _config_values(command)
 
 
 def test_oss_codex_resume_reasserts_provider_and_schema():
@@ -76,9 +77,10 @@ def test_oss_codex_resume_reasserts_provider_and_schema():
     assert 'web_search="disabled"' in _config_values(command)
     assert "features.multi_agent=false" in _config_values(command)
     assert "features.multi_agent_v2=false" in _config_values(command)
+    assert "features.unified_exec=false" in _config_values(command)
 
 
-def test_oss_codex_allows_explicit_multi_agent_override():
+def test_oss_codex_allows_explicit_feature_overrides():
     command = llm._build_codex_cmd(
         "prompt",
         {
@@ -89,6 +91,7 @@ def test_oss_codex_allows_explicit_multi_agent_override():
             "codex_config": {
                 "features.multi_agent": True,
                 "features.multi_agent_v2": True,
+                "features.unified_exec": True,
             },
         },
         None,
@@ -101,6 +104,8 @@ def test_oss_codex_allows_explicit_multi_agent_override():
     assert "features.multi_agent=false" not in values
     assert "features.multi_agent_v2=true" in values
     assert "features.multi_agent_v2=false" not in values
+    assert "features.unified_exec=true" in values
+    assert "features.unified_exec=false" not in values
 
 
 def test_custom_provider_config_is_structured_and_rejects_secrets():

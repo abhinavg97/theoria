@@ -1147,9 +1147,17 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     # `namespace` tool type before the model sees the prompt. Keep the agentic
     # shell loop while disabling both incompatible multi-agent implementations
     # for OSS adapters. An explicit provider override remains possible.
+    #
+    # unified_exec is also disabled for OSS. With it on, Codex advertises
+    # shell access as a PTY-session tool pair (exec_command/write_stdin);
+    # with it off, as the single classic shell tool. Both are plain
+    # function types that providers accept, but the classic tool matches
+    # the shell-tool shape local models are trained on, drops a tool from
+    # an already-long prompt, and gives up only interactive sessions,
+    # which no Theoria role uses.
     if oss:
         configured_keys = {key for key, _ in config_items}
-        for feature in ("multi_agent", "multi_agent_v2"):
+        for feature in ("multi_agent", "multi_agent_v2", "unified_exec"):
             key = f"features.{feature}"
             if key not in configured_keys:
                 cmd += ["-c", f"{key}=false"]
