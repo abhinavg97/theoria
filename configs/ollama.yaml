@@ -4,6 +4,8 @@
 #   --codex-model YOUR_OLLAMA_MODEL
 # or by changing `_ollama_role.model` below. Ollama must expose its compatible
 # endpoint at the configured URL. CODEX_OSS_BASE_URL overrides oss_base_url.
+# Configure the selected model with at least a 16K-token context window;
+# Codex's baseline instructions and tool schemas do not fit in a 4K context.
 
 _no_search_policy: &no_search_policy |
   Live web search is disabled for this profile. Retrieving a known URL is

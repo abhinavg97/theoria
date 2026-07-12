@@ -106,6 +106,11 @@ theoria custom "Prove there are infinitely many primes" \
   --config configs/ollama.yaml --codex-model YOUR_OLLAMA_MODEL
 ```
 
+Configure the local model with at least a 16K-token context window for a smoke
+test; substantial questions and repair rounds can require more. Codex's
+instructions and tool schemas alone exceed 4K tokens, so an Ollama model left
+at a 4096-token default fails before it can answer the question.
+
 `configs/ollama.yaml` points to `http://localhost:11434/v1`. Set `CODEX_OSS_BASE_URL` to override it. In Docker mode, Theoria maps a loopback endpoint to `host.docker.internal`; `--no-docker` uses the URL directly. The profile sets every role, including the formalizer, to `backend: codex`. Codex formalizer repairs are stateless: each repair call includes the prior proof and failed verdicts.
 
 [`configs/oss_custom_provider.example.yaml`](configs/oss_custom_provider.example.yaml) shows the corresponding `model_providers` wiring for a hosted or self-hosted provider. It forwards only the environment-variable names in `provider_env`; credentials must remain in the environment and must never be written into YAML. Provider compatibility must be tested individually.

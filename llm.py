@@ -1135,7 +1135,24 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     if search is not None:
         if not isinstance(search, bool):
             raise ValueError("search must be a boolean")
-        cmd += ["-c", f"tools.web_search={'true' if search else 'false'}"]
+        # Codex 0.133 uses the top-level enum to decide whether the native
+        # Responses API web-search tool is sent to the provider. Its legacy
+        # tools.web_search boolean is ignored; the nested table now only
+        # holds options for an enabled tool.
+        search_mode = "live" if search else "disabled"
+        cmd += ["-c", f"web_search={_toml_scalar(search_mode)}"]
+
+    # Codex enables its multi-agent namespace tool by default. Ollama and LM
+    # Studio accept ordinary function tools but reject the Responses API's
+    # `namespace` tool type before the model sees the prompt. Keep the agentic
+    # shell loop while disabling both incompatible multi-agent implementations
+    # for OSS adapters. An explicit provider override remains possible.
+    if oss:
+        configured_keys = {key for key, _ in config_items}
+        for feature in ("multi_agent", "multi_agent_v2"):
+            key = f"features.{feature}"
+            if key not in configured_keys:
+                cmd += ["-c", f"{key}=false"]
 
     if system and not resume:
         # System prompt only on initial call; resume continues existing context

@@ -24,7 +24,7 @@ def test_cloud_codex_command_keeps_existing_defaults():
     assert "--oss" not in command
     assert 'model_provider="openai"' in _config_values(command)
     assert "model_reasoning_effort=xhigh" in _config_values(command)
-    assert "tools.web_search=true" in _config_values(command)
+    assert 'web_search="live"' in _config_values(command)
 
 
 def test_oss_codex_initial_command_uses_local_provider_without_effort():
@@ -48,7 +48,9 @@ def test_oss_codex_initial_command_uses_local_provider_without_effort():
     assert "--oss" in command
     assert "--output-schema" in command
     assert not any(value.startswith("model_reasoning_effort=") for value in _config_values(command))
-    assert "tools.web_search=false" in _config_values(command)
+    assert 'web_search="disabled"' in _config_values(command)
+    assert "features.multi_agent=false" in _config_values(command)
+    assert "features.multi_agent_v2=false" in _config_values(command)
 
 
 def test_oss_codex_resume_reasserts_provider_and_schema():
@@ -59,6 +61,7 @@ def test_oss_codex_resume_reasserts_provider_and_schema():
             "effort": None,
             "oss": True,
             "local_provider": "ollama",
+            "search": False,
         },
         "/tmp/schema.json",
         None,
@@ -70,6 +73,34 @@ def test_oss_codex_resume_reasserts_provider_and_schema():
     assert "--oss" not in command
     assert 'model_provider="ollama"' in _config_values(command)
     assert command[command.index("--output-schema") + 1] == "/tmp/schema.json"
+    assert 'web_search="disabled"' in _config_values(command)
+    assert "features.multi_agent=false" in _config_values(command)
+    assert "features.multi_agent_v2=false" in _config_values(command)
+
+
+def test_oss_codex_allows_explicit_multi_agent_override():
+    command = llm._build_codex_cmd(
+        "prompt",
+        {
+            "model": "local-model",
+            "effort": None,
+            "oss": True,
+            "local_provider": "lmstudio",
+            "codex_config": {
+                "features.multi_agent": True,
+                "features.multi_agent_v2": True,
+            },
+        },
+        None,
+        None,
+        None,
+    )
+
+    values = _config_values(command)
+    assert "features.multi_agent=true" in values
+    assert "features.multi_agent=false" not in values
+    assert "features.multi_agent_v2=true" in values
+    assert "features.multi_agent_v2=false" not in values
 
 
 def test_custom_provider_config_is_structured_and_rejects_secrets():
