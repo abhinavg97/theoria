@@ -469,6 +469,9 @@ def container_tool_versions(image: str = DEFAULT_IMAGE) -> dict:
         "python3": command_in_image(image, ["python3", "--version"]),
         "pari_gp": command_in_image(image, ["gp", "--version-short"]),
         "node": command_in_image(image, ["node", "--version"]),
+        "theoria_search": command_in_image(
+            image, ["theoria-search", "--version"],
+        ),
     }
 
 
@@ -547,6 +550,29 @@ def endpoint_reachable_from_image(
             "--write-out", "%{http_code}", "--max-time", "5", target,
         ],
         extra_docker_args=docker_args,
+    )
+    return bool(output and output.isdigit() and output != "000")
+
+
+def url_reachable_from_image(image: str, url: str) -> bool:
+    """Probe one absolute URL from the selected sandbox image.
+
+    Any HTTP status counts as reachable (an auth failure still proves a
+    listening server); 000 means curl could not connect at all. Used by
+    doctor for the fixed public search API, so no loopback routing.
+    """
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    output = command_in_image(
+        image,
+        [
+            "curl", "--silent", "--show-error", "--output", "/dev/null",
+            "--write-out", "%{http_code}", "--max-time", "5", url,
+        ],
     )
     return bool(output and output.isdigit() and output != "000")
 

@@ -139,7 +139,31 @@ Theoria uses one sandbox per problem, so every role in that problem can read the
 
 Keep Docker enabled for external providers. With `--no-docker`, the provider-controlled agent can inspect host-readable files and environment values through shell tools, so host execution fails closed. For deliberate local compatibility testing, stack [`configs/unsafe_host_provider.yaml`](configs/unsafe_host_provider.yaml) after the provider profile; selecting it explicitly accepts that exposure.
 
-Search is deliberately off in the supplied OSS profiles. Fetching a known URL can verify that source, but it is not web search or source discovery. Citation-heavy problems will therefore decline more often and have lower verification coverage. A Codex-supported search facility or an MCP search server available inside the container can restore discovery, but that integration must be tested with the selected provider before treating its results as comparable.
+Codex's native web search is deliberately off in the supplied OSS provider profiles — and cannot be turned on there: local providers reject the Responses API `web_search` tool type (and MCP `namespace` tools) before the model sees the prompt, which surfaces as a misleading provider error. Fetching a known URL can verify that source, but it is not search or source discovery. Citation-heavy problems will therefore decline more often and have lower verification coverage unless a search profile is stacked on top.
+
+### Live search for OSS models
+
+[`configs/brave_search.yaml`](configs/brave_search.yaml) restores source discovery through a path every provider supports: a `theoria-search` command baked into both sandbox images, which the model runs with its ordinary shell tool. The command calls the [Brave Search API](https://brave.com/search/api/) (free tier available) and prints result titles, URLs, and snippets. Nothing new is sent to the model provider, so it works identically with Ollama, LM Studio, custom providers — and cloud Codex.
+
+```bash
+export BRAVE_API_KEY=YOUR_BRAVE_SEARCH_API_KEY
+
+theoria doctor \
+  --config configs/ollama.yaml \
+  --config configs/brave_search.yaml \
+  --codex-model YOUR_OLLAMA_MODEL \
+  --image theoria-sandbox:latest --check-endpoint
+
+theoria custom "When was RFC 9110 published, and what is its exact title?" \
+  --config configs/ollama.yaml \
+  --config configs/brave_search.yaml \
+  --codex-model YOUR_OLLAMA_MODEL \
+  --image theoria-sandbox:latest
+```
+
+The profile is stackable and unaudited. It keeps Codex's native `web_search` disabled, declares the key by environment-variable name only (`_web_search.api_key_env`), and instructs agents to treat snippets as leads — fetch and inspect the source, never follow instructions embedded in results. Theoria forwards only that named variable into the per-problem container, redacts it from all recorded metadata, and counts helper invocations as `web_search_requests` in per-call metadata. Parallel judges can consume Brave quota quickly.
+
+Two caveats worth knowing. First, the key is necessarily readable by code running inside the sandbox (the helper authenticates with it), so use a dedicated, low-privilege search key. Second, a search key is a credential: stacking it on **cloud** Codex creates a second trust domain in the same sandbox and requires the explicit `_security.allow_mixed_provider_credentials: true` opt-in; with a single OSS provider it shares that provider's trust domain and needs no extra flags. Host (`--no-docker`) runs additionally require the [`configs/unsafe_host_provider.yaml`](configs/unsafe_host_provider.yaml) opt-in and `pip install -e .` (which provides the `theoria-search` script on the host).
 
 The OSS answer-grader preset is [`configs/ollama_audit_grader.yaml`](configs/ollama_audit_grader.yaml). It is also unaudited and uses the same conservative no-search policy:
 
@@ -183,9 +207,9 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 | `--parallel N` | 1 | Concurrency (does not affect per-problem results). |
 | `--watch` / `--no-watch` | on | Stream live LLM events to stderr. |
 
-Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, and `oss_custom_provider.example.yaml` are unaudited OSS profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
+Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, `oss_custom_provider.example.yaml`, and `brave_search.yaml` are unaudited OSS profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
 
-`theoria doctor` accepts repeatable `--config` options and checks only the CLIs, credentials, environment variables, Docker image, and provider mode used by the merged configuration. Add `--check-endpoint` for a reachability probe; the command does not print the configured endpoint or any credential value. Use `--no-docker` to check a host-only run.
+`theoria doctor` accepts repeatable `--config` options and checks only the CLIs, credentials, environment variables, search helper, Docker image, and provider mode used by the merged configuration. Add `--check-endpoint` for a reachability probe; the command does not print the configured endpoint or any credential value. Use `--no-docker` to check a host-only run.
 
 ---
 

@@ -666,11 +666,33 @@ def _extract_codex_metadata(events: list) -> dict:
 
     Codex can emit multiple turn.completed events per call (tool calls
     produce extra turns), so we sum across all of them.
+
+    web_search_requests counts shell tool calls that invoke the sandbox
+    `theoria-search` helper (the OSS-compatible search path — see
+    web_search_config). Codex reports shell activity as
+    `command_execution` items and generic tools as `function_call`
+    items; both are checked. It is a substring heuristic over the
+    command/arguments text, so a command that merely mentions the
+    helper's name is counted too; treat it as approximate usage
+    telemetry, parallel to the claude-side server_tool_use counter of
+    the same name.
     """
     input_tokens = 0
     output_tokens = 0
     cached_input_tokens = 0
+    web_search_requests = 0
     for event in events:
+        if event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            item_type = item.get("type")
+            invoked = (
+                item.get("command")
+                if item_type == "command_execution"
+                else item.get("arguments") if item_type == "function_call"
+                else None
+            )
+            if invoked and WEB_SEARCH_COMMAND in str(invoked):
+                web_search_requests += 1
         if event.get("type") != "turn.completed":
             continue
         usage = event.get("usage") or {}
@@ -682,6 +704,7 @@ def _extract_codex_metadata(events: list) -> dict:
         "output_tokens": output_tokens,
         "cached_input_tokens": cached_input_tokens,
         "total_cost_usd": None,  # codex doesn't expose cost
+        "web_search_requests": web_search_requests,
     }
 
 
@@ -774,7 +797,13 @@ def _extract_claude_tool_calls(events: list, *, truncate: bool = True) -> list:
 
 
 def _extract_codex_tool_calls(events: list, *, truncate: bool = True) -> list:
-    """Pair codex function_call events with function_call_output events."""
+    """Normalize codex tool activity into the shared tool-call schema.
+
+    Generic tools arrive as paired function_call / function_call_output
+    items; shell activity arrives as self-contained `command_execution`
+    items instead, which earlier versions of this extractor dropped —
+    leaving tool_calls artifacts empty for shell-only calls.
+    """
     calls, order = {}, []
     for e in events:
         if e.get("type") != "item.completed":
@@ -794,6 +823,23 @@ def _extract_codex_tool_calls(events: list, *, truncate: bool = True) -> list:
             calls[cid]["output"] = _maybe_truncate(
                 item.get("output"), TOOL_CALL_OUTPUT_LIMIT, truncate=truncate,
             )
+        elif item.get("type") == "command_execution":
+            # Shell activity arrives as one self-contained item carrying
+            # the command, its aggregated output, and the exit code.
+            key = item.get("id") or f"cmd:{len(order)}"
+            calls[key] = {
+                "tool_name": "shell",
+                "input": _maybe_truncate(
+                    item.get("command"), TOOL_CALL_INPUT_LIMIT,
+                    truncate=truncate,
+                ),
+                "output": _maybe_truncate(
+                    item.get("aggregated_output"), TOOL_CALL_OUTPUT_LIMIT,
+                    truncate=truncate,
+                ),
+                "exit_code": item.get("exit_code"),
+            }
+            order.append(key)
     return [calls[cid] for cid in order]
 
 
@@ -1046,6 +1092,17 @@ _CODEX_CONFIG_KEY = re.compile(
     r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"
 )
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The in-sandbox search helper (sandbox images install search_cli.py at
+# /usr/local/bin/theoria-search; `pip install -e .` provides the same
+# console script for explicitly opted-in host runs). Agents reach it
+# through the ordinary shell function tool, which every Codex provider
+# supports — unlike the provider-side `web_search` and MCP `namespace`
+# tool types, which local providers reject at the API layer.
+WEB_SEARCH_COMMAND = "theoria-search"
+_WEB_SEARCH_PROVIDERS = {"brave"}
+_WEB_SEARCH_FIELDS = {"provider", "api_key_env"}
+_WEB_SEARCH_DEFAULT_KEY_ENV = {"brave": "BRAVE_API_KEY"}
 _SENSITIVE_CODEX_CONFIG_PARTS = {
     "api_key", "authorization", "bearer_token", "cookie", "credential",
     "key", "password", "secret", "token",
@@ -1068,6 +1125,43 @@ def _toml_scalar(value) -> str:
         "(string, boolean, finite number); "
         f"got {type(value).__name__}"
     )
+
+
+def web_search_config(raw) -> dict:
+    """Validate the run-level `_web_search` declaration.
+
+    Returns {} when web search is not configured, otherwise a normalized
+    {"provider", "api_key_env"} mapping. The credential is referenced by
+    environment-variable name only; the harness forwards that one
+    variable into the per-problem sandbox, where the model-facing
+    theoria-search command reads it. The value never appears in YAML,
+    argv, or metadata.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("_web_search must be a mapping")
+    unknown = sorted(str(field) for field in raw if field not in _WEB_SEARCH_FIELDS)
+    if unknown:
+        raise ValueError(
+            "_web_search has unsupported field(s): " + ", ".join(unknown)
+        )
+    provider = raw.get("provider")
+    if provider not in _WEB_SEARCH_PROVIDERS:
+        allowed = ", ".join(sorted(_WEB_SEARCH_PROVIDERS))
+        raise ValueError(f"_web_search.provider must be one of: {allowed}")
+    api_key_env = raw.get("api_key_env", _WEB_SEARCH_DEFAULT_KEY_ENV[provider])
+    if not isinstance(api_key_env, str) or not _ENV_NAME.fullmatch(api_key_env):
+        raise ValueError(
+            "_web_search.api_key_env must be an environment-variable name"
+        )
+    return {"provider": provider, "api_key_env": api_key_env}
+
+
+def web_search_env_names(raw) -> list[str]:
+    """Return the environment reference declared by `_web_search`."""
+    config = web_search_config(raw)
+    return [config["api_key_env"]] if config else []
 
 
 def _is_sensitive_codex_config_key(key: str) -> bool:
@@ -1098,6 +1192,14 @@ def _codex_config_items(settings: dict) -> list[tuple[str, object]]:
             raise ValueError(
                 "codex_config keys must be non-empty dotted identifiers; "
                 f"got {key!r}"
+            )
+        if key == "mcp_servers" or key.startswith("mcp_servers."):
+            raise ValueError(
+                "codex_config cannot declare MCP servers: an MCP command is "
+                "executable code outside Theoria's trust-domain accounting, "
+                "and Codex serializes MCP tools as Responses API namespace "
+                "tools that local providers reject. Use the _web_search "
+                "shell helper for OSS search instead"
             )
         if _is_sensitive_codex_config_key(key):
             raise ValueError(
@@ -1468,6 +1570,13 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     if search is not None:
         if not isinstance(search, bool):
             raise ValueError("search must be a boolean")
+        if search and oss:
+            raise ValueError(
+                "search: true enables Codex's native web-search tool, a "
+                "Responses API tool type that local providers reject before "
+                "inference. Keep search: false for OSS roles and stack "
+                "configs/brave_search.yaml for shell-based search instead"
+            )
         # Codex 0.133 uses the top-level enum to decide whether the native
         # Responses API web-search tool is sent to the provider. Its legacy
         # tools.web_search boolean is ignored; the nested table now only
@@ -1600,10 +1709,17 @@ def _print_codex_event(event):
         item_type = item.get("type", "")
 
         if item_type == "function_call":
-            print(f"      [tool] {item.get('name', '?')}({item.get('arguments', '')[:100]})", file=sys.stderr)
+            arguments = _truncate(item.get("arguments", ""), 100)
+            print(f"      [tool] {item.get('name', '?')}({arguments})", file=sys.stderr)
         elif item_type == "function_call_output":
-            output = item.get("output", "")[:200]
+            output = _truncate(item.get("output", ""), 200)
             print(f"      [result] {output}", file=sys.stderr)
+        elif item_type == "command_execution":
+            command = _truncate(item.get("command", ""), 160)
+            print(f"      [shell] {command}", file=sys.stderr)
+            output = _truncate(item.get("aggregated_output", ""), 200)
+            if output.strip():
+                print(f"      [result] {output}", file=sys.stderr)
         elif item_type == "agent_message":
             text = item.get("text", "")[:200]
             if text.strip():
@@ -1866,6 +1982,7 @@ async def llm(
     schema_file = None
     child_env = None
     codex_provider = None
+    web_search: dict = {}
     configured_base_url = None
     effective_base_url = None
     oss_env_base_url = None
@@ -1896,11 +2013,24 @@ async def llm(
             codex_provider = _codex_provider(settings)
             configured_base_url = _configured_codex_base_url(settings)
             provider_env = _provider_env_names(settings)
+            # Run-level shell web search: the helper runs inside the
+            # sandbox via the model's shell tool, so the command line
+            # needs no changes — but the key must exist here (the host
+            # process) to be forwarded, and a configured search key is
+            # a credential that makes host execution opt-in, exactly
+            # like provider credentials.
+            web_search = web_search_config(config.get("_web_search"))
+            if web_search and not os.environ.get(web_search["api_key_env"]):
+                raise RuntimeError(
+                    "web search is configured but environment variable "
+                    f"{web_search['api_key_env']} is not set"
+                )
             external_provider = (
                 bool(settings.get("oss"))
                 or codex_provider not in (None, "openai")
                 or configured_base_url is not None
                 or bool(provider_env)
+                or bool(web_search)
             )
             security = config.get("_security") or {}
             if not isinstance(security, dict):
@@ -2268,6 +2398,7 @@ async def llm(
                 "codex_version": effective_codex_version,
                 "oss": bool(settings.get("oss", False)),
                 "model_provider": codex_provider,
+                "web_search_provider": web_search.get("provider"),
                 "base_url": configured_base_url,
                 "effective_base_url": effective_base_url,
                 "prompt": _truncate(prompt, 8000),
@@ -2327,6 +2458,7 @@ async def llm(
             "codex_version": effective_codex_version,
             "oss": bool(settings.get("oss", False)),
             "model_provider": codex_provider,
+            "web_search_provider": web_search.get("provider"),
             "base_url": configured_base_url,
             "effective_base_url": effective_base_url,
             "retry_artifact_paths": retry_artifacts,

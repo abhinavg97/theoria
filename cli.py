@@ -37,8 +37,10 @@ import urllib.request
 from pathlib import Path
 
 import harness
+import llm
 import loaders
 import sandbox
+import search_cli
 
 STD_IMAGE = "theoria-sandbox:latest"
 SAGE_IMAGE = "theoria-sandbox-sage:latest"
@@ -356,11 +358,17 @@ def cmd_doctor(args) -> None:
         if str(key).startswith("_")
     }
     effective_config.update(roles)
+    runtime_provider_env = []
+    web_search = {}
     try:
         runtime = harness.resolve_runtime(effective_config)
     except ValueError as exc:
         check("provider security configuration is valid", False, str(exc))
     else:
+        runtime_provider_env = runtime["provider_env"]
+        web_search = llm.web_search_config(
+            effective_config.get("_web_search")
+        )
         requirements = runtime["requirements"]
         mixed_credentials = requirements["mixed_provider_credentials"]
         mixed_credentials_allowed = requirements[
@@ -422,6 +430,10 @@ def cmd_doctor(args) -> None:
         cv = cli_version("codex")
         check(f"codex CLI {('(' + cv + ')') if cv else ''}", cv is not None,
               "install the Codex CLI")
+        if web_search:
+            helper = shutil.which("theoria-search")
+            check("host web-search helper theoria-search", helper is not None,
+                  "pip install -e .  (installs the theoria-search script)")
         if cv is not None and provider_roles:
             try:
                 help_result = subprocess.run(
@@ -487,18 +499,11 @@ def cmd_doctor(args) -> None:
         check("provider_env contains environment-variable names",
               not invalid_provider_env,
               "fix provider_env for: " + ", ".join(invalid_provider_env))
-    required_env = sorted({
-        name
-        for settings in provider_roles.values()
-        for name in (
-            provider_env_names(settings)
-            if isinstance(provider_env_names(settings), list)
-            else []
-        )
-        if isinstance(name, str) and env_name_pattern.fullmatch(name)
-    })
-    for name in required_env:
-        check(f"provider environment variable {name}", bool(os.environ.get(name)),
+    # Runtime-resolved names cover role provider_env plus the run-level
+    # web-search key, deduplicated, with presence already evaluated.
+    for item in runtime_provider_env:
+        name = item["name"]
+        check(f"required environment variable {name}", item["present"],
               f"set {name} in the environment before running Theoria")
 
     placeholder_models = {
@@ -539,6 +544,26 @@ def cmd_doctor(args) -> None:
             check(f"{provider} endpoint reachable ({len(endpoint_roles)} role(s))",
                   reachable,
                   "verify the provider service and its configured base URL")
+        if web_search:
+            search_url = search_cli.DEFAULT_ENDPOINT
+            if args.docker:
+                search_reachable = sandbox.url_reachable_from_image(
+                    args.image, search_url,
+                )
+            else:
+                # An HTTP error (401 without a key) still proves the
+                # search API answers from this host.
+                try:
+                    request = urllib.request.Request(search_url, method="GET")
+                    with urllib.request.urlopen(request, timeout=5):
+                        search_reachable = True
+                except urllib.error.HTTPError:
+                    search_reachable = True
+                except (OSError, ValueError, urllib.error.URLError):
+                    search_reachable = False
+            check(f"{web_search['provider']} search API reachable",
+                  search_reachable,
+                  "check outbound network access from the sandbox/host")
 
     daemon_ok = False
     if args.docker:
@@ -577,6 +602,16 @@ def cmd_doctor(args) -> None:
                     f"container Codex CLI {('(' + version + ')') if version else ''}",
                     version is not None,
                     "rebuild the selected sandbox image",
+                )
+            if web_search:
+                version = sandbox.command_in_image(
+                    args.image, ["theoria-search", "--version"],
+                )
+                check(
+                    f"container web-search helper "
+                    f"{('(' + version + ')') if version else ''}",
+                    version is not None,
+                    "rebuild the selected sandbox image (adds theoria-search)",
                 )
             if provider_roles:
                 capabilities = sandbox.codex_oss_capabilities_in_image(args.image)

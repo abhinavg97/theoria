@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import cli
+import llm
 import pipeline
 
 
@@ -32,6 +33,29 @@ def test_ollama_profile_configures_every_pipeline_role():
         assert settings["effort"] is None
         assert settings["search"] is False
         assert settings["schema_retries"] == 1
+
+
+def test_brave_search_profile_stacks_on_ollama_without_losing_provider():
+    root = Path(__file__).parents[1]
+    config = pipeline.load_config([
+        root / "configs" / "ollama.yaml",
+        root / "configs" / "brave_search.yaml",
+    ])
+
+    assert llm.web_search_config(config["_web_search"]) == {
+        "provider": "brave",
+        "api_key_env": "BRAVE_API_KEY",
+    }
+    for role in ACTIVE_ROLES:
+        settings = config[role]
+        # Provider wiring from ollama.yaml must survive the stack ...
+        assert settings["backend"] == "codex"
+        assert settings["oss"] is True
+        assert settings["local_provider"] == "ollama"
+        # ... while the search profile swaps the no-search policy for the
+        # shell helper and keeps Codex's native search tool disabled.
+        assert settings["search"] is False
+        assert "theoria-search" in settings["prompt_suffix"]
 
 
 def test_custom_provider_profile_uses_env_reference_not_secret():

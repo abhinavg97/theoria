@@ -32,6 +32,8 @@ from llm import (
     sandbox_container,
     sandbox_image_id,
     uses_external_codex_provider,
+    web_search_config,
+    web_search_env_names,
 )
 from pipeline import run, CONFIG, load_config
 
@@ -199,6 +201,7 @@ def _external_provider_domain(
     endpoints: list[str],
     provider_env: list[str],
     credential_refs: list[str],
+    web_search: dict | None = None,
 ) -> str:
     """Return a non-secret identity for one external provider trust domain."""
     identity = json.dumps(
@@ -207,12 +210,20 @@ def _external_provider_domain(
             "endpoints": sorted(set(endpoints)),
             "provider_env": sorted(set(provider_env)),
             "credential_refs": sorted(set(credential_refs)),
+            "web_search": web_search or {},
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:12]
     return f"codex:{provider or 'external'}:{fingerprint}"
+
+
+def _web_search_credential_domain(web_search: dict) -> str:
+    """Return a non-secret identity for the shell web-search credential."""
+    identity = json.dumps(web_search, sort_keys=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:12]
+    return f"web-search:{web_search.get('provider', '?')}:{fingerprint}"
 
 
 def _codex_config_endpoints(value, *, key: str = ""):
@@ -249,9 +260,11 @@ def _endpoint_needs_host_gateway(endpoint: str) -> bool:
 def _provider_env_names(config: dict) -> list[str]:
     names: list[str] = []
     has_local_oss = False
+    has_codex = False
     for _, settings in _role_settings(config):
         if settings.get("backend", "claude") != "codex":
             continue
+        has_codex = True
         has_local_oss = has_local_oss or bool(settings.get("oss", False))
         configured = settings.get("provider_env", [])
         if isinstance(configured, str):
@@ -261,6 +274,11 @@ def _provider_env_names(config: dict) -> list[str]:
         if not isinstance(configured, (list, tuple)):
             raise ValueError("provider_env must be a list of environment variable names")
         names.extend(configured)
+    # The shell web-search key rides the same forwarding path as provider
+    # credentials: referenced by name here, value taken from the host
+    # environment at container start, redacted from inspect artifacts.
+    if has_codex:
+        names.extend(web_search_env_names(config.get("_web_search")))
     # CODEX_OSS_BASE_URL is the standard process-level override. Preserve its
     # value only in the environment; metadata records the name and presence.
     if has_local_oss and "CODEX_OSS_BASE_URL" in os.environ:
@@ -271,6 +289,8 @@ def _provider_env_names(config: dict) -> list[str]:
 def resolve_runtime(config: dict | None = None) -> dict:
     """Resolve active backends and provider requirements from merged config."""
     resolved_config = CONFIG if config is None else config
+    web_search = web_search_config(resolved_config.get("_web_search"))
+    web_search_env = [web_search["api_key_env"]] if web_search else []
     roles: dict[str, dict] = {}
     needs_claude = False
     needs_codex = False
@@ -280,6 +300,12 @@ def resolve_runtime(config: dict | None = None) -> dict:
 
     env_override = os.environ.get("CODEX_OSS_BASE_URL")
     for role, settings in _role_settings(resolved_config):
+        if "web_search" in settings:
+            raise ValueError(
+                f"{role}.web_search is not allowed; configure shell web "
+                "search through the top-level _web_search mapping (per-role "
+                "`search` only controls Codex's native cloud search tool)"
+            )
         backend = settings.get("backend", "claude")
         role_runtime: dict = {
             "backend": backend,
@@ -337,6 +363,13 @@ def resolve_runtime(config: dict | None = None) -> dict:
             if not external_provider:
                 needs_codex_cloud_auth = True
                 credential_domains.add("codex:openai")
+                # A search key next to cloud Codex auth is a second
+                # credential in the same sandbox; surface it as its own
+                # domain so mixing requires the explicit opt-in.
+                if web_search:
+                    credential_domains.add(
+                        _web_search_credential_domain(web_search)
+                    )
             else:
                 credential_domains.add(_external_provider_domain(
                     provider=provider,
@@ -345,17 +378,31 @@ def resolve_runtime(config: dict | None = None) -> dict:
                         if env_override and oss
                         else endpoints
                     ),
-                    provider_env=list(configured_env),
+                    provider_env=list(dict.fromkeys([
+                        *configured_env,
+                        *web_search_env,
+                    ])),
                     credential_refs=credential_refs,
+                    web_search=web_search,
                 ))
 
             role_runtime.update({
                 "oss": oss,
                 "model_provider": provider or "openai",
                 "search": settings.get("search"),
-                "provider_env": list(configured_env),
+                "web_search": web_search.get("provider"),
+                "provider_env": list(dict.fromkeys([
+                    *configured_env,
+                    *web_search_env,
+                ])),
             })
         roles[role] = role_runtime
+
+    if web_search and not needs_codex:
+        raise ValueError(
+            "_web_search requires at least one Codex-backed role; Claude "
+            "roles already have native web search"
+        )
 
     provider_env_names = _provider_env_names(resolved_config)
     security = resolved_config.get("_security") or {}
@@ -398,8 +445,9 @@ def resolve_runtime(config: dict | None = None) -> dict:
             "allow_external_provider_host_access": allow_external_host,
         },
         "credential_domains": sorted(credential_domains),
+        "web_search": web_search or None,
         "provider_env": [
-            {"name": name, "present": name in os.environ}
+            {"name": name, "present": bool(os.environ.get(name))}
             for name in provider_env_names
         ],
     }

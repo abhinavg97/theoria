@@ -138,6 +138,82 @@ def test_same_provider_id_with_different_endpoints_is_mixed(monkeypatch):
     assert len(runtime["credential_domains"]) == 2
 
 
+def test_web_search_key_joins_oss_provider_forwarding(monkeypatch):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+    config = {
+        "_web_search": {"provider": "brave"},
+        "solver": {
+            "backend": "codex",
+            "model": "gpt-oss:20b",
+            "oss": True,
+            "local_provider": "ollama",
+        },
+        "formalizer": {
+            "backend": "codex",
+            "model": "gpt-oss:20b",
+            "oss": True,
+            "local_provider": "ollama",
+        },
+    }
+
+    runtime = harness.resolve_runtime(config)
+
+    # One uniform external domain: the search key is part of the same
+    # trust domain as the local provider, not a second one.
+    assert runtime["requirements"]["mixed_provider_credentials"] is False
+    assert len(runtime["credential_domains"]) == 1
+    assert runtime["credential_domains"][0].startswith("codex:ollama:")
+    assert runtime["web_search"] == {
+        "provider": "brave",
+        "api_key_env": "BRAVE_API_KEY",
+    }
+    assert runtime["roles"]["solver"]["web_search"] == "brave"
+    assert {"name": "BRAVE_API_KEY", "present": True} in runtime["provider_env"]
+
+
+def test_web_search_with_cloud_codex_is_mixed_credentials(monkeypatch):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    runtime = harness.resolve_runtime({
+        "_web_search": {"provider": "brave"},
+        "solver": {"backend": "codex", "model": "gpt-5.5"},
+    })
+
+    assert runtime["requirements"]["mixed_provider_credentials"] is True
+    assert "codex:openai" in runtime["credential_domains"]
+    assert any(
+        domain.startswith("web-search:brave:")
+        for domain in runtime["credential_domains"]
+    )
+
+
+def test_role_level_web_search_is_rejected():
+    try:
+        harness.resolve_runtime({
+            "solver": {
+                "backend": "codex",
+                "model": "gpt-5.5",
+                "web_search": {"provider": "brave"},
+            },
+        })
+    except ValueError as exc:
+        assert "top-level _web_search" in str(exc)
+    else:
+        raise AssertionError("role-level web_search was accepted")
+
+
+def test_web_search_requires_a_codex_role():
+    try:
+        harness.resolve_runtime({
+            "_web_search": {"provider": "brave"},
+            "solver": {"backend": "claude", "model": "opus"},
+        })
+    except ValueError as exc:
+        assert "Codex-backed role" in str(exc)
+    else:
+        raise AssertionError("claude-only web search was accepted")
+
+
 def test_mixed_provider_credentials_require_explicit_opt_in(monkeypatch, tmp_path):
     monkeypatch.setattr(harness, "CONFIG", {
         "solver": {

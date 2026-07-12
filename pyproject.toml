@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 theoria = "cli:main"
+theoria-search = "search_cli:main"
 
 [tool.setuptools]
 py-modules = [
@@ -24,6 +25,7 @@ py-modules = [
     "grade",
     "export_problem",
     "cli",
+    "search_cli",
 ]
 
 [tool.pytest.ini_options]

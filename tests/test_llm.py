@@ -108,11 +108,237 @@ def test_oss_codex_allows_explicit_feature_overrides():
     assert "features.unified_exec=false" not in values
 
 
+def test_oss_role_rejects_codex_native_search_tool():
+    with pytest.raises(ValueError, match="native web-search"):
+        llm._build_codex_cmd(
+            "prompt",
+            {
+                "model": "gpt-oss:20b",
+                "oss": True,
+                "local_provider": "ollama",
+                "search": True,
+            },
+            None,
+            None,
+            None,
+        )
+
+
+def test_web_search_config_normalizes_and_fails_closed():
+    assert llm.web_search_config(None) == {}
+    assert llm.web_search_config({"provider": "brave"}) == {
+        "provider": "brave",
+        "api_key_env": "BRAVE_API_KEY",
+    }
+    assert llm.web_search_config(
+        {"provider": "brave", "api_key_env": "SEARCH_KEY"}
+    )["api_key_env"] == "SEARCH_KEY"
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        llm.web_search_config("brave")
+    with pytest.raises(ValueError, match="provider must be one of"):
+        llm.web_search_config({"provider": "google"})
+    with pytest.raises(ValueError, match="environment-variable name"):
+        llm.web_search_config(
+            {"provider": "brave", "api_key_env": "not a name"}
+        )
+    with pytest.raises(ValueError, match="unsupported field"):
+        llm.web_search_config({"provider": "brave", "api_key": "secret"})
+
+
+def test_codex_config_rejects_mcp_server_declarations():
+    with pytest.raises(ValueError, match="cannot declare MCP servers"):
+        llm._build_codex_cmd(
+            "prompt",
+            {
+                "model": "model-id",
+                "codex_config": {"mcp_servers.search.command": "server"},
+            },
+            None,
+            None,
+            None,
+        )
+
+
+def test_codex_metadata_counts_search_helper_invocations():
+    # Codex reports shell activity as self-contained command_execution
+    # items (observed live from the pinned 0.133 container) and generic
+    # tools as function_call items; both shapes must count.
+    events = [
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "item_1",
+                "command": '/bin/bash -lc \'theoria-search "rfc 9110" --count 3\'',
+                "aggregated_output": "1. RFC 9110: HTTP Semantics\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "item_2",
+                "command": "curl -s https://example.test",
+                "aggregated_output": "<html/>",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "container.exec",
+                "arguments": '{"cmd":"theoria-search \\"follow up\\""}',
+            },
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}},
+    ]
+
+    metadata = llm._extract_codex_metadata(events)
+
+    assert metadata["web_search_requests"] == 2
+    assert metadata["input_tokens"] == 10
+
+
+def test_codex_tool_calls_include_shell_command_executions():
+    events = [
+        {
+            "type": "item.started",
+            "item": {
+                "type": "command_execution",
+                "id": "item_1",
+                "command": "theoria-search \"rfc 9110\"",
+                "status": "in_progress",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "item_1",
+                "command": "theoria-search \"rfc 9110\"",
+                "aggregated_output": "1. RFC 9110: HTTP Semantics\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+    ]
+
+    calls = llm._extract_codex_tool_calls(events)
+
+    assert len(calls) == 1
+    assert calls[0]["tool_name"] == "shell"
+    assert "theoria-search" in calls[0]["input"]
+    assert "RFC 9110" in calls[0]["output"]
+    assert calls[0]["exit_code"] == 0
+
+
+def test_web_search_key_is_required_before_codex_launch(monkeypatch):
+    launched = False
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+
+    monkeypatch.setattr(
+        llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+    )
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="BRAVE_API_KEY is not set"):
+        asyncio.run(llm.llm(
+            "prompt",
+            role="solver",
+            config={
+                "_web_search": {"provider": "brave"},
+                "_security": {
+                    "allow_external_provider_host_access": True,
+                },
+                "solver": {
+                    "backend": "codex",
+                    "model": "gpt-oss:20b",
+                    "oss": True,
+                    "local_provider": "ollama",
+                },
+            },
+        ))
+
+    assert launched is False
+
+
+def test_web_search_call_records_provider_and_usage(monkeypatch, tmp_path):
+    events = [
+        {"type": "thread.started", "thread_id": "thread-id"},
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "shell",
+                "arguments": '{"command":["theoria-search","rfc 9110"]}',
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "done"},
+        },
+    ]
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            payload = "\n".join(json.dumps(event) for event in events)
+            return payload.encode(), b""
+
+    async def fake_create_subprocess_exec(*_command, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+    )
+    monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+
+    calls = []
+    artifact_token = llm.artifact_dir.set(str(tmp_path))
+    log_token = llm.call_log.set(calls)
+    try:
+        response, _ = asyncio.run(llm.llm(
+            "prompt",
+            role="solver",
+            config={
+                "_web_search": {"provider": "brave"},
+                "_security": {
+                    "allow_external_provider_host_access": True,
+                },
+                "solver": {
+                    "backend": "codex",
+                    "model": "gpt-oss:20b",
+                    "oss": True,
+                    "local_provider": "ollama",
+                    "search": False,
+                },
+            },
+        ))
+    finally:
+        llm.call_log.reset(log_token)
+        llm.artifact_dir.reset(artifact_token)
+
+    assert response == "done"
+    assert calls[0]["web_search_provider"] == "brave"
+    assert calls[0]["web_search_requests"] == 1
+
+
 def test_oss_calls_are_serialized_within_one_event_loop(monkeypatch):
     active = 0
     max_active = 0
 
-    class FakeProcess:
+    class GateProbeProcess:
         returncode = 0
 
         async def communicate(self):
@@ -131,7 +357,7 @@ def test_oss_calls_are_serialized_within_one_event_loop(monkeypatch):
             return "\n".join(json.dumps(e) for e in events).encode(), b""
 
     async def fake_create_subprocess_exec(*_command, **_kwargs):
-        return FakeProcess()
+        return GateProbeProcess()
 
     monkeypatch.setattr(
         llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,

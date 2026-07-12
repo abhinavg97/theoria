@@ -107,5 +107,15 @@ RUN npm install -g --no-audit --no-fund \
         @anthropic-ai/claude-code@${CLAUDE_VERSION} \
         @openai/codex@${CODEX_VERSION}
 
+# ── Web-search helper ───────────────────────────────────────────
+# theoria-search wraps the Brave Search API behind a plain CLI so any
+# agent with a shell tool gets source discovery — local model providers
+# reject Codex's provider-side search tool types. Needs BRAVE_API_KEY at
+# runtime (forwarded by the harness); without it the command fails with
+# a clear message. Kept as the final layer: it changes more often than
+# the CLIs above and costs nothing to rebuild.
+COPY search_cli.py /usr/local/bin/theoria-search
+RUN chmod 0755 /usr/local/bin/theoria-search
+
 USER node
 WORKDIR /workspace
