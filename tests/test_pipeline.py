@@ -25,6 +25,52 @@ def test_agent_prompt_appends_provider_suffix(monkeypatch):
     )
 
 
+def test_no_search_policy_is_derived_after_general_suffix(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "CONFIG",
+        {
+            "solver": {
+                "backend": "codex",
+                "prompt": "solve",
+                "prompt_suffix": "provider-specific policy",
+                "search": False,
+            },
+        },
+    )
+
+    prompt = pipeline.agent_prompt("solver")
+    assert "provider-specific policy" in prompt
+    assert pipeline.NO_SEARCH_POLICY in prompt
+    assert prompt.index("provider-specific policy") < prompt.index(
+        pipeline.NO_SEARCH_POLICY
+    )
+
+
+def test_shell_search_policy_is_derived_from_effective_run_config(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "CONFIG",
+        {
+            "_web_search": {
+                "provider": "searxng",
+                "endpoint": "http://localhost:8888",
+            },
+            "solver": {
+                "backend": "codex",
+                "prompt": "solve",
+                "prompt_suffix": "provider-specific policy",
+                "search": False,
+            },
+        },
+    )
+
+    prompt = pipeline.agent_prompt("solver")
+    assert "provider-specific policy" in prompt
+    assert pipeline.SHELL_SEARCH_POLICY in prompt
+    assert pipeline.NO_SEARCH_POLICY not in prompt
+
+
 def test_coerce_formalizer_decision_accepts_serialized_object():
     assert pipeline._coerce_formalizer_decision(
         '{"action": "reject", "reject_reason": "bad"}'

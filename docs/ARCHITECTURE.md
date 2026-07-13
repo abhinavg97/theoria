@@ -131,19 +131,25 @@ image, invoked through the shell function tool, calling the configured
 search backend directly from the container. `_web_search` is run-level
 configuration with two providers: `brave` (hosted keyed API on a fixed
 endpoint — the key is referenced by environment-variable name and joins the
-same forwarding allowlist, redaction, and trust-domain fingerprint as
-provider credentials) and `searxng` (self-hosted, credential-free — the
-instance endpoint gets the same validation and loopback routing as an OSS
-model endpoint). LLM answer engines are deliberately not backends: judges
+same forwarding allowlist and redaction path as provider credentials) and
+`searxng` (self-hosted, credential-free — the instance endpoint gets the same
+validation and loopback routing as an OSS model endpoint). Runtime metadata
+records credential issuers independently from model/search data destinations:
+SearXNG is a destination but not a credential domain, while Brave is both.
+This makes a keyed custom model plus Brave an explicit mixed-credential run,
+without misclassifying a key-free model/search combination. LLM answer engines
+are deliberately not backends: judges
 must verify primary sources, not another model's synthesis. Helper
 invocations are counted as `web_search_requests` in call metadata. Search
-results are untrusted leads: role prompts require agents to ignore embedded
-instructions and fetch and inspect the underlying source before accepting a
-claim.
+results are untrusted leads: one centrally derived prompt policy requires
+agents to ignore embedded instructions and fetch and inspect the underlying
+source before accepting a claim. Provider prompt suffixes cannot replace that
+policy when configuration profiles are stacked.
 
 Credentials are scoped to a per-problem sandbox, not to an individual role.
-The runtime therefore rejects configurations that mix an external provider
-with Claude, Codex cloud, or another external provider by default. The
+The runtime therefore rejects configurations that expose a credential across
+an external model trust boundary or combine multiple external credential
+issuers by default. The
 `_security.allow_mixed_provider_credentials` escape hatch requires an explicit
 acknowledgement that every role can access every credential in that run.
 External-provider host execution is also rejected by default because an

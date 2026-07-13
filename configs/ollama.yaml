@@ -7,13 +7,6 @@
 # Configure the selected model with at least a 16K-token context window;
 # Codex's baseline instructions and tool schemas do not fit in a 4K context.
 
-_no_search_policy: &no_search_policy |
-  Live web search is disabled for this profile. Retrieving a known URL is
-  direct fetch, not search or source discovery. You may fetch and check an
-  authoritative source when its URL is already known. For any material
-  external claim that cannot be verified with the available tools, take this
-  role's conservative failure path rather than relying on memory.
-
 _ollama_role: &ollama_role
   backend: codex
   model: gpt-oss:20b
@@ -27,18 +20,15 @@ _ollama_role: &ollama_role
 
 solver:
   <<: *ollama_role
-  prompt_suffix: *no_search_policy
 
 interpreter:
   <<: *ollama_role
 
 formalizer:
   <<: *ollama_role
-  prompt_suffix: *no_search_policy
 
 citation:
   <<: *ollama_role
-  prompt_suffix: *no_search_policy
 
 problem_given:
   <<: *ollama_role
@@ -48,11 +38,9 @@ computation:
 
 pedantry:
   <<: *ollama_role
-  prompt_suffix: *no_search_policy
 
 convention_lift:
   <<: *ollama_role
-  prompt_suffix: *no_search_policy
 
 initial_state:
   <<: *ollama_role

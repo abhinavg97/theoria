@@ -351,6 +351,57 @@ def test_web_search_key_is_required_before_codex_launch(monkeypatch):
     assert launched is False
 
 
+def test_custom_web_search_key_name_is_injected_for_helper(monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "ok"},
+        },
+    ]
+    captured_envs = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            payload = "\n".join(json.dumps(event) for event in events)
+            return payload.encode(), b""
+
+    async def fake_create_subprocess_exec(*_command, **kwargs):
+        captured_envs.append(kwargs.get("env"))
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+    )
+    monkeypatch.setenv("SEARCH_KEY", "custom-key")
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+
+    response, _ = asyncio.run(llm.llm(
+        "prompt",
+        role="solver",
+        config={
+            "_web_search": {
+                "provider": "brave",
+                "api_key_env": "SEARCH_KEY",
+            },
+            "_security": {"allow_external_provider_host_access": True},
+            "solver": {
+                "backend": "codex",
+                "model": "gpt-oss:20b",
+                "oss": True,
+                "local_provider": "ollama",
+                "search": False,
+            },
+        },
+    ))
+
+    assert response == "ok"
+    assert captured_envs[0]["THEORIA_SEARCH_API_KEY_ENV"] == "SEARCH_KEY"
+    assert captured_envs[0]["SEARCH_KEY"] == "custom-key"
+
+
 def test_web_search_call_records_provider_and_usage(monkeypatch, tmp_path):
     events = [
         {"type": "thread.started", "thread_id": "thread-id"},

@@ -107,6 +107,7 @@ _NON_SECRET_METADATA_KEYS = {
     "allow_mixed_provider_credentials",
     "claude_credentials",
     "credential_domains",
+    "data_destinations",
     "mixed_provider_credentials",
 }
 
@@ -201,16 +202,14 @@ def _external_provider_domain(
     endpoints: list[str],
     provider_env: list[str],
     credential_refs: list[str],
-    web_search: dict | None = None,
 ) -> str:
-    """Return a non-secret identity for one external provider trust domain."""
+    """Return a non-secret identity for one model credential issuer."""
     identity = json.dumps(
         {
             "provider": provider or "external",
             "endpoints": sorted(set(endpoints)),
             "provider_env": sorted(set(provider_env)),
             "credential_refs": sorted(set(credential_refs)),
-            "web_search": web_search or {},
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -224,6 +223,28 @@ def _web_search_credential_domain(web_search: dict) -> str:
     identity = json.dumps(web_search, sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:12]
     return f"web-search:{web_search.get('provider', '?')}:{fingerprint}"
+
+
+def _data_destination(
+    kind: str,
+    provider: str,
+    endpoints: list[str] | tuple[str, ...] = (),
+) -> dict:
+    """Describe a non-secret service that receives model or search data.
+
+    Destinations are deliberately separate from credential issuers: a
+    key-free SearXNG instance receives queries but adds no credential domain,
+    while Brave adds both a destination and its own credential issuer.
+    """
+    destination = {"kind": kind, "provider": provider}
+    sanitized = sorted({
+        _sanitize_endpoint(endpoint)
+        for endpoint in endpoints
+        if isinstance(endpoint, str) and endpoint
+    })
+    if sanitized:
+        destination["endpoints"] = sanitized
+    return destination
 
 
 def _codex_config_endpoints(value, *, key: str = ""):
@@ -297,6 +318,17 @@ def resolve_runtime(config: dict | None = None) -> dict:
     needs_codex_cloud_auth = False
     needs_host_gateway = False
     credential_domains: set[str] = set()
+    data_destinations: dict[str, dict] = {}
+    external_model_destinations: set[str] = set()
+    external_model_credentials: set[str] = set()
+    has_external_access = bool(web_search)
+
+    def add_destination(destination: dict) -> str:
+        identity = json.dumps(
+            destination, sort_keys=True, separators=(",", ":"),
+        )
+        data_destinations[identity] = destination
+        return identity
 
     env_override = os.environ.get("CODEX_OSS_BASE_URL")
     for role, settings in _role_settings(resolved_config):
@@ -315,6 +347,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
         if backend == "claude":
             needs_claude = True
             credential_domains.add("claude")
+            add_destination(_data_destination("model", "claude"))
         elif backend == "codex":
             needs_codex = True
             oss = bool(settings.get("oss", False))
@@ -363,28 +396,30 @@ def resolve_runtime(config: dict | None = None) -> dict:
             if not external_provider:
                 needs_codex_cloud_auth = True
                 credential_domains.add("codex:openai")
-                # A search key next to cloud Codex auth is a second
-                # credential in the same sandbox; surface it as its own
-                # domain so mixing requires the explicit opt-in.
-                if web_search:
-                    credential_domains.add(
-                        _web_search_credential_domain(web_search)
-                    )
+                add_destination(_data_destination("model", "codex:openai"))
             else:
-                credential_domains.add(_external_provider_domain(
-                    provider=provider,
-                    endpoints=(
-                        [env_override]
-                        if env_override and oss
-                        else endpoints
-                    ),
-                    provider_env=list(dict.fromkeys([
-                        *configured_env,
-                        *web_search_env,
-                    ])),
-                    credential_refs=credential_refs,
-                    web_search=web_search,
-                ))
+                has_external_access = True
+                effective_endpoints = (
+                    [env_override]
+                    if env_override and oss
+                    else endpoints
+                )
+                external_model_destinations.add(add_destination(_data_destination(
+                    "model", f"codex:{provider or 'external'}",
+                    effective_endpoints,
+                )))
+                # A key-free local endpoint is still a data destination, but
+                # it is not a credential issuer.  Only provider-specific
+                # environment references create a credential domain.
+                if configured_env or credential_refs:
+                    model_credential = _external_provider_domain(
+                        provider=provider,
+                        endpoints=effective_endpoints,
+                        provider_env=list(configured_env),
+                        credential_refs=credential_refs,
+                    )
+                    credential_domains.add(model_credential)
+                    external_model_credentials.add(model_credential)
 
             role_runtime.update({
                 "oss": oss,
@@ -403,6 +438,14 @@ def resolve_runtime(config: dict | None = None) -> dict:
             "_web_search requires at least one Codex-backed role; Claude "
             "roles already have native web search"
         )
+    if web_search:
+        add_destination(_data_destination(
+            "search",
+            str(web_search.get("provider") or "unknown"),
+            [web_search["endpoint"]] if web_search.get("endpoint") else [],
+        ))
+        if web_search_env:
+            credential_domains.add(_web_search_credential_domain(web_search))
     # A loopback self-hosted search endpoint needs the same Linux
     # host-gateway mapping as a loopback model endpoint.
     if needs_codex and _endpoint_needs_host_gateway(
@@ -432,8 +475,24 @@ def resolve_runtime(config: dict | None = None) -> dict:
         domain for domain in credential_domains
         if domain not in {"claude", "codex:openai"}
     }
+    standard_model_credentials = credential_domains & {
+        "claude", "codex:openai",
+    }
+    # Credential issuers and data destinations are independent. A key-free
+    # external model still makes a standard Claude/Codex credential foreign
+    # to that model's trust boundary. Likewise, a second external model can
+    # inspect the first external model's key in the shared sandbox. A lone
+    # Brave key with a key-free model remains one intended credential issuer.
+    foreign_model_credential_exposure = bool(
+        (external_model_destinations and standard_model_credentials)
+        or (
+            len(external_model_destinations) > 1
+            and external_model_credentials
+        )
+    )
     mixed_provider_credentials = bool(
-        external_domains and len(credential_domains) > 1
+        (external_domains and len(credential_domains) > 1)
+        or foreign_model_credential_exposure
     )
     return {
         "active_backends": sorted({r["backend"] for r in roles.values()}),
@@ -447,10 +506,14 @@ def resolve_runtime(config: dict | None = None) -> dict:
             ),
             "mixed_provider_credentials": mixed_provider_credentials,
             "allow_mixed_provider_credentials": allow_mixed_credentials,
-            "external_provider": bool(external_domains),
+            "external_provider": has_external_access,
             "allow_external_provider_host_access": allow_external_host,
         },
         "credential_domains": sorted(credential_domains),
+        "data_destinations": sorted(
+            data_destinations.values(),
+            key=lambda item: json.dumps(item, sort_keys=True),
+        ),
         "web_search": web_search or None,
         "provider_env": [
             {"name": name, "present": bool(os.environ.get(name))}
@@ -905,9 +968,10 @@ async def run_problems(
         and not requirements["allow_mixed_provider_credentials"]
     ):
         raise RuntimeError(
-            "External model providers cannot share a run with Claude, Codex "
-            "cloud, or another external provider because every role can access "
-            "the run's credentials. Use one provider trust domain, or set "
+            "Credentials cannot cross an external model trust boundary, and "
+            "multiple external credential issuers cannot share a run, because "
+            "every role can access the run's credentials. Use one provider "
+            "trust domain, or set "
             "_security.allow_mixed_provider_credentials: true only after "
             "accepting that exposure."
         )

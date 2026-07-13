@@ -12,9 +12,10 @@ Two providers, selected by the THEORIA_SEARCH_PROVIDER environment
 variable (the harness sets it from the run's `_web_search` config):
 
   brave (default) — the hosted Brave Search API, an independent index
-      behind a stable keyed JSON API. BRAVE_API_KEY must be present;
-      the endpoint is fixed, and THEORIA_SEARCH_ENDPOINT exists only so
-      tests can point the CLI at a mock server.
+      behind a stable keyed JSON API. The key defaults to BRAVE_API_KEY;
+      THEORIA_SEARCH_API_KEY_ENV may select another environment-variable
+      name. The endpoint is fixed, and THEORIA_SEARCH_ENDPOINT exists only
+      so tests can point the CLI at a mock server.
   searxng — a self-hosted SearXNG metasearch instance. Key-free and
       quota-free; THEORIA_SEARCH_ENDPOINT must carry the instance URL
       (the harness routes and injects it), and the instance must enable
@@ -44,7 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1"
+VERSION = "1.2"
 PROVIDERS = ("brave", "searxng")
 PROVIDER_ENV = "THEORIA_SEARCH_PROVIDER"
 DEFAULT_PROVIDER = "brave"
@@ -53,6 +54,7 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 # for the fixed Brave endpoint.
 DEFAULT_ENDPOINT = BRAVE_ENDPOINT
 API_KEY_ENV = "BRAVE_API_KEY"
+API_KEY_NAME_ENV = "THEORIA_SEARCH_API_KEY_ENV"
 ENDPOINT_ENV = "THEORIA_SEARCH_ENDPOINT"
 
 REQUEST_TIMEOUT_SECS = 20
@@ -86,6 +88,16 @@ def _provider() -> str:
             f"{PROVIDER_ENV} must be one of: " + ", ".join(PROVIDERS)
         )
     return provider
+
+
+def _api_key_env() -> str:
+    """Return the configured Brave key reference, never the key value."""
+    name = os.environ.get(API_KEY_NAME_ENV, API_KEY_ENV)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(
+            f"{API_KEY_NAME_ENV} must name an environment variable"
+        )
+    return name
 
 
 def _endpoint(provider: str) -> str:
@@ -245,15 +257,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_CONFIG
 
-    api_key = os.environ.get(API_KEY_ENV, "")
-    if provider == "brave" and not api_key:
-        print(
-            f"error: {API_KEY_ENV} is not set. Web search is unavailable in "
-            "this environment — do not retry; verify the claim another way "
-            "or take the conservative path.",
-            file=sys.stderr,
-        )
-        return EXIT_CONFIG
+    api_key = ""
+    if provider == "brave":
+        try:
+            api_key_env = _api_key_env()
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return EXIT_CONFIG
+        api_key = os.environ.get(api_key_env, "")
+        if not api_key:
+            print(
+                f"error: {api_key_env} is not set. Web search is unavailable "
+                "in this environment — do not retry; verify the claim another "
+                "way or take the conservative path.",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
 
     try:
         payload = _fetch(provider, args.query, args.count, args.offset,

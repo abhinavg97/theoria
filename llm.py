@@ -1105,6 +1105,7 @@ _WEB_SEARCH_FIELDS = {"provider", "api_key_env", "endpoint"}
 _WEB_SEARCH_DEFAULT_KEY_ENV = {"brave": "BRAVE_API_KEY"}
 _WEB_SEARCH_PROVIDER_ENV = "THEORIA_SEARCH_PROVIDER"
 _WEB_SEARCH_ENDPOINT_ENV = "THEORIA_SEARCH_ENDPOINT"
+_WEB_SEARCH_API_KEY_NAME_ENV = "THEORIA_SEARCH_API_KEY_ENV"
 _SENSITIVE_CODEX_CONFIG_PARTS = {
     "api_key", "authorization", "bearer_token", "cookie", "credential",
     "key", "password", "secret", "token",
@@ -2110,6 +2111,14 @@ async def llm(
                 web_search_env_vars = {
                     _WEB_SEARCH_PROVIDER_ENV: web_search["provider"],
                 }
+                if web_search.get("api_key_env"):
+                    # The helper needs the configured *name* so custom
+                    # references such as SEARCH_KEY work.  This selector is
+                    # non-secret; the value itself still travels only through
+                    # the provider_env allowlist prepared by the harness.
+                    web_search_env_vars[_WEB_SEARCH_API_KEY_NAME_ENV] = (
+                        web_search["api_key_env"]
+                    )
                 if web_search.get("endpoint"):
                     web_search_env_vars[_WEB_SEARCH_ENDPOINT_ENV] = (
                         _route_oss_base_url(

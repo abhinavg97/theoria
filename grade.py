@@ -27,7 +27,7 @@ from pathlib import Path
 
 from llm import llm as _llm_call
 from llm import uses_external_codex_provider
-from pipeline import load_config
+from pipeline import compose_role_prompt, load_config
 
 
 # ── Structured output schema (identical to the internal audit grader) ──
@@ -232,9 +232,11 @@ async def grade_run(
                 "the provider-controlled agent can inspect host-readable data."
             )
     prompt_text, prompt_sha = load_prompt()
-    prompt_suffix = settings.get("prompt_suffix", "")
-    if prompt_suffix:
-        prompt_text = f"{prompt_text.rstrip()}\n\n{prompt_suffix}\n"
+    composed_prompt = compose_role_prompt(
+        prompt_text.rstrip(), settings, config,
+    )
+    if composed_prompt != prompt_text.rstrip():
+        prompt_text = f"{composed_prompt}\n"
         prompt_sha = hashlib.sha256(prompt_text.encode()).hexdigest()[:16]
     grader_model = (
         f"{settings.get('backend', 'claude')}:"

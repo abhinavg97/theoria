@@ -36,6 +36,7 @@ def search_server(monkeypatch):
     thread.start()
     host, port = server.server_address
     monkeypatch.delenv(search_cli.PROVIDER_ENV, raising=False)
+    monkeypatch.delenv(search_cli.API_KEY_NAME_ENV, raising=False)
     monkeypatch.setenv(
         search_cli.ENDPOINT_ENV, f"http://{host}:{port}/res/v1/web/search",
     )
@@ -56,6 +57,7 @@ def searxng_server(monkeypatch):
     host, port = server.server_address
     monkeypatch.setenv(search_cli.PROVIDER_ENV, "searxng")
     monkeypatch.setenv(search_cli.ENDPOINT_ENV, f"http://{host}:{port}")
+    monkeypatch.delenv(search_cli.API_KEY_NAME_ENV, raising=False)
     monkeypatch.delenv(search_cli.API_KEY_ENV, raising=False)
     try:
         yield server.state
@@ -85,11 +87,32 @@ def _brave_payload():
 
 
 def test_missing_api_key_fails_with_config_exit_code(monkeypatch, capsys):
+    monkeypatch.delenv(search_cli.API_KEY_NAME_ENV, raising=False)
     monkeypatch.delenv(search_cli.API_KEY_ENV, raising=False)
     monkeypatch.delenv(search_cli.ENDPOINT_ENV, raising=False)
 
     assert search_cli.main(["query"]) == search_cli.EXIT_CONFIG
     assert search_cli.API_KEY_ENV in capsys.readouterr().err
+
+
+def test_custom_api_key_environment_name_is_honored(
+    search_server, monkeypatch, capsys,
+):
+    search_server["responses"] = [(200, _brave_payload())]
+    monkeypatch.delenv(search_cli.API_KEY_ENV, raising=False)
+    monkeypatch.setenv(search_cli.API_KEY_NAME_ENV, "SEARCH_KEY")
+    monkeypatch.setenv("SEARCH_KEY", "custom-key")
+
+    assert search_cli.main(["custom key"]) == search_cli.EXIT_OK
+    assert search_server["requests"][0]["token"] == "custom-key"
+    assert "RFC 9110" in capsys.readouterr().out
+
+
+def test_invalid_api_key_environment_name_fails_closed(monkeypatch, capsys):
+    monkeypatch.setenv(search_cli.API_KEY_NAME_ENV, "not a name")
+
+    assert search_cli.main(["query"]) == search_cli.EXIT_CONFIG
+    assert search_cli.API_KEY_NAME_ENV in capsys.readouterr().err
 
 
 def test_search_prints_clean_titles_urls_and_snippets(search_server, capsys):

@@ -6,13 +6,6 @@
 # structured output; basic Chat Completions compatibility is not sufficient.
 # Never put the credential value in this file.
 
-_no_search_policy: &no_search_policy |
-  Live web search is disabled for this profile. Retrieving a known URL is
-  direct fetch, not search or source discovery. You may fetch and check an
-  authoritative source when its URL is already known. For any material
-  external claim that cannot be verified with the available tools, take this
-  role's conservative failure path rather than relying on memory.
-
 _custom_provider_config: &custom_provider_config
   model_provider: oss_custom
   model_providers.oss_custom.name: OSS custom provider
@@ -32,18 +25,15 @@ _custom_role: &custom_role
 
 solver:
   <<: *custom_role
-  prompt_suffix: *no_search_policy
 
 interpreter:
   <<: *custom_role
 
 formalizer:
   <<: *custom_role
-  prompt_suffix: *no_search_policy
 
 citation:
   <<: *custom_role
-  prompt_suffix: *no_search_policy
 
 problem_given:
   <<: *custom_role
@@ -53,11 +43,9 @@ computation:
 
 pedantry:
   <<: *custom_role
-  prompt_suffix: *no_search_policy
 
 convention_lift:
   <<: *custom_role
-  prompt_suffix: *no_search_policy
 
 initial_state:
   <<: *custom_role

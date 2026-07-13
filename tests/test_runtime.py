@@ -69,8 +69,13 @@ def test_external_provider_cannot_share_subscription_credentials(monkeypatch):
     runtime = harness.resolve_runtime(config)
 
     assert runtime["requirements"]["mixed_provider_credentials"] is True
-    assert runtime["credential_domains"][0] == "claude"
-    assert runtime["credential_domains"][1].startswith("codex:ollama:")
+    # Ollama is key-free, so it is a data destination rather than a second
+    # credential issuer. It still cannot inherit Claude's credential without
+    # the explicit mixed-trust opt-in.
+    assert runtime["credential_domains"] == ["claude"]
+    assert {item["provider"] for item in runtime["data_destinations"]} == {
+        "claude", "codex:ollama",
+    }
 
 
 def test_custom_openai_endpoint_is_an_external_domain(monkeypatch):
@@ -159,11 +164,13 @@ def test_web_search_key_joins_oss_provider_forwarding(monkeypatch):
 
     runtime = harness.resolve_runtime(config)
 
-    # One uniform external domain: the search key is part of the same
-    # trust domain as the local provider, not a second one.
+    # One credential issuer (Brave) alongside a key-free local model.
     assert runtime["requirements"]["mixed_provider_credentials"] is False
     assert len(runtime["credential_domains"]) == 1
-    assert runtime["credential_domains"][0].startswith("codex:ollama:")
+    assert runtime["credential_domains"][0].startswith("web-search:brave:")
+    assert {item["provider"] for item in runtime["data_destinations"]} == {
+        "codex:ollama", "brave",
+    }
     assert runtime["web_search"] == {
         "provider": "brave",
         "api_key_env": "BRAVE_API_KEY",
@@ -199,6 +206,14 @@ def test_searxng_search_needs_no_env_and_requests_linux_gateway(monkeypatch):
     }
     assert runtime["roles"]["solver"]["web_search"] == "searxng"
     assert runtime["requirements"]["mixed_provider_credentials"] is False
+    assert runtime["credential_domains"] == []
+    destinations = {
+        (item["kind"], item["provider"]): item
+        for item in runtime["data_destinations"]
+    }
+    assert destinations[("search", "searxng")]["endpoints"] == [
+        "http://localhost:8888"
+    ]
     # The loopback instance needs the same Linux host-gateway mapping
     # as the loopback model endpoint.
     assert runtime["requirements"]["linux_host_gateway"] is True
@@ -217,6 +232,60 @@ def test_web_search_with_cloud_codex_is_mixed_credentials(monkeypatch):
         domain.startswith("web-search:brave:")
         for domain in runtime["credential_domains"]
     )
+
+
+def test_keyless_searxng_with_cloud_codex_is_not_mixed_credentials(
+    monkeypatch,
+):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    runtime = harness.resolve_runtime({
+        "_web_search": {
+            "provider": "searxng",
+            "endpoint": "https://search.example.test",
+        },
+        "solver": {"backend": "codex", "model": "gpt-5.5"},
+    })
+
+    assert runtime["requirements"]["mixed_provider_credentials"] is False
+    assert runtime["credential_domains"] == ["codex:openai"]
+    assert {item["provider"] for item in runtime["data_destinations"]} == {
+        "codex:openai", "searxng",
+    }
+
+
+def test_keyed_custom_provider_plus_brave_has_two_credential_issuers(
+    monkeypatch,
+):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    runtime = harness.resolve_runtime({
+        "_web_search": {"provider": "brave", "api_key_env": "SEARCH_KEY"},
+        "solver": {
+            "backend": "codex",
+            "model": "deployment-name",
+            "codex_config": {
+                "model_provider": "azure",
+                "model_providers.azure.base_url": (
+                    "https://resource.openai.azure.com/openai/v1"
+                ),
+                "model_providers.azure.env_key": "AZURE_OPENAI_API_KEY",
+            },
+            "provider_env": ["AZURE_OPENAI_API_KEY"],
+        },
+    })
+
+    assert runtime["requirements"]["mixed_provider_credentials"] is True
+    assert len(runtime["credential_domains"]) == 2
+    assert any(
+        domain.startswith("codex:azure:")
+        for domain in runtime["credential_domains"]
+    )
+    assert any(
+        domain.startswith("web-search:brave:")
+        for domain in runtime["credential_domains"]
+    )
+    assert {item["provider"] for item in runtime["data_destinations"]} == {
+        "codex:azure", "brave",
+    }
 
 
 def test_role_level_web_search_is_rejected():

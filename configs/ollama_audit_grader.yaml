@@ -1,14 +1,6 @@
 # Unaudited answer-grader profile using Codex's built-in Ollama adapter.
 # Override the example model with `theoria grade --codex-model MODEL`.
 
-_no_search_policy: &no_search_policy |
-  The earlier Web search section does not apply to this profile: live web
-  search is disabled. Retrieving a known URL is direct fetch, not search or
-  source discovery. You may fetch and check an authoritative source when its
-  URL is already known. For any material external claim that cannot be
-  verified with the available tools, grade conservatively rather than relying
-  on memory.
-
 audit_grader:
   backend: codex
   model: gpt-oss:20b
@@ -19,4 +11,3 @@ audit_grader:
   provider_env: []
   search: false
   schema_retries: 1
-  prompt_suffix: *no_search_policy

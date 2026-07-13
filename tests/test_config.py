@@ -55,7 +55,8 @@ def test_brave_search_profile_stacks_on_ollama_without_losing_provider():
         # ... while the search profile swaps the no-search policy for the
         # shell helper and keeps Codex's native search tool disabled.
         assert settings["search"] is False
-        assert "theoria-search" in settings["prompt_suffix"]
+        assert "theoria-search" in pipeline.role_search_policy(settings, config)
+        assert "prompt_suffix" not in settings
 
 
 def test_searxng_search_profile_stacks_on_ollama():
@@ -73,7 +74,8 @@ def test_searxng_search_profile_stacks_on_ollama():
         settings = config[role]
         assert settings["oss"] is True
         assert settings["search"] is False
-        assert "theoria-search" in settings["prompt_suffix"]
+        assert "theoria-search" in pipeline.role_search_policy(settings, config)
+        assert "prompt_suffix" not in settings
 
 
 def test_custom_provider_profile_uses_env_reference_not_secret():
