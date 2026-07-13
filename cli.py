@@ -545,25 +545,38 @@ def cmd_doctor(args) -> None:
                   reachable,
                   "verify the provider service and its configured base URL")
         if web_search:
-            search_url = search_cli.DEFAULT_ENDPOINT
+            if web_search["provider"] == "brave":
+                # Hosted API on a fixed endpoint. Any HTTP status (401
+                # without a key) proves a listening server.
+                search_url = search_cli.DEFAULT_ENDPOINT
+                require_ok = False
+                hint = "check outbound network access from the sandbox/host"
+            else:
+                # Self-hosted SearXNG: a real JSON query must return 200 —
+                # a 403 means the instance is up but its json format is
+                # disabled, which would fail every agent search.
+                base = web_search["endpoint"]
+                if args.docker:
+                    base = llm._route_oss_base_url(base, sandboxed=True)
+                search_url = base.rstrip("/") + "/search?q=theoria&format=json"
+                require_ok = True
+                hint = ("start the SearXNG instance and enable the json "
+                        "format (settings.yml: search.formats)")
             if args.docker:
                 search_reachable = sandbox.url_reachable_from_image(
-                    args.image, search_url,
+                    args.image, search_url, require_ok=require_ok,
                 )
             else:
-                # An HTTP error (401 without a key) still proves the
-                # search API answers from this host.
                 try:
                     request = urllib.request.Request(search_url, method="GET")
-                    with urllib.request.urlopen(request, timeout=5):
+                    with urllib.request.urlopen(request, timeout=10):
                         search_reachable = True
                 except urllib.error.HTTPError:
-                    search_reachable = True
+                    search_reachable = not require_ok
                 except (OSError, ValueError, urllib.error.URLError):
                     search_reachable = False
             check(f"{web_search['provider']} search API reachable",
-                  search_reachable,
-                  "check outbound network access from the sandbox/host")
+                  search_reachable, hint)
 
     daemon_ok = False
     if args.docker:

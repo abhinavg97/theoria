@@ -554,12 +554,17 @@ def endpoint_reachable_from_image(
     return bool(output and output.isdigit() and output != "000")
 
 
-def url_reachable_from_image(image: str, url: str) -> bool:
+def url_reachable_from_image(
+    image: str, url: str, *, require_ok: bool = False,
+) -> bool:
     """Probe one absolute URL from the selected sandbox image.
 
-    Any HTTP status counts as reachable (an auth failure still proves a
-    listening server); 000 means curl could not connect at all. Used by
-    doctor for the fixed public search API, so no loopback routing.
+    By default any HTTP status counts as reachable (an auth failure
+    still proves a listening server); 000 means curl could not connect
+    at all. With require_ok=True only a 2xx passes — used for endpoints
+    that must actually serve the probe (a SearXNG instance whose json
+    format is disabled answers 403 but would fail every agent search).
+    The caller routes loopback URLs before probing.
     """
     try:
         parsed = urlsplit(url)
@@ -567,14 +572,25 @@ def url_reachable_from_image(image: str, url: str) -> bool:
         return False
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
+    docker_args = []
+    if (
+        parsed.hostname.lower() == "host.docker.internal"
+        and sys.platform.startswith("linux")
+    ):
+        docker_args = ["--add-host=host.docker.internal:host-gateway"]
     output = command_in_image(
         image,
         [
             "curl", "--silent", "--show-error", "--output", "/dev/null",
-            "--write-out", "%{http_code}", "--max-time", "5", url,
+            "--write-out", "%{http_code}", "--max-time", "10", url,
         ],
+        extra_docker_args=docker_args,
     )
-    return bool(output and output.isdigit() and output != "000")
+    if not output or not output.isdigit() or output == "000":
+        return False
+    if require_ok:
+        return output.startswith("2")
+    return True
 
 
 def pip_freeze_in_container(container_id: str) -> str | None:

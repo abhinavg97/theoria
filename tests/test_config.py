@@ -58,6 +58,24 @@ def test_brave_search_profile_stacks_on_ollama_without_losing_provider():
         assert "theoria-search" in settings["prompt_suffix"]
 
 
+def test_searxng_search_profile_stacks_on_ollama():
+    root = Path(__file__).parents[1]
+    config = pipeline.load_config([
+        root / "configs" / "ollama.yaml",
+        root / "configs" / "searxng_search.yaml",
+    ])
+
+    assert llm.web_search_config(config["_web_search"]) == {
+        "provider": "searxng",
+        "endpoint": "http://localhost:8888",
+    }
+    for role in ACTIVE_ROLES:
+        settings = config[role]
+        assert settings["oss"] is True
+        assert settings["search"] is False
+        assert "theoria-search" in settings["prompt_suffix"]
+
+
 def test_custom_provider_profile_uses_env_reference_not_secret():
     root = Path(__file__).parents[1]
     config = pipeline.load_config(

@@ -172,6 +172,38 @@ def test_web_search_key_joins_oss_provider_forwarding(monkeypatch):
     assert {"name": "BRAVE_API_KEY", "present": True} in runtime["provider_env"]
 
 
+def test_searxng_search_needs_no_env_and_requests_linux_gateway(monkeypatch):
+    monkeypatch.setattr(harness.sys, "platform", "linux")
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    config = {
+        "_web_search": {
+            "provider": "searxng",
+            "endpoint": "http://localhost:8888",
+        },
+        "solver": {
+            "backend": "codex",
+            "model": "gpt-oss:20b",
+            "oss": True,
+            "local_provider": "ollama",
+            "oss_base_url": "http://localhost:11434/v1",
+        },
+    }
+
+    runtime = harness.resolve_runtime(config)
+
+    # Key-free: nothing joins the forwarded-environment allowlist.
+    assert runtime["provider_env"] == []
+    assert runtime["web_search"] == {
+        "provider": "searxng",
+        "endpoint": "http://localhost:8888",
+    }
+    assert runtime["roles"]["solver"]["web_search"] == "searxng"
+    assert runtime["requirements"]["mixed_provider_credentials"] is False
+    # The loopback instance needs the same Linux host-gateway mapping
+    # as the loopback model endpoint.
+    assert runtime["requirements"]["linux_host_gateway"] is True
+
+
 def test_web_search_with_cloud_codex_is_mixed_credentials(monkeypatch):
     monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
     runtime = harness.resolve_runtime({

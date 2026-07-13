@@ -35,10 +35,28 @@ def search_server(monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
+    monkeypatch.delenv(search_cli.PROVIDER_ENV, raising=False)
     monkeypatch.setenv(
         search_cli.ENDPOINT_ENV, f"http://{host}:{port}/res/v1/web/search",
     )
     monkeypatch.setenv(search_cli.API_KEY_ENV, "test-key")
+    try:
+        yield server.state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def searxng_server(monkeypatch):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server.state = {"requests": [], "responses": [(200, {})]}
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    monkeypatch.setenv(search_cli.PROVIDER_ENV, "searxng")
+    monkeypatch.setenv(search_cli.ENDPOINT_ENV, f"http://{host}:{port}")
+    monkeypatch.delenv(search_cli.API_KEY_ENV, raising=False)
     try:
         yield server.state
     finally:
@@ -140,6 +158,83 @@ def test_count_and_offset_are_bounded(monkeypatch, capsys):
     assert search_cli.main(["query", "--count", "0"]) == search_cli.EXIT_USAGE
     assert search_cli.main(["query", "--count", "21"]) == search_cli.EXIT_USAGE
     assert search_cli.main(["query", "--offset", "10"]) == search_cli.EXIT_USAGE
+
+
+def _searxng_payload():
+    return {
+        "query": "rfc 9110",
+        "results": [
+            {
+                "title": "RFC 9110: <strong>HTTP</strong> Semantics",
+                "url": "https://www.rfc-editor.org/rfc/rfc9110",
+                "content": "The &quot;core&quot; semantics of HTTP.",
+                "publishedDate": "2022-06-06",
+                "engine": "brave",
+            },
+            {
+                "title": "Second result",
+                "url": "https://example.test/second",
+                "content": "",
+            },
+            {
+                "title": "Third result",
+                "url": "https://example.test/third",
+                "content": "",
+            },
+        ],
+    }
+
+
+def test_searxng_provider_needs_no_key_and_parses_results(
+    searxng_server, capsys,
+):
+    searxng_server["responses"] = [(200, _searxng_payload())]
+
+    assert search_cli.main(["rfc 9110", "--count", "2"]) == search_cli.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "1. RFC 9110: HTTP Semantics  (2022-06-06)" in out
+    assert "https://www.rfc-editor.org/rfc/rfc9110" in out
+    assert 'The "core" semantics of HTTP.' in out
+    # --count is applied client-side (SearXNG paginates, ~10 per page).
+    assert "Third result" not in out
+
+    request = searxng_server["requests"][0]
+    assert request["path"].startswith("/search?")
+    assert "format=json" in request["path"]
+    assert "pageno=1" in request["path"]
+    assert request["token"] is None  # no credential sent anywhere
+
+
+def test_searxng_offset_maps_to_pages(searxng_server):
+    searxng_server["responses"] = [(200, _searxng_payload())]
+
+    assert search_cli.main(["query", "--offset", "2"]) == search_cli.EXIT_OK
+    assert "pageno=3" in searxng_server["requests"][0]["path"]
+
+
+def test_searxng_without_endpoint_fails_closed(monkeypatch, capsys):
+    monkeypatch.setenv(search_cli.PROVIDER_ENV, "searxng")
+    monkeypatch.delenv(search_cli.ENDPOINT_ENV, raising=False)
+
+    assert search_cli.main(["query"]) == search_cli.EXIT_CONFIG
+    assert search_cli.ENDPOINT_ENV in capsys.readouterr().err
+
+
+def test_searxng_403_explains_json_format(searxng_server, capsys):
+    searxng_server["responses"] = [(403, {"detail": "forbidden"})]
+
+    assert search_cli.main(["query"]) == search_cli.EXIT_HTTP
+    err = capsys.readouterr().err
+    assert "HTTP 403" in err
+    assert "json format" in err
+
+
+def test_unknown_provider_fails_closed(monkeypatch, capsys):
+    monkeypatch.setenv(search_cli.PROVIDER_ENV, "google")
+
+    assert search_cli.main(["query"]) == search_cli.EXIT_CONFIG
+    assert search_cli.PROVIDER_ENV in capsys.readouterr().err
 
 
 def test_sandbox_copies_match_the_canonical_module():

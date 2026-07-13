@@ -8,11 +8,20 @@ all: any agent with a shell function tool can discover sources with
 
     theoria-search "original 1998 PageRank paper" --count 5
 
-The query goes to the Brave Search API. BRAVE_API_KEY must be present in
-the environment; the endpoint is fixed to Brave's hosted API. The
-THEORIA_SEARCH_ENDPOINT override exists only so tests can point the CLI
-at a mock server — anyone who can set it can already reach the network
-directly, so it grants no new capability.
+Two providers, selected by the THEORIA_SEARCH_PROVIDER environment
+variable (the harness sets it from the run's `_web_search` config):
+
+  brave (default) — the hosted Brave Search API, an independent index
+      behind a stable keyed JSON API. BRAVE_API_KEY must be present;
+      the endpoint is fixed, and THEORIA_SEARCH_ENDPOINT exists only so
+      tests can point the CLI at a mock server.
+  searxng — a self-hosted SearXNG metasearch instance. Key-free and
+      quota-free; THEORIA_SEARCH_ENDPOINT must carry the instance URL
+      (the harness routes and injects it), and the instance must enable
+      the JSON output format (settings.yml: search.formats).
+
+Neither env var grants new capability: anyone who can set them can
+already reach the network directly from the sandbox shell.
 
 Stdlib-only on purpose: the sandbox images install it as a single file
 at /usr/local/bin/theoria-search, and `pip install -e .` exposes the
@@ -35,9 +44,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0"
-PROVIDER = "brave"
-DEFAULT_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+VERSION = "1.1"
+PROVIDERS = ("brave", "searxng")
+PROVIDER_ENV = "THEORIA_SEARCH_PROVIDER"
+DEFAULT_PROVIDER = "brave"
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+# Backwards-compatible alias: doctor and older callers import this name
+# for the fixed Brave endpoint.
+DEFAULT_ENDPOINT = BRAVE_ENDPOINT
 API_KEY_ENV = "BRAVE_API_KEY"
 ENDPOINT_ENV = "THEORIA_SEARCH_ENDPOINT"
 
@@ -65,10 +79,24 @@ def _clean(text) -> str:
     return _CTRL.sub("", html.unescape(_TAG.sub("", text))).strip()
 
 
-def _endpoint() -> str:
+def _provider() -> str:
+    provider = os.environ.get(PROVIDER_ENV, DEFAULT_PROVIDER)
+    if provider not in PROVIDERS:
+        raise ValueError(
+            f"{PROVIDER_ENV} must be one of: " + ", ".join(PROVIDERS)
+        )
+    return provider
+
+
+def _endpoint(provider: str) -> str:
     override = os.environ.get(ENDPOINT_ENV)
     if not override:
-        return DEFAULT_ENDPOINT
+        if provider == "brave":
+            return BRAVE_ENDPOINT
+        raise ValueError(
+            f"the {provider} provider needs {ENDPOINT_ENV} to carry the "
+            "instance URL (set _web_search.endpoint in the run config)"
+        )
     parsed = urllib.parse.urlsplit(override)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError(
@@ -77,30 +105,42 @@ def _endpoint() -> str:
     return override
 
 
-def _request(url: str, api_key: str):
-    return urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "Accept-Encoding": "identity",
-            "X-Subscription-Token": api_key,
-            "User-Agent": f"theoria-search/{VERSION}",
-        },
-        method="GET",
-    )
-
-
-def _fetch(query: str, count: int, offset: int, api_key: str) -> dict:
+def _build_url(provider: str, query: str, count: int, offset: int) -> str:
+    endpoint = _endpoint(provider)
+    if provider == "brave":
+        params = urllib.parse.urlencode(
+            {"q": query, "count": count, "offset": offset}
+        )
+        return f"{endpoint}?{params}"
+    # SearXNG paginates instead of offsetting; ~10 results per page. The
+    # `count` bound is applied client-side in _results.
     params = urllib.parse.urlencode(
-        {"q": query, "count": count, "offset": offset}
+        {"q": query, "format": "json", "pageno": offset + 1}
     )
-    url = f"{_endpoint()}?{params}"
+    return f"{endpoint.rstrip('/')}/search?{params}"
+
+
+def _request(provider: str, url: str, api_key: str):
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "User-Agent": f"theoria-search/{VERSION}",
+    }
+    if provider == "brave":
+        headers["X-Subscription-Token"] = api_key
+    return urllib.request.Request(url, headers=headers, method="GET")
+
+
+def _fetch(provider: str, query: str, count: int, offset: int,
+           api_key: str) -> dict:
+    url = _build_url(provider, query, count, offset)
     attempts = 0
     while True:
         attempts += 1
         try:
             with urllib.request.urlopen(
-                _request(url, api_key), timeout=REQUEST_TIMEOUT_SECS,
+                _request(provider, url, api_key),
+                timeout=REQUEST_TIMEOUT_SECS,
             ) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
@@ -117,9 +157,15 @@ def _fetch(query: str, count: int, offset: int, api_key: str) -> dict:
                 body = _clean(error.read().decode(errors="replace"))[:300]
             except OSError:
                 pass
+            hint = ""
+            if provider == "searxng" and error.code == 403:
+                hint = (
+                    " (a SearXNG 403 usually means the json format is "
+                    "disabled — add it to search.formats in settings.yml)"
+                )
             raise RuntimeError(
                 f"search API returned HTTP {error.code}"
-                + (f": {body}" if body else "")
+                + (f": {body}" if body else "") + hint
             ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise RuntimeError(f"search API is unreachable: {error}") from error
@@ -129,9 +175,12 @@ def _fetch(query: str, count: int, offset: int, api_key: str) -> dict:
             ) from error
 
 
-def _results(payload: dict) -> list[dict]:
-    web = payload.get("web") if isinstance(payload, dict) else None
-    raw = web.get("results") if isinstance(web, dict) else None
+def _results(provider: str, payload: dict, count: int) -> list[dict]:
+    if provider == "brave":
+        web = payload.get("web") if isinstance(payload, dict) else None
+        raw = web.get("results") if isinstance(web, dict) else None
+    else:
+        raw = payload.get("results") if isinstance(payload, dict) else None
     results = []
     for item in raw or []:
         if not isinstance(item, dict):
@@ -139,19 +188,26 @@ def _results(payload: dict) -> list[dict]:
         results.append({
             "title": _clean(item.get("title")),
             "url": _clean(item.get("url")),
-            "description": _clean(item.get("description")),
-            "age": _clean(item.get("age") or item.get("page_age")),
+            "description": _clean(
+                item.get("description")
+                if provider == "brave" else item.get("content")
+            ),
+            "age": _clean(
+                (item.get("age") or item.get("page_age"))
+                if provider == "brave" else item.get("publishedDate")
+            ),
         })
+        if len(results) >= count:
+            break
     return results
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="theoria-search",
-        description="Search the web (Brave Search API) and print result "
-                    "titles, URLs, and snippets. Snippets are leads — fetch "
-                    "and inspect the source before treating a claim as "
-                    "verified.",
+        description="Search the web and print result titles, URLs, and "
+                    "snippets. Snippets are leads — fetch and inspect the "
+                    "source before treating a claim as verified.",
     )
     parser.add_argument("query", help="What to search for.")
     parser.add_argument(
@@ -168,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--version", action="version",
-        version=f"theoria-search {VERSION} ({PROVIDER})",
+        version=f"theoria-search {VERSION} "
+                f"(providers: {', '.join(PROVIDERS)})",
     )
     args = parser.parse_args(argv)
 
@@ -182,8 +239,14 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --offset must be between 0 and 9", file=sys.stderr)
         return EXIT_USAGE
 
+    try:
+        provider = _provider()
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return EXIT_CONFIG
+
     api_key = os.environ.get(API_KEY_ENV, "")
-    if not api_key:
+    if provider == "brave" and not api_key:
         print(
             f"error: {API_KEY_ENV} is not set. Web search is unavailable in "
             "this environment — do not retry; verify the claim another way "
@@ -193,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG
 
     try:
-        payload = _fetch(args.query, args.count, args.offset, api_key)
+        payload = _fetch(provider, args.query, args.count, args.offset,
+                         api_key)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_CONFIG
@@ -201,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_HTTP
 
-    results = _results(payload)
+    results = _results(provider, payload, args.count)
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return EXIT_OK

@@ -146,6 +146,86 @@ def test_web_search_config_normalizes_and_fails_closed():
         llm.web_search_config({"provider": "brave", "api_key": "secret"})
 
 
+def test_web_search_searxng_requires_endpoint_and_forbids_keys():
+    assert llm.web_search_config(
+        {"provider": "searxng", "endpoint": "http://localhost:8888"}
+    ) == {"provider": "searxng", "endpoint": "http://localhost:8888"}
+
+    with pytest.raises(ValueError, match="endpoint is required"):
+        llm.web_search_config({"provider": "searxng"})
+    with pytest.raises(ValueError, match="not supported for searxng"):
+        llm.web_search_config({
+            "provider": "searxng",
+            "endpoint": "http://localhost:8888",
+            "api_key_env": "SEARX_KEY",
+        })
+    with pytest.raises(ValueError, match="not configurable for brave"):
+        llm.web_search_config({
+            "provider": "brave",
+            "endpoint": "https://example.test",
+        })
+    with pytest.raises(ValueError, match="http\\(s\\)"):
+        llm.web_search_config({
+            "provider": "searxng",
+            "endpoint": "ftp://localhost:8888",
+        })
+    assert llm.web_search_env_names(
+        {"provider": "searxng", "endpoint": "http://localhost:8888"}
+    ) == []
+
+
+def test_searxng_search_injects_helper_env_without_any_key(monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "ok"},
+        },
+    ]
+    captured_envs = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            payload = "\n".join(json.dumps(event) for event in events)
+            return payload.encode(), b""
+
+    async def fake_create_subprocess_exec(*_command, **kwargs):
+        captured_envs.append(kwargs.get("env"))
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+    )
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+
+    response, _ = asyncio.run(llm.llm(
+        "prompt",
+        role="solver",
+        config={
+            "_web_search": {
+                "provider": "searxng",
+                "endpoint": "http://localhost:8888",
+            },
+            "_security": {"allow_external_provider_host_access": True},
+            "solver": {
+                "backend": "codex",
+                "model": "gpt-oss:20b",
+                "oss": True,
+                "local_provider": "ollama",
+                "search": False,
+            },
+        },
+    ))
+
+    assert response == "ok"
+    env = captured_envs[0]
+    assert env["THEORIA_SEARCH_PROVIDER"] == "searxng"
+    # Host mode keeps the loopback endpoint unrouted.
+    assert env["THEORIA_SEARCH_ENDPOINT"] == "http://localhost:8888"
+
+
 def test_codex_config_rejects_mcp_server_declarations():
     with pytest.raises(ValueError, match="cannot declare MCP servers"):
         llm._build_codex_cmd(

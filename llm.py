@@ -1100,9 +1100,11 @@ _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # supports — unlike the provider-side `web_search` and MCP `namespace`
 # tool types, which local providers reject at the API layer.
 WEB_SEARCH_COMMAND = "theoria-search"
-_WEB_SEARCH_PROVIDERS = {"brave"}
-_WEB_SEARCH_FIELDS = {"provider", "api_key_env"}
+_WEB_SEARCH_PROVIDERS = {"brave", "searxng"}
+_WEB_SEARCH_FIELDS = {"provider", "api_key_env", "endpoint"}
 _WEB_SEARCH_DEFAULT_KEY_ENV = {"brave": "BRAVE_API_KEY"}
+_WEB_SEARCH_PROVIDER_ENV = "THEORIA_SEARCH_PROVIDER"
+_WEB_SEARCH_ENDPOINT_ENV = "THEORIA_SEARCH_ENDPOINT"
 _SENSITIVE_CODEX_CONFIG_PARTS = {
     "api_key", "authorization", "bearer_token", "cookie", "credential",
     "key", "password", "secret", "token",
@@ -1131,11 +1133,18 @@ def web_search_config(raw) -> dict:
     """Validate the run-level `_web_search` declaration.
 
     Returns {} when web search is not configured, otherwise a normalized
-    {"provider", "api_key_env"} mapping. The credential is referenced by
-    environment-variable name only; the harness forwards that one
-    variable into the per-problem sandbox, where the model-facing
-    theoria-search command reads it. The value never appears in YAML,
-    argv, or metadata.
+    mapping per provider:
+
+      brave   → {"provider", "api_key_env"} — hosted keyed API on a
+                fixed endpoint. The credential is referenced by
+                environment-variable name only; the harness forwards
+                that one variable into the per-problem sandbox, where
+                the model-facing theoria-search command reads it. The
+                value never appears in YAML, argv, or metadata.
+      searxng → {"provider", "endpoint"} — self-hosted metasearch, no
+                credential. The endpoint gets the same validation and
+                loopback→host.docker.internal routing as an OSS model
+                endpoint, and reaches the helper via container env.
     """
     if raw is None:
         return {}
@@ -1150,18 +1159,46 @@ def web_search_config(raw) -> dict:
     if provider not in _WEB_SEARCH_PROVIDERS:
         allowed = ", ".join(sorted(_WEB_SEARCH_PROVIDERS))
         raise ValueError(f"_web_search.provider must be one of: {allowed}")
-    api_key_env = raw.get("api_key_env", _WEB_SEARCH_DEFAULT_KEY_ENV[provider])
-    if not isinstance(api_key_env, str) or not _ENV_NAME.fullmatch(api_key_env):
-        raise ValueError(
-            "_web_search.api_key_env must be an environment-variable name"
+
+    if provider == "brave":
+        if "endpoint" in raw:
+            raise ValueError(
+                "_web_search.endpoint is not configurable for brave: the "
+                "hosted API endpoint is fixed by design (the "
+                "THEORIA_SEARCH_ENDPOINT env override exists for tests only)"
+            )
+        api_key_env = raw.get(
+            "api_key_env", _WEB_SEARCH_DEFAULT_KEY_ENV[provider],
         )
-    return {"provider": provider, "api_key_env": api_key_env}
+        if not isinstance(api_key_env, str) or not _ENV_NAME.fullmatch(api_key_env):
+            raise ValueError(
+                "_web_search.api_key_env must be an environment-variable name"
+            )
+        return {"provider": provider, "api_key_env": api_key_env}
+
+    # searxng
+    if "api_key_env" in raw:
+        raise ValueError(
+            "_web_search.api_key_env is not supported for searxng; the "
+            "instance is unauthenticated — keep it bound to localhost"
+        )
+    endpoint = raw.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError(
+            "_web_search.endpoint is required for searxng (the base URL of "
+            "your instance, e.g. http://localhost:8888)"
+        )
+    # Same shape rules as OSS model endpoints: absolute http(s), no
+    # credentials/query/fragment. Routing happens at call time.
+    _route_oss_base_url(endpoint, sandboxed=False)
+    return {"provider": provider, "endpoint": endpoint}
 
 
 def web_search_env_names(raw) -> list[str]:
     """Return the environment reference declared by `_web_search`."""
     config = web_search_config(raw)
-    return [config["api_key_env"]] if config else []
+    api_key_env = config.get("api_key_env")
+    return [api_key_env] if api_key_env else []
 
 
 def _is_sensitive_codex_config_key(key: str) -> bool:
@@ -1983,6 +2020,7 @@ async def llm(
     child_env = None
     codex_provider = None
     web_search: dict = {}
+    web_search_env_vars: dict[str, str] = {}
     configured_base_url = None
     effective_base_url = None
     oss_env_base_url = None
@@ -2015,15 +2053,16 @@ async def llm(
             provider_env = _provider_env_names(settings)
             # Run-level shell web search: the helper runs inside the
             # sandbox via the model's shell tool, so the command line
-            # needs no changes — but the key must exist here (the host
-            # process) to be forwarded, and a configured search key is
-            # a credential that makes host execution opt-in, exactly
-            # like provider credentials.
+            # needs no changes — but a keyed provider's key must exist
+            # here (the host process) to be forwarded, and configured
+            # search access makes host execution opt-in, exactly like
+            # provider credentials.
             web_search = web_search_config(config.get("_web_search"))
-            if web_search and not os.environ.get(web_search["api_key_env"]):
+            web_search_key_env = web_search.get("api_key_env")
+            if web_search_key_env and not os.environ.get(web_search_key_env):
                 raise RuntimeError(
                     "web search is configured but environment variable "
-                    f"{web_search['api_key_env']} is not set"
+                    f"{web_search_key_env} is not set"
                 )
             external_provider = (
                 bool(settings.get("oss"))
@@ -2063,6 +2102,23 @@ async def llm(
                 child_env = os.environ.copy()
                 if oss_env_base_url is not None:
                     child_env["CODEX_OSS_BASE_URL"] = oss_env_base_url
+            # Tell the sandbox helper which provider to use. A
+            # self-hosted endpoint rides its own env var, loopback-routed
+            # the same way as an OSS model endpoint. Docker mode injects
+            # these on the exec below; host mode inherits child_env.
+            if web_search:
+                web_search_env_vars = {
+                    _WEB_SEARCH_PROVIDER_ENV: web_search["provider"],
+                }
+                if web_search.get("endpoint"):
+                    web_search_env_vars[_WEB_SEARCH_ENDPOINT_ENV] = (
+                        _route_oss_base_url(
+                            web_search["endpoint"], sandboxed=sandboxed,
+                        )
+                    )
+                if not sandboxed:
+                    child_env = child_env or os.environ.copy()
+                    child_env.update(web_search_env_vars)
             if schema:
                 codex_schema = _add_additional_properties(schema)
                 schema_json = json.dumps(codex_schema).encode("utf-8")
@@ -2118,6 +2174,10 @@ async def llm(
                 docker_prefix += [
                     "--env", f"CODEX_OSS_BASE_URL={oss_env_base_url}",
                 ]
+            for env_name, env_value in web_search_env_vars.items():
+                # Provider name and (already-validated, credential-free)
+                # endpoint URL only — never a secret value.
+                docker_prefix += ["--env", f"{env_name}={env_value}"]
             cmd = docker_prefix + [
                 "-w", container_call_cwd, container_id,
             ] + cmd

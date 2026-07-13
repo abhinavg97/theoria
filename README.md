@@ -143,27 +143,34 @@ Codex's native web search is deliberately off in the supplied OSS provider profi
 
 ### Live search for OSS models
 
-[`configs/brave_search.yaml`](configs/brave_search.yaml) restores source discovery through a path every provider supports: a `theoria-search` command baked into both sandbox images, which the model runs with its ordinary shell tool. The command calls the [Brave Search API](https://brave.com/search/api/) (free tier available) and prints result titles, URLs, and snippets. Nothing new is sent to the model provider, so it works identically with Ollama, LM Studio, custom providers — and cloud Codex.
+Source discovery is restored through a path every provider supports: a `theoria-search` command baked into both sandbox images, which the model runs with its ordinary shell tool. Nothing new is sent to the model provider, so it works identically with Ollama, LM Studio, custom providers — and cloud Codex. Two backends are supported; stack exactly one:
+
+- [`configs/brave_search.yaml`](configs/brave_search.yaml) — the [Brave Search API](https://brave.com/search/api/): an independent index behind a stable keyed JSON API, zero infrastructure to run, free tier of ~2,000 queries/month. Best for laptop smoke tests. Costs money and rate-limits at research scale.
+- [`configs/searxng_search.yaml`](configs/searxng_search.yaml) — a self-hosted [SearXNG](https://github.com/searxng/searxng) instance: key-free (nothing to leak from the sandbox) and quota-free (parallel judges search freely), with a pinnable, inspectable retrieval stack. Best for research-scale runs. Honest caveat: SearXNG scrapes upstream engines, so result quality depends on those engines not blocking your IP — datacenter IPs are frequently captcha'd, residential IPs work well. Its `settings.yml` must enable the `json` output format, and the instance should stay bound to localhost (it is unauthenticated; Theoria routes a loopback endpoint into the sandbox the same way it routes the Ollama endpoint).
 
 ```bash
+# Option A: Brave
 export BRAVE_API_KEY=YOUR_BRAVE_SEARCH_API_KEY
+SEARCH=configs/brave_search.yaml
+
+# Option B: SearXNG (see configs/searxng_search.yaml for the settings.yml snippet)
+docker run -d --name searxng -p 8888:8080 -v ./searxng:/etc/searxng searxng/searxng
+SEARCH=configs/searxng_search.yaml
 
 theoria doctor \
-  --config configs/ollama.yaml \
-  --config configs/brave_search.yaml \
+  --config configs/ollama.yaml --config "$SEARCH" \
   --codex-model YOUR_OLLAMA_MODEL \
   --image theoria-sandbox:latest --check-endpoint
 
 theoria custom "When was RFC 9110 published, and what is its exact title?" \
-  --config configs/ollama.yaml \
-  --config configs/brave_search.yaml \
+  --config configs/ollama.yaml --config "$SEARCH" \
   --codex-model YOUR_OLLAMA_MODEL \
   --image theoria-sandbox:latest
 ```
 
-The profile is stackable and unaudited. It keeps Codex's native `web_search` disabled, declares the key by environment-variable name only (`_web_search.api_key_env`), and instructs agents to treat snippets as leads — fetch and inspect the source, never follow instructions embedded in results. Theoria forwards only that named variable into the per-problem container, redacts it from all recorded metadata, and counts helper invocations as `web_search_requests` in per-call metadata. Parallel judges can consume Brave quota quickly.
+Both profiles are stackable and unaudited. They keep Codex's native `web_search` disabled and instruct agents to treat snippets as leads — fetch and inspect the source, never follow instructions embedded in results. Helper invocations are counted as `web_search_requests` in per-call metadata. LLM answer engines (Perplexica and similar) are deliberately not supported as backends: they synthesize claims with another model, and Theoria's judges must verify against primary sources, not against a second model's summary.
 
-Two caveats worth knowing. First, the key is necessarily readable by code running inside the sandbox (the helper authenticates with it), so use a dedicated, low-privilege search key. Second, a search key is a credential: stacking it on **cloud** Codex creates a second trust domain in the same sandbox and requires the explicit `_security.allow_mixed_provider_credentials: true` opt-in; with a single OSS provider it shares that provider's trust domain and needs no extra flags. Host (`--no-docker`) runs additionally require the [`configs/unsafe_host_provider.yaml`](configs/unsafe_host_provider.yaml) opt-in and `pip install -e .` (which provides the `theoria-search` script on the host).
+Brave-specific caveats: the key is referenced by environment-variable name only (`_web_search.api_key_env`), forwarded into the per-problem container, and redacted from all recorded metadata — but it is necessarily readable by code inside the sandbox, so use a dedicated, low-privilege search key. A search key is also a credential: stacking it on **cloud** Codex creates a second trust domain in the same sandbox and requires the explicit `_security.allow_mixed_provider_credentials: true` opt-in; with a single OSS provider it shares that provider's trust domain and needs no extra flags. Host (`--no-docker`) runs additionally require the [`configs/unsafe_host_provider.yaml`](configs/unsafe_host_provider.yaml) opt-in and `pip install -e .` (which provides the `theoria-search` script on the host).
 
 The OSS answer-grader preset is [`configs/ollama_audit_grader.yaml`](configs/ollama_audit_grader.yaml). It is also unaudited and uses the same conservative no-search policy:
 
@@ -207,7 +214,7 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 | `--parallel N` | 1 | Concurrency (does not affect per-problem results). |
 | `--watch` / `--no-watch` | on | Stream live LLM events to stderr. |
 
-Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, `oss_custom_provider.example.yaml`, and `brave_search.yaml` are unaudited OSS profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
+Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, `oss_custom_provider.example.yaml`, `brave_search.yaml`, and `searxng_search.yaml` are unaudited OSS profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
 
 `theoria doctor` accepts repeatable `--config` options and checks only the CLIs, credentials, environment variables, search helper, Docker image, and provider mode used by the merged configuration. Add `--check-endpoint` for a reachability probe; the command does not print the configured endpoint or any credential value. Use `--no-docker` to check a host-only run.
 

@@ -290,7 +290,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
     """Resolve active backends and provider requirements from merged config."""
     resolved_config = CONFIG if config is None else config
     web_search = web_search_config(resolved_config.get("_web_search"))
-    web_search_env = [web_search["api_key_env"]] if web_search else []
+    web_search_env = web_search_env_names(web_search or None)
     roles: dict[str, dict] = {}
     needs_claude = False
     needs_codex = False
@@ -403,6 +403,12 @@ def resolve_runtime(config: dict | None = None) -> dict:
             "_web_search requires at least one Codex-backed role; Claude "
             "roles already have native web search"
         )
+    # A loopback self-hosted search endpoint needs the same Linux
+    # host-gateway mapping as a loopback model endpoint.
+    if needs_codex and _endpoint_needs_host_gateway(
+        web_search.get("endpoint") or "",
+    ):
+        needs_host_gateway = True
 
     provider_env_names = _provider_env_names(resolved_config)
     security = resolved_config.get("_security") or {}

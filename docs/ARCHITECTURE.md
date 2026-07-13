@@ -124,17 +124,22 @@ Native search cannot simply be enabled for local providers: Codex serializes
 its `web_search` tool — and every MCP server — as Responses API tool types
 (`web_search`, `namespace`) that Ollama and LM Studio reject before
 inference, so the call layer fails closed on `search: true` for OSS roles and
-rejects MCP declarations in `codex_config`. The stackable
-`brave_search.yaml` profile restores discovery through the one tool path all
-providers share: a fixed `theoria-search` command inside the sandbox image,
-invoked through the shell function tool, calling the Brave Search API
-directly from the container. `_web_search` is run-level configuration; the
-key is referenced by environment-variable name, joins the same forwarding
-allowlist, redaction, and trust-domain fingerprint as provider credentials,
-and helper invocations are counted as `web_search_requests` in call
-metadata. Search results are untrusted leads: role prompts require agents to
-ignore embedded instructions and fetch and inspect the underlying source
-before accepting a claim.
+rejects MCP declarations in `codex_config`. The stackable `brave_search.yaml`
+and `searxng_search.yaml` profiles restore discovery through the one tool
+path all providers share: a `theoria-search` command inside the sandbox
+image, invoked through the shell function tool, calling the configured
+search backend directly from the container. `_web_search` is run-level
+configuration with two providers: `brave` (hosted keyed API on a fixed
+endpoint — the key is referenced by environment-variable name and joins the
+same forwarding allowlist, redaction, and trust-domain fingerprint as
+provider credentials) and `searxng` (self-hosted, credential-free — the
+instance endpoint gets the same validation and loopback routing as an OSS
+model endpoint). LLM answer engines are deliberately not backends: judges
+must verify primary sources, not another model's synthesis. Helper
+invocations are counted as `web_search_requests` in call metadata. Search
+results are untrusted leads: role prompts require agents to ignore embedded
+instructions and fetch and inspect the underlying source before accepting a
+claim.
 
 Credentials are scoped to a per-problem sandbox, not to an individual role.
 The runtime therefore rejects configurations that mix an external provider
