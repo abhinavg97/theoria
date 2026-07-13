@@ -26,6 +26,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from observability import event, get_logger
+from telemetry import enrich_call
+
+logger = get_logger("llm")
+
 
 SUBPROCESS_STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
 
@@ -43,6 +48,11 @@ TOOL_CALL_OUTPUT_LIMIT = 2000  # chars per tool output (can be a web search resu
 
 call_log: contextvars.ContextVar[list | None] = contextvars.ContextVar(
     "llm_call_log", default=None,
+)
+
+# Correlation identifiers set by the harness and copied into every call.
+telemetry_context: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "llm_telemetry_context", default={},
 )
 
 
@@ -395,6 +405,7 @@ def _extract_claude_metadata(result_event: dict) -> dict:
         "output_tokens": usage.get("output_tokens", 0),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+        "reasoning_output_tokens": usage.get("reasoning_output_tokens", 0),
         "total_cost_usd": result_event.get("total_cost_usd"),
         "num_turns": result_event.get("num_turns"),
         "duration_api_ms": result_event.get("duration_api_ms"),
@@ -402,6 +413,7 @@ def _extract_claude_metadata(result_event: dict) -> dict:
         "is_error": result_event.get("is_error", False),
         "web_search_requests": server_tools.get("web_search_requests", 0),
         "web_fetch_requests": server_tools.get("web_fetch_requests", 0),
+        "provider_usage": usage,
     }
 
 
@@ -414,18 +426,31 @@ def _extract_codex_metadata(events: list) -> dict:
     input_tokens = 0
     output_tokens = 0
     cached_input_tokens = 0
+    reasoning_output_tokens = 0
+    provider_usage = []
     for event in events:
         if event.get("type") != "turn.completed":
             continue
         usage = event.get("usage") or {}
+        provider_usage.append(usage)
         input_tokens += usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("output_tokens", 0) or 0
         cached_input_tokens += usage.get("cached_input_tokens", 0) or 0
+        output_details = usage.get("output_tokens_details") or {}
+        reasoning_output_tokens += (
+            usage.get("reasoning_output_tokens", 0)
+            or output_details.get("reasoning_tokens", 0)
+            or 0
+        )
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_input_tokens": cached_input_tokens,
+        "cache_read_input_tokens": cached_input_tokens,
+        "cache_creation_input_tokens": 0,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "total_cost_usd": None,  # codex doesn't expose cost
+        "provider_usage": provider_usage,
     }
 
 
@@ -986,8 +1011,8 @@ async def llm(
             cmd.json              — the exact argv run
             prompt.txt            — the full user prompt
             system.txt            — the full system prompt (if any)
-            stdout.jsonl[.gz]     — raw provider stdout
-            stderr.txt[.gz]       — raw provider stderr
+            attempt_NNN_stdout.jsonl.gz — raw provider stdout per retry
+            attempt_NNN_stderr.txt.gz   — raw provider stderr per retry
             response.txt          — parsed response text (or JSON)
             events.json.gz        — parsed provider event stream
             tool_calls.json       — untruncated tool call I/O
@@ -998,6 +1023,13 @@ async def llm(
     """
     settings = config.get(role, {})
     backend = settings.get("backend", "claude")
+    trace = dict(telemetry_context.get())
+    call_started_at = _utc_now_iso()
+    call_started_perf = time.perf_counter()
+    pricing_path = (
+        (config.get("_telemetry") or {}).get("pricing_file")
+        or os.getenv("THEORIA_PRICING_FILE")
+    )
 
     # Apply backend-specific defaults (config values take precedence)
     if backend == "codex":
@@ -1023,6 +1055,16 @@ async def llm(
     else:
         call_index = len(log)
         log.append(None)  # reserve slot; replaced with call_meta below
+    call_id = (
+        f"{trace.get('run_id')}:{trace.get('problem_id')}:{call_index}"
+        if trace.get("run_id") and trace.get("problem_id") and call_index is not None
+        else str(uuid.uuid4())
+    )
+    event(
+        logger, 20, "llm.call.started", "LLM call started",
+        call_id=call_id, role=role, backend=backend,
+        run_id=trace.get("run_id"), problem_id=trace.get("problem_id"),
+    )
 
     # ── Set up the per-call artifact directory ───────────────────
     base_artifact_dir = artifact_dir.get()
@@ -1043,12 +1085,25 @@ async def llm(
         cached = _try_resume_from_cache(call_dir, prompt, system, schema)
         if cached is not None:
             response, session_id, cache_meta = cached
+            cache_meta.update({
+                "call_id": call_id,
+                **trace,
+                "resumed_from_cache": True,
+            })
+            enrich_call(cache_meta, pricing_path=pricing_path)
             print(
                 f"[resume] cache hit on call_{call_index:03d}_{role}",
                 file=sys.stderr,
             )
             if log is not None and call_index is not None:
                 log[call_index] = cache_meta
+            event(
+                logger, 20, "llm.call.cache_hit", "LLM call reused cached result",
+                call_id=call_id, role=role, backend=backend,
+                cache_lookup_duration_ms=int(round(
+                    (time.perf_counter() - call_started_perf) * 1000
+                )),
+            )
             return response, session_id
 
     # ── Docker sandbox wiring ────────────────────────────────────
@@ -1158,10 +1213,12 @@ async def llm(
         # Up to WATCHDOG_RETRY_MAX retries; non-watchdog failures are
         # raised immediately without retry.
         watchdog_attempts = 0
+        attempt_records: list[dict] = []
         call_label = (f"call_{call_index:03d}_{role}"
                       if call_index is not None else role)
         while True:
-            started_at = _utc_now_iso()
+            attempt_number = len(attempt_records) + 1
+            attempt_started_at = _utc_now_iso()
             started = time.perf_counter()
 
             # Run
@@ -1224,6 +1281,8 @@ async def llm(
                     else:
                         response, session_id, provider_meta, events = \
                             _parse_codex_output(output, schema)
+                if watch:
+                    raw_stderr = await proc.stderr.read()
                 # Success — exit retry loop.
                 break
             except Exception:
@@ -1251,22 +1310,42 @@ async def llm(
                     except (asyncio.CancelledError, Exception):
                         pass
                 # Save raw stdout/stderr for the most recent attempt.
-                # On retry the previous attempt's data is overwritten —
-                # last attempt wins. The retry message printed above
-                # is the only signal that earlier attempts existed.
+                attempt_records.append({
+                    "attempt": attempt_number,
+                    "started_at": attempt_started_at,
+                    "ended_at": _utc_now_iso(),
+                    "duration_ms": int(round(
+                        (time.perf_counter() - started) * 1000
+                    )),
+                    "returncode": proc.returncode,
+                    "watchdog_killed": watchdog_killed[0],
+                    "stdout_bytes": len(raw_stdout),
+                    "stderr_bytes": len(raw_stderr),
+                })
                 if call_dir:
                     if raw_stdout:
                         _write_artifact(
-                            os.path.join(call_dir, "stdout.jsonl"),
+                            os.path.join(
+                                call_dir,
+                                f"attempt_{attempt_number:03d}_stdout.jsonl",
+                            ),
                             raw_stdout, gzip_it=True,
                         )
                     if raw_stderr:
                         _write_artifact(
-                            os.path.join(call_dir, "stderr.txt"),
+                            os.path.join(
+                                call_dir,
+                                f"attempt_{attempt_number:03d}_stderr.txt",
+                            ),
                             raw_stderr, gzip_it=True,
                         )
 
-        duration_ms = int(round((time.perf_counter() - started) * 1000))
+        final_attempt_duration_ms = int(round(
+            (time.perf_counter() - started) * 1000
+        ))
+        duration_ms = int(round(
+            (time.perf_counter() - call_started_perf) * 1000
+        ))
 
         # ── Save post-parse artifacts ────────────────────────────
         artifact_paths: dict[str, str] = {}
@@ -1278,9 +1357,15 @@ async def llm(
             if system:
                 artifact_paths["system_path"] = os.path.join(call_dir, "system.txt")
             if raw_stdout:
-                artifact_paths["stdout_path"] = os.path.join(call_dir, "stdout.jsonl.gz")
+                artifact_paths["stdout_path"] = os.path.join(
+                    call_dir,
+                    f"attempt_{attempt_number:03d}_stdout.jsonl.gz",
+                )
             if raw_stderr:
-                artifact_paths["stderr_path"] = os.path.join(call_dir, "stderr.txt.gz")
+                artifact_paths["stderr_path"] = os.path.join(
+                    call_dir,
+                    f"attempt_{attempt_number:03d}_stderr.txt.gz",
+                )
 
             _write_artifact(
                 os.path.join(call_dir, "response.txt"), response_text,
@@ -1315,6 +1400,8 @@ async def llm(
         if log is not None:
             response_text = response if isinstance(response, str) else json.dumps(response)
             call_meta = {
+                "call_id": call_id,
+                **trace,
                 "role": role,
                 "backend": backend,
                 # Record the effective model actually sent to the CLI,
@@ -1323,9 +1410,12 @@ async def llm(
                 "model": _effective_model(cmd) or settings.get("model"),
                 "model_config": settings.get("model"),
                 "effort": settings.get("effort"),
-                "started_at": started_at,
+                "started_at": call_started_at,
                 "ended_at": _utc_now_iso(),
                 "duration_ms": duration_ms,
+                "final_attempt_duration_ms": final_attempt_duration_ms,
+                "retry_count": watchdog_attempts,
+                "attempts": attempt_records,
                 "session_id": session_id,
                 "resumed": bool(resume),
                 "has_schema": schema is not None,
@@ -1343,6 +1433,7 @@ async def llm(
                 **artifact_paths,
                 **provider_meta,
             }
+            enrich_call(call_meta, pricing_path=pricing_path)
             # Fill the slot we reserved at the top.
             log[call_index] = call_meta
 
@@ -1354,9 +1445,50 @@ async def llm(
                 json.dumps(call_meta, indent=2, default=str),
             )
 
+        event(
+            logger, 20, "llm.call.completed", "LLM call completed",
+            call_id=call_id, role=role, backend=backend,
+            model=call_meta.get("model") if call_meta else settings.get("model"),
+            duration_ms=duration_ms, retry_count=watchdog_attempts,
+        )
         return response, session_id
 
     except Exception as e:
+        failure_meta = {
+            "call_id": call_id,
+            **trace,
+            "role": role,
+            "backend": backend,
+            "model": _effective_model(cmd) or settings.get("model"),
+            "model_config": settings.get("model"),
+            "effort": settings.get("effort"),
+            "started_at": call_started_at,
+            "ended_at": _utc_now_iso(),
+            "duration_ms": int(round(
+                (time.perf_counter() - call_started_perf) * 1000
+            )),
+            "retry_count": locals().get("watchdog_attempts", 0),
+            "attempts": locals().get("attempt_records", []),
+            "returncode": getattr(locals().get("proc"), "returncode", None),
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "failed": True,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_cost_usd": None,
+        }
+        enrich_call(failure_meta, pricing_path=pricing_path)
+        if log is not None and call_index is not None:
+            log[call_index] = failure_meta
+        event(
+            logger, 40, "llm.call.failed", "LLM call failed",
+            call_id=call_id, role=role, backend=backend,
+            error_type=type(e).__name__, duration_ms=failure_meta["duration_ms"],
+            retry_count=failure_meta["retry_count"],
+        )
         # Failure path: at minimum record enough to reconstruct what
         # happened. Raw stdout/stderr were already saved in the inner
         # finally. Write a failure meta.json so the call dir is
@@ -1366,20 +1498,12 @@ async def llm(
                 _write_artifact(
                     os.path.join(call_dir, "meta.json"),
                     json.dumps({
-                        "role": role,
-                        "backend": backend,
-                        "model": settings.get("model"),
-                        "effort": settings.get("effort"),
+                        **failure_meta,
                         "argv": cmd,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                        "failed": True,
                     }, indent=2, default=str),
                 )
             except Exception:
                 pass
-        # Leave the placeholder None in call_log so an operator can
-        # spot it (and the partial save will persist it).
         raise
 
     finally:

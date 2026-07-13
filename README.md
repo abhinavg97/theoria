@@ -56,7 +56,10 @@ Both are required: every run uses Codex for the solver/judges and Claude for the
 
 > **Why macOS (for now):** Theoria mounts your Claude subscription credentials into the sandbox by reading them from the macOS Keychain. The Codex side is a plain `~/.codex` bind-mount and is cross-platform, but the formalizer needs Claude, so macOS is currently required end-to-end. An API-key path (any OS, no subscription) is the next planned addition.
 
-Running Theoria costs nothing beyond your existing Claude/Codex subscriptions — there are no API keys or per-call charges.
+The default path uses existing Claude/Codex subscriptions, so the CLIs do not
+expose a complete per-call bill. Theoria records measured token usage and any
+provider-reported cost; optional versioned pricing catalogs can produce clearly
+labeled API-equivalent estimates.
 
 ---
 
@@ -72,7 +75,12 @@ theoria hle 1               # reproduce HLE problem 1 (streams live by default)
 
 `theoria doctor` tells you exactly what's missing and how to fix it. `theoria build` builds both sandbox images (`theoria-sandbox` and the Sage math/science variant `theoria-sandbox-sage`); the Sage image installs SageMath via conda, so its first build takes several minutes.
 
-Results land in `runs/<command>_<tag>_<timestamp>.json`; full per-call artifacts (every prompt, response, tool call, and event stream) under `runs/artifacts/`. Both are gitignored.
+Results land in `runs/<command>_<tag>_<timestamp>.json`; full per-call artifacts
+(every prompt, response, tool call, event stream, normalized usage, and cost
+provenance) live under `runs/artifacts/`. Run-level research telemetry is in
+`runs/artifacts/<run_id>/telemetry.json`. All are gitignored. See
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the schema and paper
+reporting guidance.
 
 ### Reproducing the HLE results
 
@@ -125,6 +133,9 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 | `--no-pair-preamble` | off | Don't auto-match the preamble to the image (reproduces the published v2 runs). |
 | `--parallel N` | 1 | Concurrency (does not affect per-problem results). |
 | `--watch` / `--no-watch` | on | Stream live LLM events to stderr. |
+| `--log-format text\|json` | text | Operational logs; JSON is suitable for log ingestion. |
+| `--log-level LEVEL` | INFO | Operational log threshold (also `THEORIA_LOG_LEVEL`). |
+| `--pricing PATH` | none | Versioned pricing catalog for labeled cost estimates. |
 
 Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, `audit_grader.yaml` (the grader role).
 
@@ -136,6 +147,9 @@ Stackable config presets in `configs/`: `defaults.yaml` (base — every role's p
 - **The built-in `correct` flag is a naive substring check**, for scanning only. The real signals are the `verified` flag and `theoria grade`.
 - **Answers are extracted** as the first element of the proof's final state; occasionally a correct conclusion sits behind a placeholder. Read the proof, not just the headline.
 - Every run records its exact models, CLI versions, and sandbox image in `runs/artifacts/<run_id>/meta.json` for reproducibility.
+- Every call records normalized input/output/cache/reasoning usage, failures,
+  retries, and explicit cost provenance. Unknown or partial cost remains null
+  instead of being presented as a complete total.
 - **Grading.** The bundled `theoria grade` shows the LLM grader slightly more per-attempt context than the internal audit grader it's ported from, so its grades may differ marginally on borderline cases — the JUDGE-PASSED/REJECTED verdict itself is unaffected.
 
 ---

@@ -37,6 +37,7 @@ from pathlib import Path
 import harness
 import loaders
 import sandbox
+from observability import configure_logging
 
 STD_IMAGE = "theoria-sandbox:latest"
 SAGE_IMAGE = "theoria-sandbox-sage:latest"
@@ -97,6 +98,20 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--resume", default=None, metavar="RUN_ID",
         help="Resume an existing run by id (reuses cached per-call results).",
+    )
+    g.add_argument(
+        "--pricing", default=None, metavar="PATH",
+        help="Versioned JSON/YAML model pricing catalog for cost estimates. "
+             "Without one, unavailable provider costs remain null.",
+    )
+    g.add_argument(
+        "--log-level", default=None,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Operational log level (or THEORIA_LOG_LEVEL).",
+    )
+    g.add_argument(
+        "--log-format", default=None, choices=("text", "json"),
+        help="Operational log format (or THEORIA_LOG_FORMAT).",
     )
 
 
@@ -405,6 +420,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
+    configure_logging(
+        level=getattr(args, "log_level", None),
+        log_format=getattr(args, "log_format", None),
+    )
     args.func(args)
 
 

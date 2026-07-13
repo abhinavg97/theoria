@@ -20,6 +20,8 @@ py-modules = [
     "sandbox",
     "loaders",
     "grade",
+    "observability",
+    "telemetry",
     "export_problem",
     "cli",
 ]
