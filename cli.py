@@ -54,6 +54,14 @@ IMAGE_PREAMBLE = {
 }
 
 
+def _required_container_codex_capabilities(*, local_oss: bool) -> set[str]:
+    """Capabilities doctor must require for the selected provider class."""
+    required = {"available", "output_schema"}
+    if local_oss:
+        required.update({"oss", "local_provider"})
+    return required
+
+
 # ── Shared run options ────────────────────────────────────────────
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -501,8 +509,9 @@ def cmd_doctor(args) -> None:
             if not settings.get("model")
             or str(settings["model"]).upper() in placeholder_models
         )
-        check("OSS provider model is explicit", not unresolved_models,
-              "set each OSS role's model or pass --codex-model MODEL "
+        check("external provider model is explicit", not unresolved_models,
+              "set each external-provider role's model or pass "
+              "--codex-model MODEL "
               "(unresolved: " + ", ".join(unresolved_models) + ")")
 
     if args.check_endpoint:
@@ -516,7 +525,7 @@ def cmd_doctor(args) -> None:
                 endpoint_groups.setdefault((provider, endpoint), []).append(role)
             else:
                 check(f"endpoint configured for provider role {role}", False,
-                      "set oss_base_url or CODEX_OSS_BASE_URL")
+                      "set the selected provider's base URL")
         for (provider, endpoint), endpoint_roles in endpoint_groups.items():
             reachable = (
                 sandbox.endpoint_reachable_from_image(
@@ -527,7 +536,7 @@ def cmd_doctor(args) -> None:
             )
             check(f"{provider} endpoint reachable ({len(endpoint_roles)} role(s))",
                   reachable,
-                  "start the provider server and verify its configured base URL")
+                  "verify the provider service and its configured base URL")
 
     daemon_ok = False
     if args.docker:
@@ -569,11 +578,17 @@ def cmd_doctor(args) -> None:
                 )
             if provider_roles:
                 capabilities = sandbox.codex_oss_capabilities_in_image(args.image)
+                required = _required_container_codex_capabilities(
+                    local_oss=bool(local_oss_roles),
+                )
+                missing = sorted(
+                    name for name in required if not capabilities.get(name)
+                )
                 check(
-                    "container Codex supports OSS providers and schemas",
-                    all(capabilities.values()),
-                    "rebuild with a Codex release supporting --oss, "
-                    "--local-provider, and --output-schema",
+                    "container Codex supports selected provider features",
+                    not missing,
+                    "rebuild with a Codex release supporting "
+                    + ", ".join(missing),
                 )
 
     print("\n" + ("All selected checks passed."

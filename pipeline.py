@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -139,17 +140,37 @@ def agent_prompt(role: str) -> str:
 
 DEFAULTS_PATH = Path(__file__).parent / "configs" / "defaults.yaml"
 
+
+def _merge_config(base: dict, override: dict) -> dict:
+    """Return a recursive config overlay without mutating either input.
+
+    Mappings are merged recursively; every other value (including lists) is
+    replaced by the overlay.  Copying values as they enter the result also
+    breaks YAML-anchor aliasing between roles, so a later in-memory change to
+    one role cannot silently change another role that used the same anchor.
+    """
+    merged = {key: copy.deepcopy(value) for key, value in base.items()}
+    for key, value in override.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_config(existing, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
 def load_config(override_paths=None) -> dict:
     """Load defaults.yaml and stack zero or more overrides on top.
 
     `override_paths` accepts None, a single path (str/Path), or a list
     of paths. When a list, overrides are applied in order — later
-    entries win on conflicts. Role entries are dict-merged into
-    defaults; top-level scalars like `_preamble` are replaced wholesale
-    (can't .update() a string).
+    entries win on conflicts. Mappings are merged recursively, while
+    scalars and lists are replaced wholesale.
     """
     with open(DEFAULTS_PATH) as f:
-        config = yaml.safe_load(f)
+        defaults = yaml.safe_load(f)
+    if not isinstance(defaults, dict):
+        raise ValueError(f"default config must be a mapping: {DEFAULTS_PATH}")
+    config = _merge_config({}, defaults)
 
     if override_paths is None:
         paths = []
@@ -161,12 +182,9 @@ def load_config(override_paths=None) -> dict:
     for path in paths:
         with open(path) as f:
             overrides = yaml.safe_load(f) or {}
-        for key, value in overrides.items():
-            existing = config.get(key)
-            if isinstance(existing, dict) and isinstance(value, dict):
-                existing.update(value)
-            else:
-                config[key] = value
+        if not isinstance(overrides, dict):
+            raise ValueError(f"config override must be a mapping: {path}")
+        config = _merge_config(config, overrides)
     return config
 
 CONFIG = {}  # set in main

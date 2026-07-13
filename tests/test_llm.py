@@ -251,6 +251,32 @@ def test_custom_provider_config_is_structured_and_rejects_secrets():
         )
 
 
+def test_external_codex_provider_requires_explicit_model():
+    settings = {
+        "codex_config": {
+            "model_provider": "custom",
+            "model_providers.custom.base_url": "https://models.example/v1",
+        },
+    }
+
+    with pytest.raises(ValueError, match="External Codex provider.*explicit model"):
+        llm._build_codex_cmd(
+            "prompt", settings, None, None, None,
+        )
+    with pytest.raises(ValueError, match="External Codex provider.*explicit model"):
+        asyncio.run(llm.llm(
+            "prompt",
+            config={
+                "_security": {"allow_external_provider_host_access": True},
+                "solver": {"backend": "codex", **settings},
+            },
+        ))
+
+    # The native OpenAI path intentionally retains its historical default.
+    command = llm._build_codex_cmd("prompt", {}, None, None, None)
+    assert command[:4] == ["codex", "exec", "--model", "gpt-5.5"]
+
+
 def test_loopback_endpoint_routes_only_inside_sandbox():
     endpoint = "http://localhost:11434/v1"
     assert llm._route_oss_base_url(endpoint, sandboxed=False) == endpoint
@@ -271,6 +297,98 @@ def test_oss_mode_fails_closed_on_cloud_alias():
             None,
             None,
         )
+
+
+def _cache_identity(
+    *,
+    system="system",
+    schema=None,
+    settings=None,
+    codex_version="codex-cli 0.133.0",
+):
+    return llm._call_cache_identity(
+        prompt="prompt",
+        system=system,
+        schema=schema,
+        role="solver",
+        backend="codex",
+        settings=settings or {
+            "model": "gpt-5.5",
+            "effort": "xhigh",
+            "sandbox": "read-only",
+            "search": True,
+        },
+        watch=False,
+        resume=None,
+        sandboxed=True,
+        image_id="sha256:image",
+        codex_version=codex_version,
+    )
+
+
+def test_resume_cache_identity_covers_runtime_and_tool_inputs(tmp_path):
+    call_dir = tmp_path / "call_000_solver"
+    call_dir.mkdir()
+    identity = _cache_identity()
+    (call_dir / "prompt.txt").write_text("prompt")
+    (call_dir / "response.txt").write_text("response")
+    (call_dir / "meta.json").write_text(json.dumps({
+        "returncode": 0,
+        "session_id": "session",
+        "cache_identity": identity,
+    }))
+
+    cached = llm._try_resume_from_cache(
+        str(call_dir), "prompt", None, identity,
+    )
+    assert cached[0:2] == ("response", "session")
+
+    variants = [
+        _cache_identity(system="changed"),
+        _cache_identity(schema={"type": "string"}),
+        _cache_identity(settings={
+            "model": "gpt-5.4",
+            "effort": "xhigh",
+            "sandbox": "read-only",
+            "search": True,
+        }),
+        _cache_identity(settings={
+            "model": "deployment-id",
+            "effort": "xhigh",
+            "sandbox": "read-only",
+            "search": False,
+            "codex_config": {
+                "model_provider": "custom",
+                "model_providers.custom.base_url": "https://models.example/v1",
+                "model_providers.custom.env_key": "MODEL_API_KEY",
+            },
+            "provider_env": ["MODEL_API_KEY"],
+        }),
+        _cache_identity(codex_version="codex-cli 0.134.0"),
+    ]
+    for changed_identity in variants:
+        with pytest.raises(RuntimeError, match="resume idempotency check failed"):
+            llm._try_resume_from_cache(
+                str(call_dir), "prompt", None, changed_identity,
+            )
+
+
+def test_resume_cache_identity_never_contains_provider_secret(monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "super-secret-value")
+    identity = _cache_identity(settings={
+        "model": "deployment-id",
+        "effort": None,
+        "search": False,
+        "codex_config": {
+            "model_provider": "custom",
+            "model_providers.custom.base_url": "https://models.example/v1",
+            "model_providers.custom.env_key": "MODEL_API_KEY",
+        },
+        "provider_env": ["MODEL_API_KEY"],
+    })
+
+    assert "super-secret-value" not in json.dumps(identity)
+    assert identity["inputs"]["provider"] == "custom"
 
 
 def test_structured_output_validation_reports_path():

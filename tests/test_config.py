@@ -60,6 +60,38 @@ def test_host_provider_opt_in_is_explicit_and_separate():
     assert config["solver"]["oss"] is True
 
 
+def test_config_overlays_merge_nested_mappings_without_aliasing(tmp_path):
+    provider = tmp_path / "provider.yaml"
+    provider.write_text("""
+solver:
+  codex_config: &provider
+    model_provider: custom
+    model_providers.custom.base_url: https://models.example/v1
+formalizer:
+  codex_config: *provider
+""")
+    features = tmp_path / "features.yaml"
+    features.write_text("""
+solver:
+  codex_config:
+    features.multi_agent: false
+""")
+
+    config = pipeline.load_config([provider, features])
+
+    assert config["solver"]["codex_config"] == {
+        "model_provider": "custom",
+        "model_providers.custom.base_url": "https://models.example/v1",
+        "features.multi_agent": False,
+    }
+    assert config["formalizer"]["codex_config"] == {
+        "model_provider": "custom",
+        "model_providers.custom.base_url": "https://models.example/v1",
+    }
+    config["solver"]["codex_config"]["model_provider"] = "changed"
+    assert config["formalizer"]["codex_config"]["model_provider"] == "custom"
+
+
 def test_doctor_parser_accepts_oss_configuration_options():
     args = cli.build_parser().parse_args([
         "doctor",
@@ -75,6 +107,19 @@ def test_doctor_parser_accepts_oss_configuration_options():
     assert args.codex_model == "local-model"
     assert args.docker is False
     assert args.check_endpoint is True
+
+
+def test_doctor_requires_local_only_flags_only_for_local_oss():
+    assert cli._required_container_codex_capabilities(local_oss=False) == {
+        "available",
+        "output_schema",
+    }
+    assert cli._required_container_codex_capabilities(local_oss=True) == {
+        "available",
+        "output_schema",
+        "oss",
+        "local_provider",
+    }
 
 
 def test_grade_parser_accepts_codex_model_override():

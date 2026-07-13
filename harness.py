@@ -25,7 +25,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pipeline
 import sandbox as sbx
-from llm import call_log, artifact_dir, sandbox_container, sandbox_image_id
+from llm import (
+    artifact_dir,
+    call_log,
+    codex_cli_version,
+    sandbox_container,
+    sandbox_image_id,
+)
 from pipeline import run, CONFIG, load_config
 
 
@@ -578,6 +584,7 @@ async def run_one(
     use_docker: bool = False,
     sandbox_image: str = sbx.DEFAULT_IMAGE,
     sandbox_image_digest: str | None = None,
+    codex_version: str | None = None,
 ) -> dict:
     """Run pipeline.run() on a problem dict and attach metadata.
 
@@ -630,6 +637,7 @@ async def run_one(
     codex_state_dir: str | None = None
     sandbox_token = None
     image_token = None
+    codex_version_token = codex_cli_version.set(codex_version)
 
     # Fallback timing — only used if sandbox startup fails before the run.
     started_iso = datetime.now().astimezone().isoformat()
@@ -683,6 +691,7 @@ async def run_one(
             sandbox_container.reset(sandbox_token)
         if image_token is not None:
             sandbox_image_id.reset(image_token)
+        codex_cli_version.reset(codex_version_token)
 
         # Snapshot container state into artifacts BEFORE stopping.
         # - /workspace captures every scratch file any agent wrote
@@ -888,6 +897,7 @@ async def run_problems(
     claude_creds_path: str | None = None
     claude_config_path: str | None = None
     image_digest: str | None = None
+    effective_codex_version: str | None = None
     enable_claude = bool(requirements["claude_credentials"])
     enable_codex = bool(requirements["codex_state"])
     codex_cloud_auth = bool(requirements["codex_cloud_auth"])
@@ -937,6 +947,7 @@ async def run_problems(
         # from the host over time — for a paper, the container
         # versions are the authoritative ones.
         container_versions = sbx.container_tool_versions(sandbox_image)
+        effective_codex_version = container_versions.get("codex")
         print(f"  container tools: {container_versions}")
         update_artifact_root_meta(artifact_root, {
             "sandbox": {
@@ -957,6 +968,8 @@ async def run_problems(
                 "linux_host_gateway_requested": add_host_gateway,
             },
         })
+    elif enable_codex:
+        effective_codex_version = _safe_version("codex")
 
     results: list[dict] = []
     lock = asyncio.Lock()
@@ -978,6 +991,7 @@ async def run_problems(
                 use_docker=use_docker,
                 sandbox_image=sandbox_image,
                 sandbox_image_digest=image_digest,
+                codex_version=effective_codex_version,
             )
         async with lock:
             results.append(result)

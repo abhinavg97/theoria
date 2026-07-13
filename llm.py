@@ -82,6 +82,14 @@ sandbox_image_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "llm_sandbox_image_id", default=None,
 )
 
+# Effective Codex CLI version for this run.  The harness resolves it once from
+# the selected container image (or host CLI) and makes it available to every
+# call so cache identity does not require launching another subprocess.
+
+codex_cli_version: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_codex_cli_version", default=None,
+)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -372,7 +380,10 @@ async def _watchdog(proc, container_id, kill_flag, *,
 # have drifted between runs.
 
 def _try_resume_from_cache(
-    call_dir: str, prompt: str, system: str | None, schema: dict | None,
+    call_dir: str,
+    prompt: str,
+    schema: dict | None,
+    expected_identity: dict,
 ):
     """Returns (response, session_id, call_meta) if call_dir has a
     complete and idempotent prior result. Returns None if nothing
@@ -393,7 +404,30 @@ def _try_resume_from_cache(
     rc = meta.get("returncode")
     if rc not in (0, None):
         return None
-    # Idempotency check: saved prompt must match what we'd send now.
+    cached_identity = meta.get("cache_identity")
+    # Cache artifacts written before invocation fingerprints existed are not
+    # safe to reuse.  Treat them as a miss so the current invocation refreshes
+    # the artifacts in place.
+    if not isinstance(cached_identity, dict):
+        return None
+    if cached_identity.get("sha256") != expected_identity.get("sha256"):
+        cached_inputs = cached_identity.get("inputs") or {}
+        current_inputs = expected_identity.get("inputs") or {}
+        changed = sorted(
+            key for key in set(cached_inputs) | set(current_inputs)
+            if cached_inputs.get(key) != current_inputs.get(key)
+        )
+        detail = ", ".join(changed) if changed else "invocation inputs"
+        raise RuntimeError(
+            f"resume idempotency check failed for {call_dir}: "
+            f"cached invocation differs in {detail}. "
+            f"Pipeline or runtime state has drifted from the original run. "
+            f"Either delete {call_dir} to force a fresh LLM call, "
+            f"or restore the original configuration and runtime."
+        )
+
+    # Keep the human-readable prompt artifact as a second, independent check
+    # against a corrupt or manually edited cache directory.
     if os.path.exists(prompt_path):
         try:
             with open(prompt_path) as f:
@@ -1007,6 +1041,105 @@ def _configured_codex_base_url(settings: dict) -> str | None:
     return None
 
 
+def _uses_external_codex_provider(settings: dict) -> bool:
+    """Return whether Codex is configured outside its native OpenAI path."""
+    provider = _codex_provider(settings)
+    return bool(
+        settings.get("oss")
+        or provider not in (None, "openai")
+        or _configured_codex_base_url(settings) is not None
+        or _provider_env_names(settings)
+    )
+
+
+def _json_sha256(value) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _call_cache_identity(
+    *,
+    prompt: str,
+    system: str | None,
+    schema: dict | None,
+    role: str,
+    backend: str,
+    settings: dict,
+    watch: bool,
+    resume: str | None,
+    sandboxed: bool,
+    image_id: str | None,
+    codex_version: str | None,
+) -> dict:
+    """Build a versioned, secret-free identity for one model invocation.
+
+    Prompt, system, schema, resume id, and tool/provider settings participate
+    only through hashes. Provider credentials never enter this function:
+    `provider_env` contributes environment-variable *names*, while Codex
+    config has already rejected literal credential values.
+    """
+    if backend == "codex":
+        configured_model = settings.get("model")
+        effective_model = (
+            "gpt-5.5"
+            if configured_model in _CLAUDE_MODEL_ALIASES
+            else configured_model
+        )
+        invocation_settings = {
+            "effort": settings.get("effort"),
+            "sandbox": settings.get("sandbox"),
+            "search": settings.get("search"),
+            "full_auto": bool(settings.get("full_auto", False)),
+            "oss": bool(settings.get("oss", False)),
+            "local_provider": settings.get("local_provider"),
+            "base_url": _configured_codex_base_url(settings),
+            "provider_env": sorted(_provider_env_names(settings)),
+            "codex_config": sorted(
+                _codex_config_items(settings), key=lambda item: item[0]
+            ),
+            "schema_retries": settings.get("schema_retries", 0),
+        }
+        provider = _codex_provider(settings)
+    else:
+        effective_model = settings.get("model")
+        invocation_settings = {
+            "effort": settings.get("effort"),
+            "tools": settings.get("tools"),
+        }
+        provider = None
+
+    payload = {
+        "version": 1,
+        "role": role,
+        "backend": backend,
+        "model": effective_model,
+        "provider": provider,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "system_sha256": hashlib.sha256(
+            (system or "").encode("utf-8")
+        ).hexdigest(),
+        "schema_sha256": _json_sha256(schema),
+        "resume_sha256": hashlib.sha256(
+            (resume or "").encode("utf-8")
+        ).hexdigest(),
+        "invocation_settings_sha256": _json_sha256(invocation_settings),
+        "watch": bool(watch),
+        "sandboxed": sandboxed,
+        "image_id": image_id,
+        "codex_version": codex_version if backend == "codex" else None,
+    }
+    return {
+        "version": 1,
+        "sha256": _json_sha256(payload),
+        "inputs": payload,
+    }
+
+
 def _schema_retry_limit(settings: dict) -> int:
     value = settings.get("schema_retries", 0)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1040,9 +1173,16 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     if not isinstance(oss, bool):
         raise ValueError("oss must be a boolean")
 
+    config_items = _codex_config_items(settings)
+    provider_env = _provider_env_names(settings)
+    configured_provider = next(
+        (value for key, value in config_items if key == "model_provider"),
+        None,
+    )
+    external_provider = _uses_external_codex_provider(settings)
     model = settings.get("model")
-    if oss and (not isinstance(model, str) or not model.strip()):
-        raise ValueError("OSS Codex roles require an explicit model")
+    if external_provider and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("External Codex provider roles require an explicit model")
     if model is None:
         model = "gpt-5.5"
     if not isinstance(model, str) or not model.strip():
@@ -1066,8 +1206,6 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     if not oss and settings.get("oss_base_url") is not None:
         raise ValueError("oss_base_url requires oss: true")
 
-    config_items = _codex_config_items(settings)
-    provider_env = _provider_env_names(settings)
     credential_refs = {
         value
         for key, value in config_items
@@ -1081,10 +1219,6 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
             "Codex provider credential environment references must also "
             "appear in provider_env: " + ", ".join(missing_credential_refs)
         )
-    configured_provider = next(
-        (value for key, value in config_items if key == "model_provider"),
-        None,
-    )
     if oss and configured_provider not in (None, local_provider):
         raise ValueError(
             "codex_config.model_provider conflicts with local_provider"
@@ -1482,7 +1616,9 @@ async def llm(
 
     # Apply backend-specific defaults (config values take precedence)
     if backend == "codex":
-        if not settings.get("oss", False):
+        # Native OpenAI retains the historical default. External providers
+        # use provider-specific model/deployment ids and must be explicit.
+        if not _uses_external_codex_provider(settings):
             settings.setdefault("model", "gpt-5.5")
         settings.setdefault("effort", "xhigh")
         settings.setdefault("sandbox", "read-only")
@@ -1515,6 +1651,26 @@ async def llm(
         )
         os.makedirs(call_dir, exist_ok=True)
 
+    container_id = sandbox_container.get()
+    image_id = sandbox_image_id.get()
+    sandboxed = container_id is not None
+    effective_codex_version = (
+        codex_cli_version.get() if backend == "codex" else None
+    )
+    cache_identity = _call_cache_identity(
+        prompt=prompt,
+        system=system,
+        schema=schema,
+        role=role,
+        backend=backend,
+        settings=settings,
+        watch=watch,
+        resume=resume,
+        sandboxed=sandboxed,
+        image_id=image_id,
+        codex_version=effective_codex_version,
+    )
+
     # ── Resume from cache (idempotent) ───────────────────────────
     # If we're resuming a prior run, this call_dir may already contain
     # a successful response. Reuse it without making a new LLM call —
@@ -1522,7 +1678,9 @@ async def llm(
     # now. Mismatch raises (state drift) rather than silently using a
     # stale cached response.
     if call_dir is not None:
-        cached = _try_resume_from_cache(call_dir, prompt, system, schema)
+        cached = _try_resume_from_cache(
+            call_dir, prompt, schema, cache_identity,
+        )
         if cached is not None:
             response, session_id, cache_meta = cached
             print(
@@ -1548,9 +1706,6 @@ async def llm(
     # agent outputs still get captured via the post-run `docker cp
     # /workspace` snapshot, and the per-call artifact dirs on the
     # host already give us "which call wrote which bytes" attribution.
-    container_id = sandbox_container.get()
-    image_id = sandbox_image_id.get()
-    sandboxed = container_id is not None
     container_call_cwd: str | None = "/workspace" if sandboxed else None
 
     schema_file = None
@@ -1942,12 +2097,14 @@ async def llm(
                 "schema_retries": schema_retries,
                 "returncode": proc.returncode,
                 "argv_hash": _cmd_hash(cmd),
+                "cache_identity": cache_identity,
                 # Which sandbox this call ran in (if any). Enables
                 # post-hoc reasoning about the container image version.
                 "sandboxed": container_id is not None,
                 "container_id": container_id,
                 "container_cwd": container_call_cwd,
                 "image_id": image_id,
+                "codex_version": effective_codex_version,
                 "oss": bool(settings.get("oss", False)),
                 "model_provider": codex_provider,
                 "base_url": configured_base_url,
@@ -1994,9 +2151,11 @@ async def llm(
             "schema_retries": schema_retries,
             "returncode": returncode,
             "argv_hash": _cmd_hash(cmd) if cmd else None,
+            "cache_identity": cache_identity,
             "sandboxed": sandboxed,
             "container_id": container_id,
             "image_id": image_id,
+            "codex_version": effective_codex_version,
             "oss": bool(settings.get("oss", False)),
             "model_provider": codex_provider,
             "base_url": configured_base_url,
