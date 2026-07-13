@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import pipeline
@@ -38,6 +40,27 @@ logger = get_logger("harness")
 
 
 # ── Run-level metadata capture ───────────────────────────────────
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _pricing_provenance() -> dict | None:
+    path = (CONFIG.get("_telemetry") or {}).get("pricing_file")
+    if not path:
+        path = os.getenv("THEORIA_PRICING_FILE")
+    if not path:
+        return None
+    try:
+        with open(os.path.expanduser(path), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {"path": path, "sha256": None, "available": False}
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "available": True,
+    }
 
 def _safe_version(binary: str) -> str | None:
     """Run `<binary> --version` and return the stripped output.
@@ -109,6 +132,15 @@ def make_artifact_root(save_path: str) -> str:
         "python_version": sys.version,
         "save_path": save_path,
         "config": dict(CONFIG),
+        "config_sha256": _sha256_text(json.dumps(
+            CONFIG, sort_keys=True, separators=(",", ":"), default=str,
+        )),
+        "prompt_sha256": {
+            role: _sha256_text(str(settings["prompt"]))
+            for role, settings in CONFIG.items()
+            if isinstance(settings, dict) and "prompt" in settings
+        },
+        "pricing": _pricing_provenance(),
         "cli_versions": {
             "claude": _safe_version("claude"),
             "codex": _safe_version("codex"),
@@ -332,6 +364,14 @@ async def run_one(
         )
     except Exception as e:
         print(f"[{pid}]   ERROR: {e}")
+        traceback_path = None
+        if prob_art_dir:
+            traceback_path = os.path.join(prob_art_dir, "traceback.txt")
+            try:
+                with open(traceback_path, "w") as f:
+                    f.write(traceback.format_exc())
+            except OSError:
+                traceback_path = None
         event(
             logger, 40, "problem.failed", "Problem run failed",
             run_id=run_id, problem_id=pid, error_type=type(e).__name__,
@@ -340,6 +380,7 @@ async def run_one(
             "answer": None,
             "verified": False,
             "error": str(e),
+            "traceback_path": traceback_path,
         }
     finally:
         call_log.reset(token)

@@ -20,6 +20,19 @@ _SENSITIVE_KEY = re.compile(
     r"password|secret|credential|cookie)",
     re.IGNORECASE,
 )
+_SENSITIVE_TEXT = (
+    re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
+        r"(\s*[:=]\s*)['\"]?([^\s,'\"}]{8,})"
+    ),
+)
+
+
+def redact_text(value: str) -> str:
+    """Redact common credential forms from console-safe text previews."""
+    value = _SENSITIVE_TEXT[0].sub(r"\1[REDACTED]", value)
+    return _SENSITIVE_TEXT[1].sub(r"\1\2[REDACTED]", value)
 
 
 def _redact(value: Any, key: str = "") -> Any:
@@ -29,6 +42,8 @@ def _redact(value: Any, key: str = "") -> Any:
         return {str(k): _redact(v, str(k)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(v) for v in value]
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 

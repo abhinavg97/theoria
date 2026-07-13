@@ -23,10 +23,11 @@ import shlex
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 
-from observability import event, get_logger
+from observability import event, get_logger, redact_text
 from telemetry import enrich_call
 
 logger = get_logger("llm")
@@ -479,6 +480,17 @@ def _maybe_truncate(s, limit: int, *, truncate: bool):
     return _truncate(s, limit)
 
 
+def _redact_tool_call_previews(tool_calls: list[dict]) -> list[dict]:
+    """Redact console/result previews; full artifact copies remain untouched."""
+    return [
+        {
+            key: redact_text(value) if isinstance(value, str) else value
+            for key, value in tool.items()
+        }
+        for tool in tool_calls
+    ]
+
+
 def _extract_claude_tool_calls(events: list, *, truncate: bool = True) -> list:
     """Pair claude tool_use events with their tool_result events.
 
@@ -663,9 +675,10 @@ def _print_claude_event(event):
         content = event.get("message", {}).get("content", [])
         for block in content:
             if block.get("type") == "tool_use":
-                print(f"      [tool] {block['name']}({json.dumps(block.get('input', {}))[:100]})", file=sys.stderr)
+                preview = redact_text(json.dumps(block.get("input", {}))[:100])
+                print(f"      [tool] {block['name']}({preview})", file=sys.stderr)
             elif block.get("type") == "text":
-                text = block["text"][:200]
+                text = redact_text(block["text"][:200])
                 if text.strip():
                     print(f"      [text] {text}", file=sys.stderr)
 
@@ -904,12 +917,13 @@ def _print_codex_event(event):
         item_type = item.get("type", "")
 
         if item_type == "function_call":
-            print(f"      [tool] {item.get('name', '?')}({item.get('arguments', '')[:100]})", file=sys.stderr)
+            preview = redact_text(item.get("arguments", "")[:100])
+            print(f"      [tool] {item.get('name', '?')}({preview})", file=sys.stderr)
         elif item_type == "function_call_output":
-            output = item.get("output", "")[:200]
+            output = redact_text(item.get("output", "")[:200])
             print(f"      [result] {output}", file=sys.stderr)
         elif item_type == "agent_message":
-            text = item.get("text", "")[:200]
+            text = redact_text(item.get("text", "")[:200])
             if text.strip():
                 print(f"      [text] {text}", file=sys.stderr)
 
@@ -1427,12 +1441,15 @@ async def llm(
                 "container_id": container_id,
                 "container_cwd": container_call_cwd,
                 "image_id": image_id,
-                "prompt": _truncate(prompt, 8000),
-                "system": _truncate(system or "", 8000),
-                "response": _truncate(response_text, 8000),
+                "prompt": redact_text(_truncate(prompt, 8000)),
+                "system": redact_text(_truncate(system or "", 8000)),
+                "response": redact_text(_truncate(response_text, 8000)),
                 **artifact_paths,
                 **provider_meta,
             }
+            call_meta["tool_calls"] = _redact_tool_call_previews(
+                call_meta.get("tool_calls") or []
+            )
             enrich_call(call_meta, pricing_path=pricing_path)
             # Fill the slot we reserved at the top.
             log[call_index] = call_meta
@@ -1495,6 +1512,9 @@ async def llm(
         # self-describing for post-mortem.
         if call_dir:
             try:
+                traceback_path = os.path.join(call_dir, "traceback.txt")
+                _write_artifact(traceback_path, traceback.format_exc())
+                failure_meta["traceback_path"] = traceback_path
                 _write_artifact(
                     os.path.join(call_dir, "meta.json"),
                     json.dumps({

@@ -189,18 +189,21 @@ def cmd_hle(args) -> None:
         for n in args.problems:
             if n < 1:
                 sys.exit("HLE problem numbers are 1-based — use 1 or higher.")
-            sel = loaders.load_hle(skip=n - 1, max_questions=1)
+            sel = loaders.load_hle(
+                skip=n - 1, max_questions=1, revision=args.dataset_revision,
+            )
             if not sel:
                 sys.exit(f"No HLE problem at position {n}.")
             problems.extend(sel)
     elif args.ids:
         ids = [s.strip() for s in args.ids.split(",")]
-        problems = loaders.load_hle(ids=ids)
+        problems = loaders.load_hle(ids=ids, revision=args.dataset_revision)
     elif args.max is not None:
         if args.max <= 0:
             sys.exit("--max must be a positive integer.")
         problems = loaders.load_hle(
             category=args.category, max_questions=args.max, skip=args.skip,
+            revision=args.dataset_revision,
         )
     else:
         sys.exit(
@@ -389,6 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--skip", type=int, default=0, help="With --max: skip the first N.")
     h.add_argument("--ids", default=None, help="Comma-separated specific dataset ids.")
     h.add_argument("--category", default=None, help="Filter (e.g. Math, Physics).")
+    h.add_argument(
+        "--dataset-revision", default=None,
+        help="Hugging Face revision (commit/tag) to pin HLE-Verified. The "
+             "resolved dataset fingerprint is always recorded.",
+    )
     add_run_options(h)
     h.set_defaults(func=cmd_hle)
 
