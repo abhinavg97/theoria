@@ -249,7 +249,13 @@ def cmd_show(args) -> None:
 
 def cmd_grade(args) -> None:
     import grade
-    asyncio.run(grade.grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade.grade_run(
+        args.run_file,
+        args.config,
+        args.out,
+        watch=args.watch,
+        pricing_path=args.pricing,
+    ))
 
 
 def cmd_doctor(args) -> None:
@@ -413,6 +419,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--config", action="append", default=None,
                    help="Grader config YAML (default: configs/audit_grader.yaml).")
     g.add_argument("--out", default=None, help="Output grades JSON path.")
+    g.add_argument(
+        "--watch", action=argparse.BooleanOptionalAction, default=True,
+        help="Stream grader LLM events (default: on).",
+    )
+    g.add_argument("--pricing", default=None, metavar="PATH",
+                   help="Versioned pricing catalog for grader cost estimates.")
+    g.add_argument(
+        "--log-level", default=None,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+    )
+    g.add_argument("--log-format", default=None, choices=("text", "json"))
     g.set_defaults(func=cmd_grade)
 
     d = sub.add_parser("doctor", help="Check your setup.")

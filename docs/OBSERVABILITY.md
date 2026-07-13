@@ -19,8 +19,12 @@ THEORIA_LOG_FORMAT=json THEORIA_LOG_LEVEL=WARNING theoria hle 1
 JSON logs include UTC timestamps, stable event names, severity, component,
 run/problem/call identifiers where available, and event-specific fields.
 Known secret-bearing field names are recursively redacted. Prompts, responses,
-credentials, and command arguments are never added to operational events.
-Those research artifacts remain under the gitignored `runs/artifacts/` tree.
+credentials, and command arguments are never added to structured operational
+events. Common inline bearer tokens and key/value credentials are also
+redacted from live tool previews and the truncated previews in result JSON.
+Full research artifacts remain under the gitignored `runs/artifacts/` tree;
+they intentionally preserve exact inputs and outputs and must be treated as
+sensitive data.
 
 ## Per-call telemetry
 
@@ -39,6 +43,8 @@ when the CLI did not report that dimension.
 
 Problem-level metrics are stored in the result JSON. Run-level totals are
 written to `runs/artifacts/<run_id>/telemetry.json`.
+`theoria grade` uses the same call schema and writes a separate
+`grade_<source-run>_<timestamp>` artifact root.
 
 ## Cost semantics
 
@@ -88,3 +94,15 @@ versions, model names, pricing ID, cost source, and cost coverage. Distinguish:
 
 Also retain rejected/failed calls and retries. Excluding them understates both
 compute and cost.
+
+For HLE runs, pin the source when possible:
+
+```bash
+theoria hle 1 --dataset-revision <hugging-face-commit>
+```
+
+Every loaded problem records the requested revision and the resolved
+`datasets` fingerprint. Run metadata also includes canonical configuration and
+per-role prompt SHA-256 hashes, pricing-file SHA-256, git state, tool versions,
+and the sandbox image digest. Failed calls and problems write traceback files
+inside their artifact directories.

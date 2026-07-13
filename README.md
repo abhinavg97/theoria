@@ -118,6 +118,8 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 ```
 
 `theoria grade` writes per-problem `key_match` + `dispute_category` to `runs/grades/`.
+Its model calls use the same telemetry schema and artifact capture as pipeline
+runs.
 
 ---
 
@@ -136,6 +138,7 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 | `--log-format text\|json` | text | Operational logs; JSON is suitable for log ingestion. |
 | `--log-level LEVEL` | INFO | Operational log threshold (also `THEORIA_LOG_LEVEL`). |
 | `--pricing PATH` | none | Versioned pricing catalog for labeled cost estimates. |
+| `--dataset-revision REV` | live default | Pin HLE-Verified to a Hugging Face commit/tag; the resolved fingerprint is recorded. |
 
 Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, `audit_grader.yaml` (the grader role).
 

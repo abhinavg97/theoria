@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from llm import (
     telemetry_context,
 )
 from pipeline import load_config
-from telemetry import aggregate_calls
+from telemetry import aggregate_calls, load_pricing
 
 
 # ── Structured output schema (identical to the internal audit grader) ──
@@ -218,13 +219,16 @@ async def grade_run(
 ) -> dict:
     """Grade every problem in a run JSON. Writes a grades JSON and returns a
     summary dict. Defaults the output to runs/grades/<run-stem>.json."""
-    results = json.load(open(run_file))
+    with open(run_file) as f:
+        results = json.load(f)
     if isinstance(results, dict):
         results = [results]
 
     config = load_config(config_paths or [DEFAULT_GRADER_CONFIG])
-    if pricing_path:
-        config.setdefault("_telemetry", {})["pricing_file"] = pricing_path
+    resolved_pricing_path = pricing_path or os.getenv("THEORIA_PRICING_FILE")
+    if resolved_pricing_path:
+        load_pricing(resolved_pricing_path)
+        config.setdefault("_telemetry", {})["pricing_file"] = resolved_pricing_path
     if "audit_grader" not in config:
         raise SystemExit(
             "No 'audit_grader' role in the loaded config. Pass "
@@ -240,7 +244,7 @@ async def grade_run(
     grade_started_perf = time.perf_counter()
     grade_run_id = (
         f"grade_{Path(run_file).stem}_"
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     )
     grade_artifact_root = Path("runs/artifacts") / grade_run_id
     grade_artifact_root.mkdir(parents=True, exist_ok=True)
@@ -291,6 +295,9 @@ async def grade_run(
             )
         except Exception as e:
             error = e
+            (problem_artifact_dir / "traceback.txt").write_text(
+                traceback.format_exc()
+            )
         finally:
             call_log.reset(call_token)
             artifact_dir.reset(artifact_token)
@@ -397,5 +404,12 @@ if __name__ == "__main__":
                         help="Grader config YAML (repeatable). "
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
+    parser.add_argument(
+        "--watch", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument("--pricing", default=None)
     args = parser.parse_args()
-    asyncio.run(grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade_run(
+        args.run_file, args.config, args.out,
+        watch=args.watch, pricing_path=args.pricing,
+    ))

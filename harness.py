@@ -34,7 +34,7 @@ from llm import (
 )
 from pipeline import run, CONFIG, load_config
 from observability import event, get_logger
-from telemetry import aggregate_calls
+from telemetry import aggregate_calls, load_pricing
 
 logger = get_logger("harness")
 
@@ -231,8 +231,12 @@ def apply_args(args) -> None:
                 continue
             if settings.get("backend") == "codex":
                 settings["model"] = args.codex_model
-    if getattr(args, "pricing", None):
-        CONFIG.setdefault("_telemetry", {})["pricing_file"] = args.pricing
+    pricing_path = (
+        getattr(args, "pricing", None) or os.getenv("THEORIA_PRICING_FILE")
+    )
+    if pricing_path:
+        load_pricing(pricing_path)
+        CONFIG.setdefault("_telemetry", {})["pricing_file"] = pricing_path
     pipeline.WATCH = args.watch
     # Pulled in run_problems; expose here so runners don't need to thread it.
     _args_ref["docker"] = bool(getattr(args, "docker", False))
@@ -517,6 +521,29 @@ async def run_problems(
     run_started_at = datetime.now(timezone.utc).isoformat()
     run_started_perf = time.perf_counter()
     artifact_root = make_artifact_root(save_path)
+    dataset_provenance = {
+        (
+            problem.get("dataset_name"),
+            problem.get("dataset_split"),
+            problem.get("dataset_revision"),
+            problem.get("dataset_fingerprint"),
+        )
+        for problem in problems
+        if problem.get("dataset_name")
+    }
+    if dataset_provenance:
+        update_artifact_root_meta(artifact_root, {
+            "datasets": [
+                {
+                    "name": name,
+                    "split": split,
+                    "requested_revision": revision,
+                    "fingerprint": fingerprint,
+                }
+                for name, split, revision, fingerprint
+                in sorted(dataset_provenance, key=lambda item: str(item))
+            ],
+        })
     event(
         logger, 20, "run.started", "Run started",
         save_path=save_path, requested_problems=len(problems), parallel=parallel,

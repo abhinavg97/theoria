@@ -65,6 +65,34 @@ def load_pricing(path: str) -> dict[str, Any]:
         raise ValueError("pricing catalog must contain a non-empty pricing_id")
     if not isinstance(catalog.get("models"), dict):
         raise ValueError("pricing catalog must contain a models mapping")
+    valid_semantics = {
+        "excludes_cache", "includes_cache_read", "includes_all_cache",
+    }
+    required_rates = (
+        "input_per_million_usd",
+        "output_per_million_usd",
+        "cache_read_per_million_usd",
+        "cache_creation_per_million_usd",
+    )
+    for model_key, rates in catalog["models"].items():
+        if not isinstance(rates, dict):
+            raise ValueError(f"pricing entry {model_key!r} must be a mapping")
+        if rates.get("input_token_semantics") not in valid_semantics:
+            raise ValueError(
+                f"pricing entry {model_key!r} has invalid "
+                "input_token_semantics"
+            )
+        for rate_name in required_rates:
+            try:
+                rate = float(rates[rate_name])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(
+                    f"pricing entry {model_key!r} needs numeric {rate_name}"
+                ) from None
+            if rate < 0:
+                raise ValueError(
+                    f"pricing entry {model_key!r} has negative {rate_name}"
+                )
     return catalog
 
 

@@ -8,7 +8,7 @@ from io import StringIO
 from pathlib import Path
 
 from llm import _extract_codex_metadata
-from observability import JsonFormatter
+from observability import JsonFormatter, redact_text
 from telemetry import aggregate_calls, enrich_call
 
 
@@ -99,6 +99,14 @@ class TelemetryTests(unittest.TestCase):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_text_redaction_covers_common_inline_credentials(self):
+        text = redact_text(
+            "Authorization: Bearer abcdefghijklmnop api_key=supersecretvalue"
+        )
+        self.assertNotIn("abcdefghijklmnop", text)
+        self.assertNotIn("supersecretvalue", text)
+        self.assertEqual(text.count("[REDACTED]"), 2)
+
     def test_json_formatter_redacts_nested_secrets(self):
         stream = StringIO()
         handler = logging.StreamHandler(stream)
