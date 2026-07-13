@@ -1041,6 +1041,22 @@ def _configured_codex_base_url(settings: dict) -> str | None:
     return None
 
 
+def _effective_codex_base_url_for_identity(settings: dict) -> str | None:
+    """Return the endpoint that can affect a cached Codex invocation.
+
+    Local OSS calls prefer the process-level ``CODEX_OSS_BASE_URL`` override
+    at launch time.  Cache identity must mirror that precedence; otherwise a
+    resumed run can reuse output produced by a different provider endpoint.
+    URL validation forbids embedded credentials, query strings, and fragments,
+    and the enclosing invocation settings are stored only through a hash.
+    """
+    if settings.get("oss"):
+        env_base_url = os.environ.get("CODEX_OSS_BASE_URL")
+        if env_base_url is not None:
+            return _route_oss_base_url(env_base_url, sandboxed=False)
+    return _configured_codex_base_url(settings)
+
+
 def _uses_external_codex_provider(settings: dict) -> bool:
     """Return whether Codex is configured outside its native OpenAI path."""
     provider = _codex_provider(settings)
@@ -1097,7 +1113,7 @@ def _call_cache_identity(
             "full_auto": bool(settings.get("full_auto", False)),
             "oss": bool(settings.get("oss", False)),
             "local_provider": settings.get("local_provider"),
-            "base_url": _configured_codex_base_url(settings),
+            "base_url": _effective_codex_base_url_for_identity(settings),
             "provider_env": sorted(_provider_env_names(settings)),
             "codex_config": sorted(
                 _codex_config_items(settings), key=lambda item: item[0]

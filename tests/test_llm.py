@@ -391,6 +391,37 @@ def test_resume_cache_identity_never_contains_provider_secret(monkeypatch):
     assert identity["inputs"]["provider"] == "custom"
 
 
+def test_resume_cache_identity_tracks_effective_oss_endpoint_override(
+    monkeypatch,
+):
+    settings = {
+        "model": "gpt-oss:20b",
+        "effort": "xhigh",
+        "sandbox": "read-only",
+        "search": False,
+        "oss": True,
+        "local_provider": "ollama",
+        # The environment override must win over this configured fallback in
+        # both the eventual launch and the pre-launch cache fingerprint.
+        "oss_base_url": "http://localhost:11434/v1",
+    }
+
+    monkeypatch.setenv("CODEX_OSS_BASE_URL", "http://localhost:12434/v1")
+    first = _cache_identity(settings=settings)
+    monkeypatch.setenv("CODEX_OSS_BASE_URL", "http://localhost:13434/v1")
+    changed = _cache_identity(settings=settings)
+
+    assert first["sha256"] != changed["sha256"]
+    assert (
+        first["inputs"]["invocation_settings_sha256"]
+        != changed["inputs"]["invocation_settings_sha256"]
+    )
+
+    monkeypatch.delenv("CODEX_OSS_BASE_URL")
+    configured = _cache_identity(settings=settings)
+    assert configured["sha256"] not in {first["sha256"], changed["sha256"]}
+
+
 def test_structured_output_validation_reports_path():
     schema = {
         "type": "object",
