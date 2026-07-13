@@ -1371,6 +1371,7 @@ def _call_cache_identity(
     sandboxed: bool,
     image_id: str | None,
     codex_version: str | None,
+    web_search: dict | None = None,
 ) -> dict:
     """Build a versioned, secret-free identity for one model invocation.
 
@@ -1398,6 +1399,12 @@ def _call_cache_identity(
             "codex_config": sorted(
                 _codex_config_items(settings), key=lambda item: item[0]
             ),
+            # The normalized run-level shell-search declaration contains
+            # only provider, endpoint, and environment-variable names. It
+            # must participate in resume identity because changing search
+            # backends changes the tools and external data source available
+            # to an otherwise identical model invocation.
+            "web_search": web_search or None,
             "schema_retries": settings.get("schema_retries", 0),
         }
         provider = _codex_provider(settings)
@@ -1966,6 +1973,7 @@ async def llm(
     effective_codex_version = (
         codex_cli_version.get() if backend == "codex" else None
     )
+    normalized_web_search = web_search_config(config.get("_web_search"))
     cache_identity = _call_cache_identity(
         prompt=prompt,
         system=system,
@@ -1978,6 +1986,7 @@ async def llm(
         sandboxed=sandboxed,
         image_id=image_id,
         codex_version=effective_codex_version,
+        web_search=normalized_web_search,
     )
 
     # ── Resume from cache (idempotent) ───────────────────────────
@@ -2020,7 +2029,7 @@ async def llm(
     schema_file = None
     child_env = None
     codex_provider = None
-    web_search: dict = {}
+    web_search: dict = normalized_web_search
     web_search_env_vars: dict[str, str] = {}
     configured_base_url = None
     effective_base_url = None
@@ -2058,7 +2067,6 @@ async def llm(
             # here (the host process) to be forwarded, and configured
             # search access makes host execution opt-in, exactly like
             # provider credentials.
-            web_search = web_search_config(config.get("_web_search"))
             web_search_key_env = web_search.get("api_key_env")
             if web_search_key_env and not os.environ.get(web_search_key_env):
                 raise RuntimeError(

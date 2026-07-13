@@ -179,6 +179,32 @@ def test_web_search_key_joins_oss_provider_forwarding(monkeypatch):
     assert {"name": "BRAVE_API_KEY", "present": True} in runtime["provider_env"]
 
 
+def test_keyless_remote_custom_provider_plus_brave_is_mixed(monkeypatch):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    runtime = harness.resolve_runtime({
+        "_web_search": {"provider": "brave"},
+        "solver": {
+            "backend": "codex",
+            "model": "remote-deployment",
+            "codex_config": {
+                "model_provider": "custom",
+                "model_providers.custom.base_url": (
+                    "https://models.example.test/v1"
+                ),
+            },
+        },
+    })
+
+    assert runtime["requirements"]["mixed_provider_credentials"] is True
+    assert len(runtime["credential_domains"]) == 1
+    assert runtime["credential_domains"][0].startswith(
+        "web-search:brave:"
+    )
+    assert {item["provider"] for item in runtime["data_destinations"]} == {
+        "codex:custom", "brave",
+    }
+
+
 def test_searxng_search_needs_no_env_and_requests_linux_gateway(monkeypatch):
     monkeypatch.setattr(harness.sys, "platform", "linux")
     monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)

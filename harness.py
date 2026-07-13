@@ -321,6 +321,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
     data_destinations: dict[str, dict] = {}
     external_model_destinations: set[str] = set()
     external_model_credentials: set[str] = set()
+    keyless_remote_model_destinations: set[str] = set()
     has_external_access = bool(web_search)
 
     def add_destination(destination: dict) -> str:
@@ -404,10 +405,11 @@ def resolve_runtime(config: dict | None = None) -> dict:
                     if env_override and oss
                     else endpoints
                 )
-                external_model_destinations.add(add_destination(_data_destination(
+                model_destination = add_destination(_data_destination(
                     "model", f"codex:{provider or 'external'}",
                     effective_endpoints,
-                )))
+                ))
+                external_model_destinations.add(model_destination)
                 # A key-free local endpoint is still a data destination, but
                 # it is not a credential issuer.  Only provider-specific
                 # environment references create a credential domain.
@@ -420,6 +422,28 @@ def resolve_runtime(config: dict | None = None) -> dict:
                     )
                     credential_domains.add(model_credential)
                     external_model_credentials.add(model_credential)
+                else:
+                    # The single-key convenience is intentionally limited to
+                    # Codex's built-in local providers on their default or a
+                    # loopback endpoint. A key-free hosted custom provider can
+                    # invoke shell search and receive its credential-bearing
+                    # output, so it crosses a trust boundary despite having no
+                    # model credential of its own.
+                    local_builtin = bool(
+                        oss
+                        and provider in {"ollama", "lmstudio"}
+                        and (
+                            not effective_endpoints
+                            or all(
+                                _endpoint_needs_host_gateway(item)
+                                for item in effective_endpoints
+                            )
+                        )
+                    )
+                    if not local_builtin:
+                        keyless_remote_model_destinations.add(
+                            model_destination
+                        )
 
             role_runtime.update({
                 "oss": oss,
@@ -489,6 +513,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
             len(external_model_destinations) > 1
             and external_model_credentials
         )
+        or (keyless_remote_model_destinations and credential_domains)
     )
     mixed_provider_credentials = bool(
         (external_domains and len(credential_domains) > 1)

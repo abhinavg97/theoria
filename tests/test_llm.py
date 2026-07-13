@@ -895,6 +895,7 @@ def _cache_identity(
     settings=None,
     watch=False,
     codex_version="codex-cli 0.133.0",
+    web_search=None,
 ):
     return llm._call_cache_identity(
         prompt="prompt",
@@ -913,6 +914,7 @@ def _cache_identity(
         sandboxed=True,
         image_id="sha256:image",
         codex_version=codex_version,
+        web_search=web_search,
     )
 
 
@@ -955,6 +957,14 @@ def test_resume_cache_identity_covers_runtime_and_tool_inputs(tmp_path):
             "provider_env": ["MODEL_API_KEY"],
         }),
         _cache_identity(codex_version="codex-cli 0.134.0"),
+        _cache_identity(web_search={
+            "provider": "brave",
+            "api_key_env": "BRAVE_API_KEY",
+        }),
+        _cache_identity(web_search={
+            "provider": "searxng",
+            "endpoint": "https://search.example.test",
+        }),
     ]
     for changed_identity in variants:
         with pytest.raises(RuntimeError, match="resume idempotency check failed"):
