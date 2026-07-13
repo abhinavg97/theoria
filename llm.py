@@ -146,6 +146,23 @@ class WatchdogKilled(RuntimeError):
     pass
 
 
+class ProviderProcessError(RuntimeError):
+    """A streamed provider failure carrying output needed for artifacts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_stdout: bytes,
+        raw_stderr: bytes,
+        events: list[dict],
+    ):
+        super().__init__(message)
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
+        self.events = events
+
+
 async def _find_subprocess_pid(
     container_id: str, comm: str, marker: str | None,
 ) -> int | None:
@@ -735,7 +752,12 @@ async def _run_claude_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("claude", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("claude", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if result_event is None:
         raise RuntimeError("claude stream ended without result event")
@@ -969,7 +991,12 @@ async def _run_codex_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("codex", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("codex", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if last_message_text is None:
         raise RuntimeError("codex stream ended without agent message")
@@ -1299,7 +1326,11 @@ async def llm(
                     raw_stderr = await proc.stderr.read()
                 # Success — exit retry loop.
                 break
-            except Exception:
+            except Exception as run_error:
+                if isinstance(run_error, ProviderProcessError):
+                    raw_stdout = run_error.raw_stdout
+                    raw_stderr = run_error.raw_stderr
+                    events = run_error.events
                 # Was this a watchdog kill (transient hang) and do we
                 # have retries left? If so, swallow and retry.
                 if (watchdog_killed[0]
@@ -1471,6 +1502,26 @@ async def llm(
         return response, session_id
 
     except Exception as e:
+        failed_provider_meta: dict = {}
+        if events:
+            if backend == "claude":
+                result_event = next(
+                    (
+                        item for item in reversed(events)
+                        if item.get("type") == "result"
+                    ),
+                    None,
+                )
+                if result_event is not None:
+                    failed_provider_meta = _extract_claude_metadata(result_event)
+                    failed_provider_meta["tool_calls"] = (
+                        _extract_claude_tool_calls(events)
+                    )
+            elif backend == "codex":
+                failed_provider_meta = _extract_codex_metadata(events)
+                failed_provider_meta["tool_calls"] = (
+                    _extract_codex_tool_calls(events)
+                )
         failure_meta = {
             "call_id": call_id,
             **trace,
@@ -1496,7 +1547,18 @@ async def llm(
             "cache_creation_input_tokens": 0,
             "reasoning_output_tokens": 0,
             "total_cost_usd": None,
+            **failed_provider_meta,
         }
+        if call_dir and raw_stdout:
+            failure_meta["stdout_path"] = os.path.join(
+                call_dir,
+                f"attempt_{len(failure_meta['attempts']):03d}_stdout.jsonl.gz",
+            )
+        if call_dir and raw_stderr:
+            failure_meta["stderr_path"] = os.path.join(
+                call_dir,
+                f"attempt_{len(failure_meta['attempts']):03d}_stderr.txt.gz",
+            )
         enrich_call(failure_meta, pricing_path=pricing_path)
         if log is not None and call_index is not None:
             log[call_index] = failure_meta
@@ -1512,6 +1574,14 @@ async def llm(
         # self-describing for post-mortem.
         if call_dir:
             try:
+                if events:
+                    events_path = os.path.join(call_dir, "events.json.gz")
+                    _write_artifact(
+                        os.path.join(call_dir, "events.json"),
+                        json.dumps(events, ensure_ascii=False, default=str),
+                        gzip_it=True,
+                    )
+                    failure_meta["events_path"] = events_path
                 traceback_path = os.path.join(call_dir, "traceback.txt")
                 _write_artifact(traceback_path, traceback.format_exc())
                 failure_meta["traceback_path"] = traceback_path

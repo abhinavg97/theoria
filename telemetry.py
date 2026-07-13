@@ -35,11 +35,13 @@ def normalize_usage(metadata: dict[str, Any]) -> dict[str, Any]:
         usage[field] = max(0, int(raw or 0))
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
     reported = (
-        not metadata.get("failed")
-        and (
-            "provider_usage" in metadata
-            or any(field in metadata for field in TOKEN_FIELDS)
-            or "cached_input_tokens" in metadata
+        "provider_usage" in metadata
+        or (
+            not metadata.get("failed")
+            and (
+                any(field in metadata for field in TOKEN_FIELDS)
+                or "cached_input_tokens" in metadata
+            )
         )
     )
     retried = int(metadata.get("retry_count", 0) or 0) > 0

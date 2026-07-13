@@ -1,18 +1,79 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
-from llm import _extract_codex_metadata
+from llm import (
+    ProviderProcessError,
+    _extract_claude_metadata,
+    _extract_codex_metadata,
+    _run_claude_streaming,
+)
 from observability import JsonFormatter, redact_text
 from telemetry import aggregate_calls, enrich_call
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_streamed_provider_failure_retains_events_and_usage(self):
+        event = {
+            "type": "result",
+            "is_error": True,
+            "result": "authentication failed",
+            "total_cost_usd": 0,
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }
+        raw_line = (json.dumps(event) + "\n").encode()
+
+        class Stream:
+            def __init__(self, lines=None, read_value=b""):
+                self.lines = list(lines or [])
+                self.read_value = read_value
+
+            def __aiter__(self):
+                self.iterator = iter(self.lines)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.iterator)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def read(self):
+                return self.read_value
+
+        class Process:
+            returncode = 1
+            stdout = Stream([raw_line])
+            stderr = Stream(read_value=b"provider stderr")
+
+            async def wait(self):
+                return self.returncode
+
+        with patch("llm._print_claude_event"):
+            with self.assertRaises(ProviderProcessError) as caught:
+                asyncio.run(_run_claude_streaming(Process(), schema=None))
+        error = caught.exception
+        self.assertEqual(error.raw_stdout, raw_line)
+        self.assertEqual(error.raw_stderr, b"provider stderr")
+        self.assertEqual(error.events, [event])
+
+        call = {
+            "backend": "claude",
+            "model": "opus",
+            "failed": True,
+            **_extract_claude_metadata(event),
+        }
+        enrich_call(call)
+        self.assertTrue(call["usage"]["complete"])
+        self.assertEqual(call["usage"]["total_tokens"], 4)
+
     def test_codex_usage_preserves_cache_and_reasoning_dimensions(self):
         metadata = _extract_codex_metadata([
             {
