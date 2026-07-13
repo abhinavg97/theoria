@@ -108,6 +108,86 @@ def test_oss_codex_allows_explicit_feature_overrides():
     assert "features.unified_exec=false" not in values
 
 
+def test_oss_calls_are_serialized_within_one_event_loop(monkeypatch):
+    active = 0
+    max_active = 0
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            events = [
+                {"type": "thread.started", "thread_id": "t"},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "ok"},
+                },
+            ]
+            return "\n".join(json.dumps(e) for e in events).encode(), b""
+
+    async def fake_create_subprocess_exec(*_command, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+    )
+    monkeypatch.delenv("THEORIA_OSS_MAX_PARALLEL", raising=False)
+    config = {
+        "_security": {"allow_external_provider_host_access": True},
+        "judge": {
+            "backend": "codex",
+            "model": "local-model",
+            "oss": True,
+            "local_provider": "ollama",
+            "search": False,
+        },
+    }
+
+    async def run_parallel():
+        await asyncio.gather(*[
+            llm.llm(f"judge {n}", role="judge", config=config)
+            for n in range(4)
+        ])
+
+    asyncio.run(run_parallel())
+    assert max_active == 1
+
+    # Providers that really do handle concurrent requests can raise the
+    # limit; a fresh event loop gets a fresh gate with the new value.
+    monkeypatch.setenv("THEORIA_OSS_MAX_PARALLEL", "4")
+    active = 0
+    max_active = 0
+    asyncio.run(run_parallel())
+    assert max_active > 1
+
+
+def test_sandboxed_codex_home_avoids_tmp_helper_warning():
+    command = llm._build_codex_cmd(
+        "prompt",
+        {
+            "model": "gpt-oss:20b",
+            "oss": True,
+            "local_provider": "ollama",
+            "search": False,
+        },
+        None,
+        None,
+        None,
+        sandboxed=True,
+        role="computation",
+    )
+
+    assert command[0] == "bash"
+    script = command[2]
+    assert "CODEX_HOME=/home/node/.codex-call-" in script
+    assert "/tmp/codex-" not in script
+
+
 def test_custom_provider_config_is_structured_and_rejects_secrets():
     command = llm._build_codex_cmd(
         "prompt",

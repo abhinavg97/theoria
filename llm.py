@@ -133,6 +133,50 @@ WATCHDOG_RETRY_MAX = 3                 # retry attempts after kill
 SCHEMA_RETRY_MAX = 3                   # hard cap for opt-in format retries
 
 
+# ── OSS call serialization ──────────────────────────────────────
+#
+# Local providers (Ollama by default) process one request at a time.
+# Theoria's judge fan-out launches every step judge concurrently, so
+# on a local provider all but one Codex process sits on an open SSE
+# stream receiving zero bytes until a slot frees — which can be hours
+# on consumer hardware. Codex's stream-idle timeout then kills and
+# re-queues each starved request up to five times before failing the
+# call outright, and every abandoned retry still burns a full prefill
+# on the server. Observed live: a 13-step proof → 14 parallel judges →
+# "stream disconnected before completion: idle timeout waiting for
+# SSE" after ~2h, zero judges completed.
+#
+# Serializing OSS calls per event loop fixes this structurally: a call
+# only opens its stream when the provider is actually free, so the
+# only idle window left is the model's own prefill. Servers that
+# genuinely handle concurrent requests can raise the limit via
+# THEORIA_OSS_MAX_PARALLEL.
+
+_oss_gates: dict[int, asyncio.Semaphore] = {}
+
+
+def _oss_max_parallel() -> int:
+    raw = os.environ.get("THEORIA_OSS_MAX_PARALLEL", "1")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        print(
+            f"[llm] ignoring non-integer THEORIA_OSS_MAX_PARALLEL={raw!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _oss_gate() -> asyncio.Semaphore:
+    """Per-event-loop semaphore bounding concurrent OSS provider calls."""
+    loop_id = id(asyncio.get_running_loop())
+    gate = _oss_gates.get(loop_id)
+    if gate is None:
+        gate = asyncio.Semaphore(_oss_max_parallel())
+        _oss_gates[loop_id] = gate
+    return gate
+
+
 class WatchdogKilled(RuntimeError):
     """Raised when the watchdog killed the subprocess for being hung.
     Distinguished from generic RuntimeError so the retry loop in llm()
@@ -1187,7 +1231,12 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
     is_resumable = role in _RESUMABLE_CODEX_ROLES
     if sandboxed and not resume and not is_resumable:
         uid = uuid.uuid4().hex[:12]
-        home = f"/tmp/codex-{uid}"
+        # Under the tmpfs home, not /tmp: codex refuses to create its
+        # helper binaries beneath a temporary directory and warns on
+        # every call ("Refusing to create helper binaries under
+        # temporary dir"). The home tmpfs is mounted exec for exactly
+        # this kind of per-call state.
+        home = f"/home/node/.codex-call-{uid}"
         inner = " ".join(shlex.quote(a) for a in cmd)
         cmd = [
             "bash", "-c",
@@ -1510,6 +1559,8 @@ async def llm(
     configured_base_url = None
     effective_base_url = None
     oss_env_base_url = None
+    oss_gate: asyncio.Semaphore | None = None
+    oss_gate_held = False
     raw_stdout: bytes = b""
     raw_stderr: bytes = b""
     events: list[dict] = []
@@ -1655,6 +1706,14 @@ async def llm(
         )
         call_label = (f"call_{call_index:03d}_{role}"
                       if call_index is not None else role)
+        # Local providers handle one request at a time; hold the gate
+        # across the whole retry loop so a call only opens its stream
+        # when the provider is actually free (see _oss_gate above).
+        # Released in the outer finally.
+        if backend == "codex" and settings.get("oss"):
+            oss_gate = _oss_gate()
+            await oss_gate.acquire()
+            oss_gate_held = True
         while True:
             process_attempts += 1
             attempt_started = time.perf_counter()
@@ -1969,6 +2028,8 @@ async def llm(
         raise
 
     finally:
+        if oss_gate_held and oss_gate is not None:
+            oss_gate.release()
         # Only unlink host-side schema tempfiles. When sandboxed the
         # schema lives at an in-container path; it's cleaned up with
         # the per-call workspace dir when the container is destroyed.

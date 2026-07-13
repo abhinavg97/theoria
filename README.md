@@ -121,6 +121,16 @@ selects Codex's simplest shell tool for OSS roles
 a model narrates instead of acting, move up to a reasoning-capable model
 rather than fighting the prompt.
 
+OSS model calls are serialized (one request in flight per run) because local
+servers such as Ollama process one request at a time. Without this, the
+parallel judge fan-out leaves all but one Codex process starving on an open
+stream; Codex's 300-second stream-idle timeout then kills and re-queues each
+starved request until the run fails hours later with "stream disconnected
+before completion: idle timeout waiting for SSE". Judges still run — just one
+after another, at the model's own speed. If your endpoint genuinely serves
+concurrent requests (a multi-GPU server, a hosted OSS provider), set
+`THEORIA_OSS_MAX_PARALLEL` to its real concurrency.
+
 `configs/ollama.yaml` points to `http://localhost:11434/v1`. Set `CODEX_OSS_BASE_URL` to override it. In Docker mode, Theoria maps a loopback endpoint to `host.docker.internal`; `--no-docker` uses the URL directly. The profile sets every role, including the formalizer, to `backend: codex`. Codex formalizer repairs are stateless: each repair call includes the prior proof and failed verdicts.
 
 [`configs/oss_custom_provider.example.yaml`](configs/oss_custom_provider.example.yaml) shows the corresponding `model_providers` wiring for a hosted or self-hosted provider. It forwards only the environment-variable names in `provider_env`; credentials must remain in the environment and must never be written into YAML. Provider compatibility must be tested individually.
