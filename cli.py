@@ -428,8 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--log-level", default=None,
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Operational log level (or THEORIA_LOG_LEVEL).",
     )
-    g.add_argument("--log-format", default=None, choices=("text", "json"))
+    g.add_argument(
+        "--log-format", default=None, choices=("text", "json"),
+        help="Operational log format (or THEORIA_LOG_FORMAT).",
+    )
     g.set_defaults(func=cmd_grade)
 
     d = sub.add_parser("doctor", help="Check your setup.")

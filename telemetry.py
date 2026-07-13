@@ -25,6 +25,11 @@ TOKEN_FIELDS = (
 )
 
 
+def config_for_hash(config: dict[str, Any]) -> dict[str, Any]:
+    """Return config suitable for stable cross-machine SHA-256 hashing."""
+    return {key: value for key, value in config.items() if key != "_telemetry"}
+
+
 def normalize_usage(metadata: dict[str, Any]) -> dict[str, Any]:
     """Return a stable usage shape while retaining zero-valued dimensions."""
     usage = {}
@@ -114,7 +119,7 @@ def cost_record(
             "source": "provider_reported",
             "pricing_id": None,
             "currency": "USD",
-            "complete": usage_complete,
+            "complete": True,
             **({"reason": "retry usage may be unreported"} if not usage_complete else {}),
         }
 
@@ -222,12 +227,33 @@ def enrich_call(
     return call
 
 
+def _timing_fields(
+    scope: str | None,
+    *,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    if scope in {"run", "grading_run"}:
+        return {
+            "run_started_at": started_at,
+            "run_ended_at": ended_at,
+            "run_duration_ms": duration_ms,
+        }
+    return {
+        "problem_started_at": started_at,
+        "problem_ended_at": ended_at,
+        "problem_duration_ms": duration_ms,
+    }
+
+
 def aggregate_calls(
     calls: list[dict[str, Any]],
     *,
     problem_started_at: str,
     problem_ended_at: str,
     problem_duration_ms: int,
+    scope: str | None = None,
 ) -> dict[str, Any]:
     """Aggregate calls without hiding missing usage or cost coverage."""
     totals = {field: 0 for field in TOKEN_FIELDS}
@@ -285,9 +311,12 @@ def aggregate_calls(
     }
     return {
         "telemetry_schema_version": SCHEMA_VERSION,
-        "problem_started_at": problem_started_at,
-        "problem_ended_at": problem_ended_at,
-        "problem_duration_ms": problem_duration_ms,
+        **_timing_fields(
+            scope,
+            started_at=problem_started_at,
+            ended_at=problem_ended_at,
+            duration_ms=problem_duration_ms,
+        ),
         "total_llm_duration_ms": total_llm_duration_ms,
         "num_calls": len(calls),
         "successful_calls": len(calls) - failed_calls,

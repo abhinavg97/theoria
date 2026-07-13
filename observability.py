@@ -24,7 +24,7 @@ _SENSITIVE_TEXT = (
     re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(
         r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
-        r"(\s*[:=]\s*)['\"]?([^\s,'\"}]{8,})"
+        r"(['\"]?\s*[:=]\s*['\"]?)([^\s,'\"}]{8,})['\"]?"
     ),
 )
 
@@ -84,6 +84,11 @@ def configure_logging(
 ) -> None:
     """Configure the package root logger once, replacing stale handlers."""
     resolved_level = (level or os.getenv("THEORIA_LOG_LEVEL") or "INFO").upper()
+    if getattr(logging, resolved_level, None) is None:
+        raise ValueError(
+            "log level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL; "
+            f"got {resolved_level!r}"
+        )
     resolved_format = (
         log_format or os.getenv("THEORIA_LOG_FORMAT") or "text"
     ).lower()

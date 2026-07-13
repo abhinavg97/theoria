@@ -42,9 +42,9 @@ usage remains the source of truth; a missing dimension is recorded as zero only
 when the CLI did not report that dimension.
 
 Problem-level metrics are stored in the result JSON. Run-level totals are
-written to `runs/artifacts/<run_id>/telemetry.json`.
-`theoria grade` uses the same call schema and writes a separate
-`grade_<source-run>_<timestamp>` artifact root.
+written to `runs/artifacts/<run_id>/telemetry.json` with `run_started_at`,
+`run_ended_at`, and `run_duration_ms`. `theoria grade` uses the same call
+schema and writes a separate `grade_<source-run>_<timestamp>` artifact root.
 
 ## Cost semantics
 

@@ -17,6 +17,7 @@ import contextvars
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -1102,7 +1103,7 @@ async def llm(
         else str(uuid.uuid4())
     )
     event(
-        logger, 20, "llm.call.started", "LLM call started",
+        logger, logging.INFO, "llm.call.started", "LLM call started",
         call_id=call_id, role=role, backend=backend,
         run_id=trace.get("run_id"), problem_id=trace.get("problem_id"),
     )
@@ -1139,7 +1140,7 @@ async def llm(
             if log is not None and call_index is not None:
                 log[call_index] = cache_meta
             event(
-                logger, 20, "llm.call.cache_hit", "LLM call reused cached result",
+                logger, logging.INFO, "llm.call.cache_hit", "LLM call reused cached result",
                 call_id=call_id, role=role, backend=backend,
                 cache_lookup_duration_ms=int(round(
                     (time.perf_counter() - call_started_perf) * 1000
@@ -1494,7 +1495,7 @@ async def llm(
             )
 
         event(
-            logger, 20, "llm.call.completed", "LLM call completed",
+            logger, logging.INFO, "llm.call.completed", "LLM call completed",
             call_id=call_id, role=role, backend=backend,
             model=call_meta.get("model") if call_meta else settings.get("model"),
             duration_ms=duration_ms, retry_count=watchdog_attempts,
@@ -1563,7 +1564,7 @@ async def llm(
         if log is not None and call_index is not None:
             log[call_index] = failure_meta
         event(
-            logger, 40, "llm.call.failed", "LLM call failed",
+            logger, logging.ERROR, "llm.call.failed", "LLM call failed",
             call_id=call_id, role=role, backend=backend,
             error_type=type(e).__name__, duration_ms=failure_meta["duration_ms"],
             retry_count=failure_meta["retry_count"],

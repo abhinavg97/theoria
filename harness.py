@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -34,7 +35,7 @@ from llm import (
 )
 from pipeline import run, CONFIG, load_config
 from observability import event, get_logger
-from telemetry import aggregate_calls, load_pricing
+from telemetry import aggregate_calls, config_for_hash, load_pricing
 
 logger = get_logger("harness")
 
@@ -133,7 +134,7 @@ def make_artifact_root(save_path: str) -> str:
         "save_path": save_path,
         "config": dict(CONFIG),
         "config_sha256": _sha256_text(json.dumps(
-            CONFIG, sort_keys=True, separators=(",", ":"), default=str,
+            config_for_hash(CONFIG), sort_keys=True, separators=(",", ":"), default=str,
         )),
         "prompt_sha256": {
             role: _sha256_text(str(settings["prompt"]))
@@ -299,7 +300,7 @@ async def run_one(
     """
     pid = problem.get("id", "?")
     event(
-        logger, 20, "problem.started", "Problem run started",
+        logger, logging.INFO, "problem.started", "Problem run started",
         run_id=run_id, problem_id=pid, sandboxed=use_docker,
     )
     print(f"\n{'#'*60}")
@@ -377,7 +378,7 @@ async def run_one(
             except OSError:
                 traceback_path = None
         event(
-            logger, 40, "problem.failed", "Problem run failed",
+            logger, logging.ERROR, "problem.failed", "Problem run failed",
             run_id=run_id, problem_id=pid, error_type=type(e).__name__,
         )
         result = {
@@ -486,7 +487,7 @@ async def run_one(
         correct = bool(re.search(pattern, given_norm))
     result["correct"] = correct
     event(
-        logger, 20, "problem.completed", "Problem run completed",
+        logger, logging.INFO, "problem.completed", "Problem run completed",
         run_id=run_id, problem_id=pid,
         verified=result.get("verified"),
         duration_ms=problem_duration_ms,
@@ -545,7 +546,7 @@ async def run_problems(
             ],
         })
     event(
-        logger, 20, "run.started", "Run started",
+        logger, logging.INFO, "run.started", "Run started",
         save_path=save_path, requested_problems=len(problems), parallel=parallel,
     )
     print(f"Artifact root: {artifact_root}")
@@ -649,6 +650,7 @@ async def run_problems(
             problem_duration_ms=int(round(
                 (time.perf_counter() - run_started_perf) * 1000
             )),
+            scope="run",
         )
         run_telemetry["scope"] = "run"
         run_telemetry["completed_problems"] = len(results)
@@ -667,10 +669,10 @@ async def run_problems(
             pass
         finalize_artifact_root(artifact_root)
         event(
-            logger, 20, "run.completed", "Run completed",
+            logger, logging.INFO, "run.completed", "Run completed",
             save_path=save_path, completed_problems=len(results),
             requested_problems=len(problems),
-            duration_ms=run_telemetry["problem_duration_ms"],
+            duration_ms=run_telemetry["run_duration_ms"],
             failed_calls=run_telemetry["failed_calls"],
         )
         if claude_creds_path:

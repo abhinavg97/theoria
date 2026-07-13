@@ -158,6 +158,46 @@ class TelemetryTests(unittest.TestCase):
         self.assertFalse(metrics["cost"]["complete"])
         self.assertIsNone(metrics["total_cost_usd"])
 
+    def test_retried_provider_cost_stays_complete(self):
+        retried = enrich_call({
+            "backend": "claude",
+            "model": "opus",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_cost_usd": 0.25,
+            "retry_count": 1,
+        })
+        self.assertTrue(retried["cost"]["complete"])
+        metrics = aggregate_calls(
+            [retried],
+            problem_started_at="start",
+            problem_ended_at="end",
+            problem_duration_ms=100,
+        )
+        self.assertEqual(metrics["total_cost_usd"], 0.25)
+
+    def test_run_scope_uses_run_timing_fields(self):
+        metrics = aggregate_calls(
+            [],
+            problem_started_at="start",
+            problem_ended_at="end",
+            problem_duration_ms=100,
+            scope="run",
+        )
+        self.assertEqual(metrics["run_started_at"], "start")
+        self.assertEqual(metrics["run_ended_at"], "end")
+        self.assertEqual(metrics["run_duration_ms"], 100)
+        self.assertNotIn("problem_duration_ms", metrics)
+
+    def test_config_hash_excludes_machine_local_telemetry(self):
+        config = {
+            "solver": {"backend": "codex"},
+            "_telemetry": {"pricing_file": "/tmp/local-pricing.json"},
+        }
+        hashed = config_for_hash(config)
+        self.assertNotIn("_telemetry", hashed)
+        self.assertEqual(hashed, {"solver": {"backend": "codex"}})
+
 
 class LoggingTests(unittest.TestCase):
     def test_text_redaction_covers_common_inline_credentials(self):

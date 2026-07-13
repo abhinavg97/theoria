@@ -37,7 +37,7 @@ from llm import (
     telemetry_context,
 )
 from pipeline import load_config
-from telemetry import aggregate_calls, load_pricing
+from telemetry import aggregate_calls, config_for_hash, load_pricing
 
 
 # ── Structured output schema (identical to the internal audit grader) ──
@@ -258,7 +258,7 @@ async def grade_run(
             prompt_text.encode()
         ).hexdigest(),
         "config_sha256": hashlib.sha256(json.dumps(
-            config, sort_keys=True, separators=(",", ":"), default=str,
+            config_for_hash(config), sort_keys=True, separators=(",", ":"), default=str,
         ).encode()).hexdigest(),
         "config": config,
     }, indent=2, default=str))
@@ -302,6 +302,7 @@ async def grade_run(
             call_log.reset(call_token)
             artifact_dir.reset(artifact_token)
             telemetry_context.reset(trace_token)
+        calls = [c for c in calls if c is not None]
         problem_metrics = aggregate_calls(
             calls,
             problem_started_at=problem_started_at,
@@ -363,6 +364,7 @@ async def grade_run(
         problem_duration_ms=int(round(
             (time.perf_counter() - grade_started_perf) * 1000
         )),
+        scope="grading_run",
     )
     run_metrics.update({
         "scope": "grading_run",
