@@ -139,6 +139,8 @@ WATCHDOG_HARD_WALL_SECS = 4 * 60 * 60  # 4h absolute ceiling
 WATCHDOG_POLL_SECS = 30                # how often the watchdog wakes
 WATCHDOG_RETRY_MAX = 3                 # retry attempts after kill
 SCHEMA_RETRY_MAX = 3                   # hard cap for opt-in format retries
+PROVIDER_TERMINATE_TIMEOUT_SECS = 5
+_CONTAINER_CALL_MARKER_ENV = "THEORIA_LLM_CALL_MARKER"
 
 
 # ── OSS call serialization ──────────────────────────────────────
@@ -374,6 +376,132 @@ async def _watchdog(proc, container_id, kill_flag, *,
                 return
     except asyncio.CancelledError:
         pass
+
+
+async def _terminate_process_wrapper(proc) -> None:
+    """Terminate and reap a host subprocess, escalating after a grace period."""
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(
+            proc.wait(), timeout=PROVIDER_TERMINATE_TIMEOUT_SECS,
+        )
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(
+            proc.wait(), timeout=PROVIDER_TERMINATE_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        print(
+            "[llm] provider subprocess did not exit after SIGKILL",
+            file=sys.stderr,
+        )
+
+
+def _container_termination_script(marker: str) -> str:
+    """Build a shell script that terminates one marked container exec tree.
+
+    Docker does not guarantee that terminating its local ``docker exec`` CLI
+    wrapper also terminates the already-started process in the container.  A
+    unique, non-secret environment marker is inherited by the provider and
+    every child in its launch chain.  Scanning ``/proc/*/environ`` lets the
+    cleanup exec signal only that call, including schemaless calls where an
+    argv marker is unavailable and concurrent calls where ``pkill codex``
+    would be unsafe.
+    """
+    marker_entry = shlex.quote(f"{_CONTAINER_CALL_MARKER_ENV}={marker}")
+    return (
+        "pids=''; "
+        "for envfile in /proc/[0-9]*/environ; do "
+        "[ -r \"$envfile\" ] || continue; "
+        "if tr '\\0' '\\n' < \"$envfile\" 2>/dev/null "
+        f"| grep -Fqx -- {marker_entry}; then "
+        "pid=${envfile#/proc/}; pid=${pid%/environ}; "
+        "pids=\"$pids $pid\"; fi; done; "
+        "[ -z \"$pids\" ] && exit 0; "
+        "kill -TERM $pids 2>/dev/null || true; "
+        "i=0; alive=\"$pids\"; "
+        "while [ -n \"$alive\" ] && [ \"$i\" -lt 50 ]; do "
+        "sleep 0.1; next=''; "
+        "for pid in $alive; do "
+        "kill -0 \"$pid\" 2>/dev/null && next=\"$next $pid\"; "
+        "done; alive=\"$next\"; i=$((i + 1)); done; "
+        "[ -z \"$alive\" ] || kill -KILL $alive 2>/dev/null || true"
+    )
+
+
+async def _terminate_container_call(container_id: str, marker: str) -> None:
+    """Terminate all in-container processes belonging to one provider call."""
+    cleanup = None
+    try:
+        cleanup = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_id, "sh", "-c",
+            _container_termination_script(marker),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(
+            cleanup.communicate(),
+            timeout=PROVIDER_TERMINATE_TIMEOUT_SECS + 2,
+        )
+    except (OSError, asyncio.TimeoutError) as error:
+        print(
+            f"[llm] could not finish in-container provider cleanup: {error}",
+            file=sys.stderr,
+        )
+        if cleanup is not None and cleanup.returncode is None:
+            try:
+                cleanup.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await cleanup.wait()
+            except Exception:
+                pass
+
+
+async def _terminate_cancelled_provider(
+    proc,
+    *,
+    container_id: str | None,
+    container_marker: str | None,
+) -> None:
+    """Finish provider cleanup before cancellation can release its OSS gate."""
+    has_container_call = container_id is not None and container_marker is not None
+    if not has_container_call and (proc is None or proc.returncode is not None):
+        return
+
+    async def cleanup() -> None:
+        if has_container_call:
+            # Kill the real provider tree first. Merely terminating the local
+            # docker CLI can leave Codex/Claude running and consuming the only
+            # local-provider slot after the semaphore has been released.
+            await _terminate_container_call(container_id, container_marker)
+        if proc is not None:
+            await _terminate_process_wrapper(proc)
+
+    cleanup_task = asyncio.create_task(cleanup())
+    # A second cancel request must not let the gate escape early. The original
+    # CancelledError is re-raised by llm() after this helper finishes.
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    try:
+        cleanup_task.result()
+    except Exception as error:
+        print(f"[llm] provider cancellation cleanup failed: {error}", file=sys.stderr)
 
 
 # ── Resume from cache ───────────────────────────────────────────
@@ -1744,6 +1872,7 @@ async def llm(
     failed_provider_attempts: list[dict] = []
     cmd: list[str] = []
     proc = None
+    container_call_marker: str | None = None
     process_attempts = 0
     schema_retries = 0
     retry_artifacts: list[str] = []
@@ -1842,6 +1971,11 @@ async def llm(
         # scratch files land there.
         if sandboxed:
             docker_prefix = ["docker", "exec"]
+            container_call_marker = uuid.uuid4().hex
+            docker_prefix += [
+                "--env",
+                f"{_CONTAINER_CALL_MARKER_ENV}={container_call_marker}",
+            ]
             if oss_env_base_url is not None:
                 # URL validation above forbids credentials/query parameters;
                 # provider secrets travel separately through provider_env.
@@ -2148,6 +2282,14 @@ async def llm(
             )
 
         return response, session_id
+
+    except asyncio.CancelledError:
+        await _terminate_cancelled_provider(
+            proc,
+            container_id=container_id,
+            container_marker=container_call_marker,
+        )
+        raise
 
     except Exception as e:
         # Failure path: at minimum record enough to reconstruct what

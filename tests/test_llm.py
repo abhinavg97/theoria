@@ -194,6 +194,210 @@ def test_oss_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
         second_loop.close()
 
 
+def test_cancelled_oss_call_reaps_process_before_gate_release(monkeypatch):
+    launches = []
+
+    class HangingProcess:
+        returncode = None
+
+        def __init__(self, started, terminating, allow_exit, cleanup_done):
+            self.started = started
+            self.terminating = terminating
+            self.allow_exit = allow_exit
+            self.cleanup_done = cleanup_done
+
+        async def communicate(self):
+            self.started.set()
+            await asyncio.Future()
+
+        def terminate(self):
+            self.terminating.set()
+
+        def kill(self):
+            self.returncode = -9
+            self.allow_exit.set()
+
+        async def wait(self):
+            await self.allow_exit.wait()
+            if self.returncode is None:
+                self.returncode = -15
+            self.cleanup_done.set()
+            return self.returncode
+
+    class SuccessfulProcess:
+        returncode = 0
+
+        async def communicate(self):
+            events = [
+                {"type": "thread.started", "thread_id": "second"},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "ok"},
+                },
+            ]
+            return "\n".join(json.dumps(event) for event in events).encode(), b""
+
+    config = {
+        "_security": {"allow_external_provider_host_access": True},
+        "judge": {
+            "backend": "codex",
+            "model": "local-model",
+            "oss": True,
+            "local_provider": "ollama",
+            "search": False,
+        },
+    }
+
+    async def scenario():
+        started = asyncio.Event()
+        terminating = asyncio.Event()
+        allow_exit = asyncio.Event()
+        cleanup_done = asyncio.Event()
+        first_process = HangingProcess(
+            started, terminating, allow_exit, cleanup_done,
+        )
+
+        async def fake_create_subprocess_exec(*_command, **_kwargs):
+            # The second launch is allowed only after the cancelled process has
+            # actually been reaped, not merely after terminate() was requested.
+            if not launches:
+                launches.append(first_process)
+                return first_process
+            assert cleanup_done.is_set()
+            process = SuccessfulProcess()
+            launches.append(process)
+            return process
+
+        monkeypatch.setattr(
+            llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+        )
+
+        first = asyncio.create_task(
+            llm.llm("first", role="judge", config=config),
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            llm.llm("second", role="judge", config=config),
+        )
+        await asyncio.sleep(0)
+
+        first.cancel()
+        await terminating.wait()
+        await asyncio.sleep(0)
+        assert len(launches) == 1
+        assert not second.done()
+
+        allow_exit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert cleanup_done.is_set()
+        response, session_id = await asyncio.wait_for(second, timeout=1)
+        assert response == "ok"
+        assert session_id == "second"
+
+    monkeypatch.delenv("THEORIA_OSS_MAX_PARALLEL", raising=False)
+    asyncio.run(scenario())
+    assert len(launches) == 2
+
+
+def test_docker_cancellation_kills_marked_container_tree_before_wrapper(
+    monkeypatch,
+):
+    events = []
+    main_command = None
+    cleanup_command = None
+
+    class DockerWrapper:
+        returncode = None
+
+        async def communicate(self):
+            main_started.set()
+            await asyncio.Future()
+
+        def terminate(self):
+            events.append("wrapper-terminate")
+            self.returncode = -15
+
+        def kill(self):
+            events.append("wrapper-kill")
+            self.returncode = -9
+
+        async def wait(self):
+            events.append("wrapper-reaped")
+            return self.returncode
+
+    class CleanupProcess:
+        returncode = None
+
+        async def communicate(self):
+            events.append("container-tree-cleaned")
+            self.returncode = 0
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def scenario():
+        nonlocal main_command, cleanup_command, main_started
+        main_started = asyncio.Event()
+        wrapper = DockerWrapper()
+
+        async def fake_create_subprocess_exec(*command, **_kwargs):
+            nonlocal main_command, cleanup_command
+            if command[:3] == ("docker", "exec", "container-1"):
+                cleanup_command = command
+                return CleanupProcess()
+            main_command = command
+            return wrapper
+
+        monkeypatch.setattr(
+            llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+        )
+        container_token = llm.sandbox_container.set("container-1")
+        try:
+            task = asyncio.create_task(llm.llm(
+                "cancel me",
+                role="judge",
+                config={
+                    "judge": {
+                        "backend": "codex",
+                        "model": "local-model",
+                        "oss": True,
+                        "local_provider": "ollama",
+                        "search": False,
+                    },
+                },
+            ))
+            await main_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            llm.sandbox_container.reset(container_token)
+
+    main_started = None
+    asyncio.run(scenario())
+
+    marker_args = [
+        value for value in main_command
+        if isinstance(value, str)
+        and value.startswith(f"{llm._CONTAINER_CALL_MARKER_ENV}=")
+    ]
+    assert len(marker_args) == 1
+    marker = marker_args[0].split("=", 1)[1]
+    cleanup_script = cleanup_command[-1]
+    assert f"{llm._CONTAINER_CALL_MARKER_ENV}={marker}" in cleanup_script
+    assert "/proc/[0-9]*/environ" in cleanup_script
+    assert "kill -TERM" in cleanup_script
+    assert "kill -KILL" in cleanup_script
+    assert events == [
+        "container-tree-cleaned", "wrapper-terminate", "wrapper-reaped",
+    ]
+
+
 def test_sandboxed_codex_home_avoids_tmp_helper_warning():
     command = llm._build_codex_cmd(
         "prompt",
