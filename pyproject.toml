@@ -8,10 +8,6 @@ dependencies = [
     "pyyaml>=6.0",
     "datasets>=4.0",
     "jsonschema>=4.21",
-]
-
-[project.optional-dependencies]
-test = [
     "pytest>=8.0",
 ]
 
