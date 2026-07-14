@@ -177,6 +177,7 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
         "endpoint": endpoint,
         "api_key_env": "AZURE_OPENAI_API_KEY",
     })
+    structured["model"] = "deployment"
     assert providers.resolve_provider_spec(structured).base_url == endpoint
 
     legacy = {
@@ -194,6 +195,10 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
     assert spec.kind == "azure_openai"
     assert spec.max_parallel == 4
     assert providers.resolve_codex_role(legacy).concurrency_key is not None
+    assert (
+        providers.resolve_codex_role(structured).concurrency_key
+        == providers.resolve_codex_role(legacy).concurrency_key
+    )
     assert ("model_providers.foundry.name", "Azure") in spec.codex_config_items
     assert ("model_providers.foundry.wire_api", "responses") in spec.codex_config_items
 
@@ -453,6 +458,38 @@ def test_azure_provider_gate_limits_parallel_calls(monkeypatch):
     assert max_active == 2
 
 
+def test_provider_gate_changed_limit_is_fresh_for_each_event_loop():
+    async def create_gate(limit):
+        loop = asyncio.get_running_loop()
+        gate = llm._provider_gate("shared-provider", limit)
+        registry = getattr(loop, llm._PROVIDER_GATES_ATTR)
+        return gate, registry
+
+    first_gate, first_registry = asyncio.run(create_gate(2))
+    second_gate, second_registry = asyncio.run(create_gate(5))
+
+    assert first_gate is not second_gate
+    assert first_registry is not second_registry
+    assert first_gate._value == 2
+    assert second_gate._value == 5
+
+
+def test_provider_gate_limit_conflict_does_not_escape_closed_loop():
+    async def conflict_in_first_loop():
+        llm._provider_gate("conflicting-provider", 2)
+        with pytest.raises(ValueError, match="same max_parallel"):
+            llm._provider_gate("conflicting-provider", 5)
+
+    async def use_changed_limit_in_fresh_loop():
+        first = llm._provider_gate("conflicting-provider", 5)
+        second = llm._provider_gate("conflicting-provider", 5)
+        assert first is second
+        assert first._value == 5
+
+    asyncio.run(conflict_in_first_loop())
+    asyncio.run(use_changed_limit_in_fresh_loop())
+
+
 def test_azure_gate_key_is_deployment_scoped():
     first = providers.resolve_codex_role(azure_settings(model="deployment-a"))
     same = providers.resolve_codex_role(azure_settings(model="deployment-a"))
@@ -522,13 +559,19 @@ def test_authenticated_azure_probe_uses_models_and_bearer_without_query():
     assert "test-secret" not in repr(result)
 
 
-def test_authenticated_azure_probe_rejects_invalid_header_without_network():
+@pytest.mark.parametrize("key", [
+    " test-secret",
+    "test-secret ",
+    "test-secret\n",
+    "test-secret\ninjected",
+])
+def test_authenticated_azure_probe_rejects_invalid_header_without_network(key):
     def opener(*_args, **_kwargs):
         raise AssertionError("invalid credential reached the network opener")
 
     result = providers.probe_azure_endpoint(
         providers.resolve_provider_spec(azure_settings()),
-        environ={"AZURE_OPENAI_API_KEY": "test-secret\ninjected"},
+        environ={"AZURE_OPENAI_API_KEY": key},
         opener=opener,
     )
 
@@ -536,6 +579,18 @@ def test_authenticated_azure_probe_rejects_invalid_header_without_network():
         False, "invalid_credential",
     )
     assert "test-secret" not in repr(result)
+
+
+def test_authenticated_azure_probe_treats_whitespace_only_key_as_missing():
+    result = providers.probe_azure_endpoint(
+        providers.resolve_provider_spec(azure_settings()),
+        environ={"AZURE_OPENAI_API_KEY": " \t\n"},
+        opener=lambda *_args, **_kwargs: pytest.fail("opener was called"),
+    )
+
+    assert result == providers.ProviderProbeResult(
+        False, "missing_credential",
+    )
 
 
 @pytest.mark.parametrize(("error", "category"), [
@@ -605,9 +660,15 @@ def test_docker_azure_probe_missing_env_does_not_spawn(monkeypatch):
     assert result.category == "missing_credential"
 
 
-def test_docker_azure_probe_invalid_header_does_not_spawn(monkeypatch):
+@pytest.mark.parametrize("key", [
+    " test-secret",
+    "test-secret ",
+    "test-secret\n",
+    "test-secret\ninjected",
+])
+def test_docker_azure_probe_invalid_header_does_not_spawn(monkeypatch, key):
     monkeypatch.setenv(
-        "AZURE_OPENAI_API_KEY", "test-secret\ninjected",
+        "AZURE_OPENAI_API_KEY", key,
     )
 
     def unexpected(*_args, **_kwargs):

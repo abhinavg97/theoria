@@ -165,7 +165,8 @@ def probe_azure_endpoint(
     key = environ.get(env_name or "")
     if not key or not key.strip():
         return ProviderProbeResult(False, "missing_credential")
-    key = key.strip()
+    if key != key.strip():
+        return ProviderProbeResult(False, "invalid_credential")
     target = spec.base_url.rstrip("/") + "/models"
     open_request = urllib.request.urlopen if opener is None else opener
     try:
@@ -698,7 +699,10 @@ def resolve_codex_role(
         raw = json.dumps(
             {
                 "kind": spec.kind,
-                "provider": spec.id,
+                # Azure's scheduler identity is endpoint + deployment. Raw
+                # configs may choose an arbitrary provider id (for example
+                # `foundry`) while compiling to the same Azure transport.
+                "provider": None if spec.kind == "azure_openai" else spec.id,
                 "endpoint": spec.base_url,
                 # Azure quotas are deployment-scoped. A local server is one
                 # shared scheduler even when roles select different models.

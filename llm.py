@@ -183,6 +183,8 @@ def _provider_gate(key: str, limit: int) -> asyncio.Semaphore:
     # The loop owns its semaphores. Keying a process-global mapping by
     # id(loop) leaves closed-loop entries behind and can attach a stale
     # semaphore (or stale limit) to a new loop when CPython reuses that id.
+    # Keeping the registry on the actual loop gives it the same lifecycle as
+    # every asyncio primitive it contains.
     gates = getattr(loop, _PROVIDER_GATES_ATTR, None)
     if gates is None:
         gates = {}

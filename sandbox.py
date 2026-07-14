@@ -519,9 +519,12 @@ import urllib.error
 import urllib.request
 
 base, env_name = sys.argv[1], sys.argv[2]
-key = os.environ.get(env_name, "").strip()
-if not key:
+key = os.environ.get(env_name, "")
+if not key or not key.strip():
     print(json.dumps({"ok": False, "category": "missing_credential", "status": None}))
+    raise SystemExit(0)
+if key != key.strip():
+    print(json.dumps({"ok": False, "category": "invalid_credential", "status": None}))
     raise SystemExit(0)
 try:
     key.encode("latin-1")
@@ -586,7 +589,10 @@ def azure_endpoint_probe_from_image(
         return provider_config.ProviderProbeResult(
             False, "missing_credential",
         )
-    key = key.strip()
+    if key != key.strip():
+        return provider_config.ProviderProbeResult(
+            False, "invalid_credential",
+        )
     try:
         key.encode("latin-1")
     except UnicodeError:
