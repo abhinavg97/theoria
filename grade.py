@@ -25,8 +25,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import providers as provider_config
 from llm import llm as _llm_call
-from llm import uses_external_codex_provider
 from pipeline import compose_role_prompt, load_config
 
 
@@ -220,12 +220,19 @@ async def grade_run(
     if codex_model and settings.get("backend", "claude") == "codex":
         settings["model"] = codex_model
     if settings.get("backend", "claude") == "codex":
+        try:
+            grader_plan = provider_config.resolve_codex_role(settings)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Invalid audit_grader provider configuration: {exc}"
+            ) from exc
+        external_provider = grader_plan.provider.external
         security = config.get("_security") or {}
         allow_external_host = (
             isinstance(security, dict)
             and security.get("allow_external_provider_host_access") is True
         )
-        if uses_external_codex_provider(settings) and not allow_external_host:
+        if external_provider and not allow_external_host:
             raise SystemExit(
                 "External-provider grading runs on the host. Stack "
                 "configs/unsafe_host_provider.yaml only after accepting that "

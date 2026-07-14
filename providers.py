@@ -12,8 +12,8 @@ The structured public provider mapping currently has one first-class kind::
       api_key_env: AZURE_OPENAI_API_KEY
       max_parallel: 4
 
-Legacy PR #3 OSS and raw ``codex_config`` declarations continue to compile to
-the same representation.
+Existing OSS and raw ``codex_config`` declarations continue to compile to the
+same representation.
 """
 
 from __future__ import annotations
@@ -633,7 +633,7 @@ def resolve_provider_spec(
         local_adapter=None,
         requires_explicit_model=external,
         capabilities=capabilities,
-        # Preserve PR #3 custom-provider behavior. Azure is the one hosted
+        # Preserve existing custom-provider behavior. Azure is the one hosted
         # provider whose native search is deliberately opt-in because it can
         # cross the configured Azure data/compliance boundary.
         native_search_default=False if azure else True,

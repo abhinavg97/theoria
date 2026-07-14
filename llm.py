@@ -492,7 +492,7 @@ async def _terminate_cancelled_provider(
     container_id: str | None,
     container_marker: str | None,
 ) -> None:
-    """Finish provider cleanup before cancellation can release its OSS gate."""
+    """Finish provider cleanup before cancellation releases its gate."""
     has_container_call = container_id is not None and container_marker is not None
     if not has_container_call and (proc is None or proc.returncode is not None):
         return
@@ -500,8 +500,8 @@ async def _terminate_cancelled_provider(
     async def cleanup() -> None:
         if has_container_call:
             # Kill the real provider tree first. Merely terminating the local
-            # docker CLI can leave Codex/Claude running and consuming the only
-            # local-provider slot after the semaphore has been released.
+            # docker CLI can leave Codex/Claude running and consuming a gated
+            # provider slot after the semaphore has been released.
             await _terminate_container_call(container_id, container_marker)
         if proc is not None:
             await _terminate_process_wrapper(proc)

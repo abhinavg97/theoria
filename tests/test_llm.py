@@ -536,7 +536,8 @@ def test_oss_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
     try:
         first_gate = first_loop.run_until_complete(current_gate())
         assert first_gate._value == 1
-        assert getattr(first_loop, llm._OSS_GATE_LOOP_ATTR) is first_gate
+        first_registry = getattr(first_loop, llm._PROVIDER_GATES_ATTR)
+        assert first_registry["legacy-oss"][1] is first_gate
     finally:
         first_loop.close()
 
@@ -546,7 +547,8 @@ def test_oss_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
         second_gate = second_loop.run_until_complete(current_gate())
         assert second_gate is not first_gate
         assert second_gate._value == 4
-        assert getattr(second_loop, llm._OSS_GATE_LOOP_ATTR) is second_gate
+        second_registry = getattr(second_loop, llm._PROVIDER_GATES_ATTR)
+        assert second_registry["legacy-oss"][1] is second_gate
     finally:
         second_loop.close()
 

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import cli
+import grade
 import harness
 import llm
 import pipeline
@@ -398,6 +399,51 @@ def test_runtime_auto_forwards_azure_key_and_records_deployment(monkeypatch):
     assert role["provider"]["kind"] == "azure_openai"
     assert role["provider"]["native_search"] is False
     assert "secret-value" not in repr(runtime)
+
+
+def test_equivalent_structured_and_raw_azure_share_one_trust_domain():
+    raw = {
+        "backend": "codex",
+        "model": "gpt-5.3-codex",
+        "provider_env": ["AZURE_OPENAI_API_KEY"],
+        "codex_config": {
+            "model_provider": "foundry",
+            "model_providers.foundry.name": "Azure",
+            "model_providers.foundry.base_url": AZURE_ENDPOINT,
+            "model_providers.foundry.env_key": "AZURE_OPENAI_API_KEY",
+            "model_providers.foundry.wire_api": "responses",
+        },
+    }
+
+    runtime = harness.resolve_runtime({
+        "solver": azure_settings(),
+        "citation": raw,
+    })
+
+    assert runtime["requirements"]["mixed_provider_credentials"] is False
+    assert len(runtime["credential_domains"]) == 1
+    model_destinations = [
+        item for item in runtime["data_destinations"]
+        if item["kind"] == "model"
+    ]
+    assert model_destinations == [{
+        "kind": "model",
+        "provider": "codex:azure",
+        "endpoints": [AZURE_ENDPOINT],
+    }]
+
+
+def test_structured_azure_grader_requires_host_access_opt_in(
+    monkeypatch, tmp_path,
+):
+    run_file = tmp_path / "run.json"
+    run_file.write_text("[]")
+    monkeypatch.setattr(grade, "load_config", lambda _paths: {
+        "audit_grader": azure_settings(),
+    })
+
+    with pytest.raises(SystemExit, match="External-provider grading runs"):
+        asyncio.run(grade.grade_run(str(run_file)))
 
 
 def test_azure_cache_identity_tracks_deployment_but_not_key_value(monkeypatch):

@@ -335,6 +335,13 @@ def resolve_runtime(config: dict | None = None) -> dict:
                 concurrency_limits[plan.concurrency_key] = spec.max_parallel
             oss = spec.kind == "local"
             provider = spec.id
+            # Raw Codex configs may choose an arbitrary provider-table id
+            # (for example ``foundry``) while targeting the same Azure
+            # endpoint and key as the structured provider.  Trust accounting
+            # describes the external service, not that local table label.
+            trust_provider = (
+                "azure" if spec.kind == "azure_openai" else provider
+            )
             endpoints = [spec.base_url] if spec.base_url else []
             if endpoints:
                 role_runtime["endpoint"] = _sanitize_endpoint(endpoints[0])
@@ -357,7 +364,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
                 has_external_access = True
                 effective_endpoints = endpoints
                 model_destination = add_destination(_data_destination(
-                    "model", f"codex:{provider or 'external'}",
+                    "model", f"codex:{trust_provider or 'external'}",
                     effective_endpoints,
                 ))
                 external_model_destinations.add(model_destination)
@@ -366,7 +373,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
                 # environment references create a credential domain.
                 if configured_env or credential_refs:
                     model_credential = _external_provider_domain(
-                        provider=provider,
+                        provider=trust_provider,
                         endpoints=effective_endpoints,
                         provider_env=list(configured_env),
                         credential_refs=credential_refs,
