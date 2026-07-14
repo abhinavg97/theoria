@@ -39,6 +39,8 @@ from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+import providers as provider_config
+
 DEFAULT_IMAGE = "theoria-sandbox:latest"
 
 # Minimum set of files codex needs in its state dir. Everything else
@@ -505,6 +507,103 @@ def codex_oss_capabilities_in_image(image: str = DEFAULT_IMAGE) -> dict:
         "local_provider": bool(output and "--local-provider" in output),
         "output_schema": bool(output and "--output-schema" in output),
     }
+
+
+_AZURE_PROBE_SCRIPT = r"""
+import json
+import os
+import socket
+import ssl
+import sys
+import urllib.error
+import urllib.request
+
+base, env_name = sys.argv[1], sys.argv[2]
+key = os.environ.get(env_name, "").strip()
+if not key:
+    print(json.dumps({"ok": False, "category": "missing_credential", "status": None}))
+    raise SystemExit(0)
+request = urllib.request.Request(
+    base.rstrip("/") + "/models",
+    headers={"Authorization": "Bearer " + key},
+    method="GET",
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        status = getattr(response, "status", 200)
+        print(json.dumps({
+            "ok": status == 200,
+            "category": "ok" if status == 200 else "http_error",
+            "status": status,
+        }))
+except urllib.error.HTTPError as exc:
+    category = {
+        401: "unauthorized", 403: "forbidden", 404: "not_found",
+        429: "rate_limited",
+    }.get(exc.code, "http_error")
+    print(json.dumps({"ok": False, "category": category, "status": exc.code}))
+except urllib.error.URLError as exc:
+    reason = exc.reason
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        category = "timeout"
+    elif isinstance(reason, ssl.SSLError):
+        category = "tls"
+    elif isinstance(reason, socket.gaierror):
+        category = "dns"
+    else:
+        category = "network"
+    print(json.dumps({"ok": False, "category": category, "status": None}))
+except (socket.timeout, TimeoutError):
+    print(json.dumps({"ok": False, "category": "timeout", "status": None}))
+except ssl.SSLError:
+    print(json.dumps({"ok": False, "category": "tls", "status": None}))
+except OSError:
+    print(json.dumps({"ok": False, "category": "network", "status": None}))
+"""
+
+
+def azure_endpoint_probe_from_image(
+    image: str,
+    endpoint: str,
+    credential_env: str,
+) -> provider_config.ProviderProbeResult:
+    """Probe Azure from the selected image without putting its key in argv.
+
+    Docker receives only ``--env NAME`` and inherits that one value from the
+    host. The in-container Python process constructs the bearer header in
+    memory and emits only a fixed category/status JSON object.
+    """
+    if not _ENV_NAME_RE.fullmatch(credential_env):
+        raise ValueError("credential_env must be an environment-variable name")
+    key = os.environ.get(credential_env)
+    if not key or not key.strip():
+        return provider_config.ProviderProbeResult(
+            False, "missing_credential",
+        )
+    endpoint = provider_config.normalize_azure_endpoint(endpoint)
+    command = [
+        "docker", "run", "--rm",
+        "--env", credential_env,
+        "--entrypoint", "python3",
+        image, "-c", _AZURE_PROBE_SCRIPT, endpoint, credential_env,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return provider_config.ProviderProbeResult(False, "network")
+    if result.returncode != 0:
+        return provider_config.ProviderProbeResult(False, "network")
+    try:
+        payload = json.loads(result.stdout)
+        return provider_config.ProviderProbeResult(
+            bool(payload.get("ok")),
+            str(payload.get("category") or "network"),
+            payload.get("status"),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return provider_config.ProviderProbeResult(False, "network")
 
 
 def endpoint_reachable_from_image(

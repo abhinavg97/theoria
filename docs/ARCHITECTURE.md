@@ -120,6 +120,34 @@ chat-completions backend would not. The supplied OSS provider profiles disable
 Codex's native search and take the conservative path when an external claim
 cannot be verified. Fetching a known URL is direct retrieval, not discovery.
 
+Provider interpretation is centralized in `providers.py`. It compiles both the
+legacy OSS/raw-Codex fields and a structured role-level provider mapping into an
+immutable `ProviderSpec` and `CodexRolePlan`. The call layer, runtime/security
+resolver, cache identity, concurrency gates, metadata, and doctor therefore use
+one endpoint/auth/capability interpretation. Provider capabilities are separate
+from locality: native search, namespace tools, unified exec, and structured
+outputs each have their own setting, rather than being inferred from one `oss`
+boolean.
+
+The first structured provider is `azure_openai`. It accepts only Azure's GA
+HTTPS `/openai/v1` endpoint shapes, requires an API-key environment reference
+and explicit deployment, and compiles to Codex's Responses provider block with
+the exact provider name `Azure`. That name is important for the pinned Codex
+0.133 image: it forces Azure Responses handling even for the supported
+`services.ai.azure.com` hostname family. Azure supports native web search, but
+its safe default is disabled because enabling it can cross the configured Azure
+data/compliance boundary. Namespace tools remain disabled, unified exec remains
+available, and structured schema output remains enabled.
+
+Concurrency is provider/deployment-scoped. Local adapters default to one open
+stream, while the Azure profile defaults to four and can be tuned for a
+deployment's RPM/TPM quota. Cache identities include the normalized provider,
+endpoint, deployment, capabilities, effective native/shell-search settings,
+schema, prompts, resume id, image digest, and Codex version. Credential values
+never enter metadata or cache identity, so rotating a key does not reuse an
+answer from another deployment but also does not invalidate an otherwise
+identical request.
+
 Native search cannot simply be enabled for local providers: Codex serializes
 its `web_search` tool — and every MCP server — as Responses API tool types
 (`web_search`, `namespace`) that Ollama and LM Studio reject before
@@ -156,6 +184,14 @@ External-provider host execution is also rejected by default because an
 agent's shell tools can inspect host-readable files and environment values.
 `configs/unsafe_host_provider.yaml` is the explicit development-only opt-in;
 Docker remains the supported isolation boundary.
+
+Azure doctor checks mirror the execution boundary: Docker mode runs a small
+Python probe inside the selected image and passes only `--env NAME`, while host
+mode uses the same normalized provider directly. Both construct the bearer
+header in memory, call the non-inference `/models` route, and return only a
+fixed status category. Initial Azure support deliberately excludes Entra ID,
+APIM/custom gateways, legacy dated endpoints, sovereign-cloud variants, and
+management-plane model discovery.
 
 Only the default Claude/Codex configuration and published traces are audited.
 All-OSS and custom-provider configurations can change both coverage and

@@ -24,6 +24,8 @@ from pathlib import Path
 
 import yaml
 
+import providers as provider_config
+
 # ── Models ──────────────────────────────────────────────────────
 
 @dataclass
@@ -149,7 +151,7 @@ def role_search_policy(settings: dict, config: dict) -> str:
         return ""
     if config.get("_web_search"):
         return SHELL_SEARCH_POLICY
-    if settings.get("search") is False:
+    if not provider_config.resolve_codex_role(settings).native_search:
         return NO_SEARCH_POLICY
     return ""
 

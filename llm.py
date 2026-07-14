@@ -17,7 +17,6 @@ import contextvars
 import gzip
 import hashlib
 import json
-import math
 import os
 import re
 import shlex
@@ -26,10 +25,11 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit
 
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import validator_for
+
+import providers as provider_config
 
 
 SUBPROCESS_STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
@@ -143,7 +143,7 @@ PROVIDER_TERMINATE_TIMEOUT_SECS = 5
 _CONTAINER_CALL_MARKER_ENV = "THEORIA_LLM_CALL_MARKER"
 
 
-# ── OSS call serialization ──────────────────────────────────────
+# ── Provider call concurrency ───────────────────────────────────
 #
 # Local providers (Ollama by default) process one request at a time.
 # Theoria's judge fan-out launches every step judge concurrently, so
@@ -162,7 +162,7 @@ _CONTAINER_CALL_MARKER_ENV = "THEORIA_LLM_CALL_MARKER"
 # genuinely handle concurrent requests can raise the limit via
 # THEORIA_OSS_MAX_PARALLEL.
 
-_OSS_GATE_LOOP_ATTR = "_theoria_oss_provider_gate"
+_PROVIDER_GATES_ATTR = "_theoria_provider_gates"
 
 
 def _oss_max_parallel() -> int:
@@ -177,19 +177,33 @@ def _oss_max_parallel() -> int:
         return 1
 
 
-def _oss_gate() -> asyncio.Semaphore:
-    """Per-event-loop semaphore bounding concurrent OSS provider calls."""
+def _provider_gate(key: str, limit: int) -> asyncio.Semaphore:
+    """Return a per-loop, provider/deployment-scoped concurrency gate."""
     loop = asyncio.get_running_loop()
-    gate = getattr(loop, _OSS_GATE_LOOP_ATTR, None)
-    if gate is None:
-        gate = asyncio.Semaphore(_oss_max_parallel())
-        # The loop owns the gate so its lifetime cannot outlive that loop.
-        # A process-global id(loop) registry is unsafe because Python may
-        # recycle an object's id after asyncio.run() closes and releases it,
-        # causing a fresh loop to inherit a semaphore created for a closed
-        # loop (and an obsolete THEORIA_OSS_MAX_PARALLEL value).
-        setattr(loop, _OSS_GATE_LOOP_ATTR, gate)
+    # The loop owns its semaphores. Keying a process-global mapping by
+    # id(loop) leaves closed-loop entries behind and can attach a stale
+    # semaphore (or stale limit) to a new loop when CPython reuses that id.
+    gates = getattr(loop, _PROVIDER_GATES_ATTR, None)
+    if gates is None:
+        gates = {}
+        setattr(loop, _PROVIDER_GATES_ATTR, gates)
+    existing = gates.get(key)
+    if existing is None:
+        gate = asyncio.Semaphore(limit)
+        gates[key] = (limit, gate)
+        return gate
+    configured_limit, gate = existing
+    if configured_limit != limit:
+        raise ValueError(
+            "roles sharing one provider/deployment concurrency key must use "
+            f"the same max_parallel (got {configured_limit} and {limit})"
+        )
     return gate
+
+
+def _oss_gate() -> asyncio.Semaphore:
+    """Backward-compatible local-provider gate helper."""
+    return _provider_gate("legacy-oss", _oss_max_parallel())
 
 
 class WatchdogKilled(RuntimeError):
@@ -1088,9 +1102,6 @@ _RESUMABLE_CODEX_ROLES = {"solver", "formalizer"}
 
 _CLAUDE_MODEL_ALIASES = {"opus", "sonnet", "haiku"}
 _CODEX_LOCAL_PROVIDERS = {"ollama", "lmstudio"}
-_CODEX_CONFIG_KEY = re.compile(
-    r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"
-)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # The in-sandbox search helper (sandbox images install search_cli.py at
@@ -1106,28 +1117,11 @@ _WEB_SEARCH_DEFAULT_KEY_ENV = {"brave": "BRAVE_API_KEY"}
 _WEB_SEARCH_PROVIDER_ENV = "THEORIA_SEARCH_PROVIDER"
 _WEB_SEARCH_ENDPOINT_ENV = "THEORIA_SEARCH_ENDPOINT"
 _WEB_SEARCH_API_KEY_NAME_ENV = "THEORIA_SEARCH_API_KEY_ENV"
-_SENSITIVE_CODEX_CONFIG_PARTS = {
-    "api_key", "authorization", "bearer_token", "cookie", "credential",
-    "key", "password", "secret", "token",
-}
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
 def _toml_scalar(value) -> str:
     """Serialize a scalar for Codex's TOML-parsed `-c key=value` flag."""
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return repr(value)
-    raise ValueError(
-        "codex_config values must be TOML scalars "
-        "(string, boolean, finite number); "
-        f"got {type(value).__name__}"
-    )
+    return provider_config.toml_scalar(value)
 
 
 def web_search_config(raw) -> dict:
@@ -1204,116 +1198,38 @@ def web_search_env_names(raw) -> list[str]:
 
 def _is_sensitive_codex_config_key(key: str) -> bool:
     """Return whether an override would put secret material in argv."""
-    lower = key.lower()
-    if lower.endswith((
-        ".env_key", ".env_var", ".env_vars", ".bearer_token_env_var",
-    )):
-        return False
-    parts = set(re.split(r"[._-]", lower))
-    if (parts & _SENSITIVE_CODEX_CONFIG_PARTS
-            or {"api", "key"}.issubset(parts)):
-        return True
-    return False
+    return provider_config.is_sensitive_codex_config_key(key)
 
 
 def _codex_config_items(settings: dict) -> list[tuple[str, object]]:
     """Validate and return structured Codex CLI configuration overrides."""
-    raw = settings.get("codex_config")
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("codex_config must be a mapping of dotted keys to scalars")
-
-    items = []
-    for key, value in raw.items():
-        if not isinstance(key, str) or not _CODEX_CONFIG_KEY.fullmatch(key):
-            raise ValueError(
-                "codex_config keys must be non-empty dotted identifiers; "
-                f"got {key!r}"
-            )
-        if key == "mcp_servers" or key.startswith("mcp_servers."):
-            raise ValueError(
-                "codex_config cannot declare MCP servers: an MCP command is "
-                "executable code outside Theoria's trust-domain accounting, "
-                "and Codex serializes MCP tools as Responses API namespace "
-                "tools that local providers reject. Use the _web_search "
-                "shell helper for OSS search instead"
-            )
-        if _is_sensitive_codex_config_key(key):
-            raise ValueError(
-                f"codex_config.{key} would expose a secret in process argv; "
-                "configure the provider's env_key and list the variable in "
-                "provider_env instead"
-            )
-        _toml_scalar(value)  # validate before constructing any subprocess
-        if key.endswith("base_url"):
-            _route_oss_base_url(value, sandboxed=False)
-        if key == "model_provider" and (
-            not isinstance(value, str) or not value.strip()
-        ):
-            raise ValueError("codex_config.model_provider must be a non-empty string")
-        items.append((key, value))
-    return items
+    return provider_config.codex_config_items(settings)
 
 
 def _codex_config_override(key: str, value, *, sandboxed: bool) -> str:
     """Serialize one override, routing custom-provider loopback URLs."""
-    if key.startswith("model_providers.") and key.endswith(".base_url"):
-        value = _route_oss_base_url(value, sandboxed=sandboxed)
-    return f"{key}={_toml_scalar(value)}"
+    return provider_config.codex_config_override(
+        key, value, sandboxed=sandboxed,
+    )
 
 
 def _route_oss_base_url(value, *, sandboxed: bool) -> str | None:
     """Validate an OSS endpoint and route host loopback from Docker."""
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("oss_base_url must be a non-empty http(s) URL")
-
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError as e:
-        raise ValueError(f"invalid oss_base_url: {e}") from e
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("oss_base_url must be an absolute http(s) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError(
-            "oss_base_url cannot contain credentials, a query, or a fragment; "
-            "pass provider credentials through provider_env"
-        )
-
-    hostname = parsed.hostname
-    if sandboxed and hostname.lower() in _LOOPBACK_HOSTS:
-        hostname = "host.docker.internal"
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-    netloc = hostname if port is None else f"{hostname}:{port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return provider_config.normalize_endpoint(
+        value, sandboxed=sandboxed, label="oss_base_url",
+    )
 
 
 def _codex_provider(settings: dict) -> str | None:
     """Return the effective configured provider without exposing secrets."""
-    if settings.get("oss"):
-        return settings.get("local_provider")
-    for key, value in _codex_config_items(settings):
-        if key == "model_provider" and isinstance(value, str):
-            return value
-    return "openai"
+    return provider_config.resolve_provider_spec(settings).id
 
 
 def _configured_codex_base_url(settings: dict) -> str | None:
     """Return a validated base URL from OSS or custom-provider settings."""
-    if settings.get("oss_base_url") is not None:
-        return _route_oss_base_url(
-            settings.get("oss_base_url"), sandboxed=False,
-        )
-    provider = _codex_provider(settings)
-    key = f"model_providers.{provider}.base_url"
-    for config_key, value in _codex_config_items(settings):
-        if config_key == key:
-            return _route_oss_base_url(value, sandboxed=False)
-    return None
+    return provider_config.resolve_provider_spec(settings).base_url
 
 
 def _effective_codex_base_url_for_identity(settings: dict) -> str | None:
@@ -1334,13 +1250,7 @@ def _effective_codex_base_url_for_identity(settings: dict) -> str | None:
 
 def _uses_external_codex_provider(settings: dict) -> bool:
     """Return whether Codex is configured outside its native OpenAI path."""
-    provider = _codex_provider(settings)
-    return bool(
-        settings.get("oss")
-        or provider not in (None, "openai")
-        or _configured_codex_base_url(settings) is not None
-        or _provider_env_names(settings)
-    )
+    return provider_config.resolve_provider_spec(settings).external
 
 
 def uses_external_codex_provider(settings: dict) -> bool:
@@ -1381,24 +1291,16 @@ def _call_cache_identity(
     config has already rejected literal credential values.
     """
     if backend == "codex":
-        configured_model = settings.get("model")
-        effective_model = (
-            "gpt-5.5"
-            if configured_model in _CLAUDE_MODEL_ALIASES
-            else configured_model
+        plan = provider_config.resolve_codex_role(
+            settings, sandboxed=sandboxed,
         )
+        effective_model = plan.deployment
         invocation_settings = {
-            "effort": settings.get("effort"),
+            "effort": plan.effort,
             "sandbox": settings.get("sandbox"),
-            "search": settings.get("search"),
             "full_auto": bool(settings.get("full_auto", False)),
-            "oss": bool(settings.get("oss", False)),
-            "local_provider": settings.get("local_provider"),
-            "base_url": _effective_codex_base_url_for_identity(settings),
-            "provider_env": sorted(_provider_env_names(settings)),
-            "codex_config": sorted(
-                _codex_config_items(settings), key=lambda item: item[0]
-            ),
+            "provider_plan": plan.cache_identity(),
+            "provider_env": sorted(plan.forwarded_env),
             "schema_retries": settings.get("schema_retries", 0),
         }
         if web_search:
@@ -1407,8 +1309,8 @@ def _call_cache_identity(
             # must participate in resume identity because changing search
             # backends changes the tools and external data source available
             # to an otherwise identical model invocation.
-            invocation_settings["web_search"] = web_search
-        provider = _codex_provider(settings)
+            invocation_settings["shell_web_search"] = web_search
+        provider = plan.provider.id
     else:
         effective_model = settings.get("model")
         invocation_settings = {
@@ -1455,44 +1357,25 @@ def _schema_retry_limit(settings: dict) -> int:
 
 
 def _provider_env_names(settings: dict) -> list[str]:
-    value = settings.get("provider_env", [])
-    if isinstance(value, str):
-        value = [value]
-    if value is None:
-        value = []
-    if not isinstance(value, (list, tuple)) or any(
-        not isinstance(name, str) or not _ENV_NAME.fullmatch(name)
-        for name in value
-    ):
-        raise ValueError(
-            "provider_env must contain only environment-variable names"
-        )
-    return list(dict.fromkeys(value))
+    return list(provider_config.resolve_provider_spec(settings).forwarded_env)
 
 
 def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
                       sandboxed: bool = False, role: str | None = None):
-    oss = settings.get("oss", False)
-    if not isinstance(oss, bool):
-        raise ValueError("oss must be a boolean")
-
-    config_items = _codex_config_items(settings)
-    provider_env = _provider_env_names(settings)
+    plan = provider_config.resolve_codex_role(
+        settings, sandboxed=sandboxed,
+    )
+    oss = plan.provider.kind == "local"
+    config_items = list(plan.codex_config_items)
+    provider_env = list(plan.forwarded_env)
     configured_provider = next(
         (value for key, value in config_items if key == "model_provider"),
         None,
     )
-    external_provider = _uses_external_codex_provider(settings)
-    model = settings.get("model")
-    if external_provider and (not isinstance(model, str) or not model.strip()):
-        raise ValueError("External Codex provider roles require an explicit model")
-    if model is None:
-        model = "gpt-5.5"
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("Codex model must be a non-empty string")
+    model = plan.deployment
     sandbox = settings.get("sandbox", "read-only")
-    effort = settings.get("effort", "xhigh")
-    local_provider = settings.get("local_provider")
+    effort = plan.effort
+    local_provider = plan.provider.local_adapter
     if oss:
         if local_provider not in _CODEX_LOCAL_PROVIDERS:
             allowed = ", ".join(sorted(_CODEX_LOCAL_PROVIDERS))
@@ -1612,43 +1495,11 @@ def _build_codex_cmd(prompt, settings, schema_file, system, resume, *,
         if schema_file:
             cmd += ["--output-schema", schema_file]
 
-    search = settings.get("search")
-    if search is not None:
-        if not isinstance(search, bool):
-            raise ValueError("search must be a boolean")
-        if search and oss:
-            raise ValueError(
-                "search: true enables Codex's native web-search tool, a "
-                "Responses API tool type that local providers reject before "
-                "inference. Keep search: false for OSS roles and stack "
-                "configs/brave_search.yaml for shell-based search instead"
-            )
-        # Codex 0.133 uses the top-level enum to decide whether the native
-        # Responses API web-search tool is sent to the provider. Its legacy
-        # tools.web_search boolean is ignored; the nested table now only
-        # holds options for an enabled tool.
-        search_mode = "live" if search else "disabled"
-        cmd += ["-c", f"web_search={_toml_scalar(search_mode)}"]
-
-    # Codex enables its multi-agent namespace tool by default. Ollama and LM
-    # Studio accept ordinary function tools but reject the Responses API's
-    # `namespace` tool type before the model sees the prompt. Keep the agentic
-    # shell loop while disabling both incompatible multi-agent implementations
-    # for OSS adapters. An explicit provider override remains possible.
-    #
-    # unified_exec is also disabled for OSS. With it on, Codex advertises
-    # shell access as a PTY-session tool pair (exec_command/write_stdin);
-    # with it off, as the single classic shell tool. Both are plain
-    # function types that providers accept, but the classic tool matches
-    # the shell-tool shape local models are trained on, drops a tool from
-    # an already-long prompt, and gives up only interactive sessions,
-    # which no Theoria role uses.
-    if oss:
-        configured_keys = {key for key, _ in config_items}
-        for feature in ("multi_agent", "multi_agent_v2", "unified_exec"):
-            key = f"features.{feature}"
-            if key not in configured_keys:
-                cmd += ["-c", f"{key}=false"]
+    # Codex 0.133 uses the top-level enum to decide whether the native
+    # Responses API web-search tool is sent to the provider. Capability
+    # validation and safe defaults were already applied by the role plan.
+    search_mode = "live" if plan.native_search else "disabled"
+    cmd += ["-c", f"web_search={_toml_scalar(search_mode)}"]
 
     if system and not resume:
         # System prompt only on initial call; resume continues existing context
@@ -1933,13 +1784,14 @@ async def llm(
 
     # Apply backend-specific defaults (config values take precedence)
     if backend == "codex":
+        provider_spec = provider_config.resolve_provider_spec(settings)
         # Native OpenAI retains the historical default. External providers
         # use provider-specific model/deployment ids and must be explicit.
-        if not _uses_external_codex_provider(settings):
+        if not provider_spec.external:
             settings.setdefault("model", "gpt-5.5")
         settings.setdefault("effort", "xhigh")
         settings.setdefault("sandbox", "read-only")
-        settings.setdefault("search", not settings.get("oss", False))
+        settings.setdefault("search", provider_spec.native_search_default)
     elif backend == "claude":
         settings.setdefault("model", "opus")
         settings.setdefault("effort", "max")
@@ -1971,6 +1823,10 @@ async def llm(
     container_id = sandbox_container.get()
     image_id = sandbox_image_id.get()
     sandboxed = container_id is not None
+    codex_plan = (
+        provider_config.resolve_codex_role(settings, sandboxed=sandboxed)
+        if backend == "codex" else None
+    )
     effective_codex_version = (
         codex_cli_version.get() if backend == "codex" else None
     )
@@ -2035,8 +1891,8 @@ async def llm(
     configured_base_url = None
     effective_base_url = None
     oss_env_base_url = None
-    oss_gate: asyncio.Semaphore | None = None
-    oss_gate_held = False
+    provider_gate: asyncio.Semaphore | None = None
+    provider_gate_held = False
     raw_stdout: bytes = b""
     raw_stderr: bytes = b""
     events: list[dict] = []
@@ -2059,9 +1915,11 @@ async def llm(
                 sandboxed=sandboxed,
             )
         elif backend == "codex":
-            codex_provider = _codex_provider(settings)
-            configured_base_url = _configured_codex_base_url(settings)
-            provider_env = _provider_env_names(settings)
+            assert codex_plan is not None
+            codex_provider = codex_plan.provider.id
+            configured_base_url = provider_spec.base_url
+            effective_base_url = codex_plan.provider.base_url
+            provider_env = list(codex_plan.forwarded_env)
             # Run-level shell web search: the helper runs inside the
             # sandbox via the model's shell tool, so the command line
             # needs no changes — but a keyed provider's key must exist
@@ -2074,13 +1932,7 @@ async def llm(
                     "web search is configured but environment variable "
                     f"{web_search_key_env} is not set"
                 )
-            external_provider = (
-                bool(settings.get("oss"))
-                or codex_provider not in (None, "openai")
-                or configured_base_url is not None
-                or bool(provider_env)
-                or bool(web_search)
-            )
+            external_provider = codex_plan.provider.external or bool(web_search)
             security = config.get("_security") or {}
             if not isinstance(security, dict):
                 raise ValueError("_security must be a mapping")
@@ -2097,17 +1949,11 @@ async def llm(
                     "default. To run this provider on the host, explicitly set "
                     "_security.allow_external_provider_host_access: true."
                 )
-            if configured_base_url is not None:
-                effective_base_url = _route_oss_base_url(
-                    configured_base_url, sandboxed=sandboxed,
-                )
-            if settings.get("oss"):
+            if codex_plan.provider.kind == "local":
                 env_base_url = os.environ.get("CODEX_OSS_BASE_URL")
                 oss_base_url = env_base_url or settings.get("oss_base_url")
                 if oss_base_url is not None:
-                    oss_env_base_url = _route_oss_base_url(
-                        oss_base_url, sandboxed=sandboxed,
-                    )
+                    oss_env_base_url = codex_plan.provider.base_url
                     effective_base_url = oss_env_base_url
                 child_env = os.environ.copy()
                 if oss_env_base_url is not None:
@@ -2230,14 +2076,22 @@ async def llm(
         )
         call_label = (f"call_{call_index:03d}_{role}"
                       if call_index is not None else role)
-        # Local providers handle one request at a time; hold the gate
-        # across the whole retry loop so a call only opens its stream
-        # when the provider is actually free (see _oss_gate above).
+        # Hold a provider/deployment-scoped gate across the entire retry loop.
+        # Local adapters default to one request; hosted Azure profiles use
+        # their configured deployment quota limit.
         # Released in the outer finally.
-        if backend == "codex" and settings.get("oss"):
-            oss_gate = _oss_gate()
-            await oss_gate.acquire()
-            oss_gate_held = True
+        if (
+            backend == "codex"
+            and codex_plan is not None
+            and codex_plan.concurrency_key is not None
+            and codex_plan.provider.max_parallel is not None
+        ):
+            provider_gate = _provider_gate(
+                codex_plan.concurrency_key,
+                codex_plan.provider.max_parallel,
+            )
+            await provider_gate.acquire()
+            provider_gate_held = True
         while True:
             process_attempts += 1
             attempt_started = time.perf_counter()
@@ -2476,6 +2330,12 @@ async def llm(
                 "codex_version": effective_codex_version,
                 "oss": bool(settings.get("oss", False)),
                 "model_provider": codex_provider,
+                "provider": (
+                    codex_plan.metadata() if codex_plan is not None else None
+                ),
+                "deployment": (
+                    codex_plan.deployment if codex_plan is not None else None
+                ),
                 "web_search_provider": web_search.get("provider"),
                 "base_url": configured_base_url,
                 "effective_base_url": effective_base_url,
@@ -2536,6 +2396,12 @@ async def llm(
             "codex_version": effective_codex_version,
             "oss": bool(settings.get("oss", False)),
             "model_provider": codex_provider,
+            "provider": (
+                codex_plan.metadata() if codex_plan is not None else None
+            ),
+            "deployment": (
+                codex_plan.deployment if codex_plan is not None else None
+            ),
             "web_search_provider": web_search.get("provider"),
             "base_url": configured_base_url,
             "effective_base_url": effective_base_url,
@@ -2566,8 +2432,8 @@ async def llm(
         raise
 
     finally:
-        if oss_gate_held and oss_gate is not None:
-            oss_gate.release()
+        if provider_gate_held and provider_gate is not None:
+            provider_gate.release()
         # Only unlink host-side schema tempfiles. When sandboxed the
         # schema lives at an in-container path; it's cleaned up with
         # the per-call workspace dir when the container is destroyed.

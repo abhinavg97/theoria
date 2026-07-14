@@ -1,0 +1,53 @@
+# Azure OpenAI GA v1 Responses profile for Codex.
+#
+# 1. Replace YOUR-RESOURCE-NAME in the endpoint below.
+# 2. Export AZURE_OPENAI_API_KEY (never put its value in YAML).
+# 3. Pass the deployment once with --codex-model DEPLOYMENT, or replace the
+#    model placeholder below. Azure expects the deployment name in `model`.
+#
+# Native Azure web search is supported but deliberately disabled. Set
+# `search: true` per role only after reviewing Azure's search data-boundary
+# policy, or stack brave_search.yaml / searxng_search.yaml for shell search.
+
+_azure_provider: &azure_provider
+  kind: azure_openai
+  endpoint: https://YOUR-RESOURCE-NAME.openai.azure.com/openai/v1
+  api_key_env: AZURE_OPENAI_API_KEY
+  # Shared per endpoint+deployment gate. Tune this to the deployment's RPM/
+  # TPM quota; it bounds Theoria's concurrent Codex processes, not Azure quota.
+  max_parallel: 4
+
+_azure_role: &azure_role
+  backend: codex
+  provider: *azure_provider
+  model: REPLACE_WITH_AZURE_DEPLOYMENT
+  effort: medium
+  search: false
+  schema_retries: 1
+
+solver:
+  <<: *azure_role
+
+interpreter:
+  <<: *azure_role
+
+formalizer:
+  <<: *azure_role
+
+citation:
+  <<: *azure_role
+
+problem_given:
+  <<: *azure_role
+
+computation:
+  <<: *azure_role
+
+pedantry:
+  <<: *azure_role
+
+convention_lift:
+  <<: *azure_role
+
+initial_state:
+  <<: *azure_role

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 import pipeline
+import providers as provider_config
 import sandbox as sbx
 from llm import (
     artifact_dir,
@@ -31,7 +32,6 @@ from llm import (
     codex_cli_version,
     sandbox_container,
     sandbox_image_id,
-    uses_external_codex_provider,
     web_search_config,
     web_search_env_names,
 )
@@ -184,16 +184,7 @@ def _role_settings(config: dict):
 
 
 def _codex_model_provider(settings: dict) -> str | None:
-    local_provider = settings.get("local_provider")
-    if isinstance(local_provider, str) and local_provider:
-        return local_provider
-    codex_config = settings.get("codex_config")
-    if not isinstance(codex_config, dict):
-        return None
-    for key, value in codex_config.items():
-        if str(key).split(".")[-1] == "model_provider" and isinstance(value, str):
-            return value
-    return None
+    return provider_config.resolve_provider_spec(settings).id
 
 
 def _external_provider_domain(
@@ -247,26 +238,6 @@ def _data_destination(
     return destination
 
 
-def _codex_config_endpoints(value, *, key: str = ""):
-    if isinstance(value, dict):
-        for child_key, child_value in value.items():
-            yield from _codex_config_endpoints(child_value, key=str(child_key))
-    elif isinstance(value, str) and key.split(".")[-1] == "base_url":
-        yield value
-
-
-def _codex_config_credential_refs(value, *, key: str = ""):
-    if isinstance(value, dict):
-        for child_key, child_value in value.items():
-            yield from _codex_config_credential_refs(
-                child_value, key=str(child_key),
-            )
-    elif isinstance(value, str) and key.lower().endswith((
-        ".env_key", ".env_var", ".bearer_token_env_var",
-    )):
-        yield value
-
-
 def _endpoint_needs_host_gateway(endpoint: str) -> bool:
     try:
         hostname = (urlsplit(endpoint).hostname or "").lower()
@@ -286,15 +257,9 @@ def _provider_env_names(config: dict) -> list[str]:
         if settings.get("backend", "claude") != "codex":
             continue
         has_codex = True
-        has_local_oss = has_local_oss or bool(settings.get("oss", False))
-        configured = settings.get("provider_env", [])
-        if isinstance(configured, str):
-            configured = [configured]
-        if configured is None:
-            configured = []
-        if not isinstance(configured, (list, tuple)):
-            raise ValueError("provider_env must be a list of environment variable names")
-        names.extend(configured)
+        spec = provider_config.resolve_provider_spec(settings)
+        has_local_oss = has_local_oss or spec.kind == "local"
+        names.extend(spec.forwarded_env)
     # The shell web-search key rides the same forwarding path as provider
     # credentials: referenced by name here, value taken from the host
     # environment at container start, redacted from inspect artifacts.
@@ -331,7 +296,6 @@ def resolve_runtime(config: dict | None = None) -> dict:
         data_destinations[identity] = destination
         return identity
 
-    env_override = os.environ.get("CODEX_OSS_BASE_URL")
     for role, settings in _role_settings(resolved_config):
         if "web_search" in settings:
             raise ValueError(
@@ -351,60 +315,31 @@ def resolve_runtime(config: dict | None = None) -> dict:
             add_destination(_data_destination("model", "claude"))
         elif backend == "codex":
             needs_codex = True
-            oss = bool(settings.get("oss", False))
-            provider = _codex_model_provider(settings)
-            endpoint = settings.get("oss_base_url")
-            endpoints = []
-            if isinstance(endpoint, str) and endpoint:
-                endpoints.append(endpoint)
-                role_runtime["endpoint"] = _sanitize_endpoint(endpoint)
-            config_endpoints = list(
-                _codex_config_endpoints(settings.get("codex_config", {}))
-            )
-            endpoints.extend(config_endpoints)
-            if "endpoint" not in role_runtime and config_endpoints:
-                role_runtime["endpoint"] = _sanitize_endpoint(config_endpoints[0])
-            if env_override and oss:
-                endpoints.append(env_override)
+            plan = provider_config.resolve_codex_role(settings)
+            spec = plan.provider
+            oss = spec.kind == "local"
+            provider = spec.id
+            endpoints = [spec.base_url] if spec.base_url else []
+            if endpoints:
+                role_runtime["endpoint"] = _sanitize_endpoint(endpoints[0])
             if any(_endpoint_needs_host_gateway(item) for item in endpoints):
                 needs_host_gateway = True
-            if oss and settings.get("local_provider") and not endpoints:
+            if oss and spec.local_adapter and not endpoints:
                 needs_host_gateway = True
 
-            configured_env = settings.get("provider_env", [])
-            if isinstance(configured_env, str):
-                configured_env = [configured_env]
-            elif configured_env is None:
-                configured_env = []
-            elif not isinstance(configured_env, (list, tuple)):
-                raise ValueError(
-                    "provider_env must be a list of environment variable names"
-                )
-            credential_refs = list(_codex_config_credential_refs(
-                settings.get("codex_config", {}),
-            ))
-            missing_credential_refs = sorted(
-                set(credential_refs) - set(configured_env)
+            configured_env = list(plan.forwarded_env)
+            credential_refs = (
+                [spec.credential_env] if spec.credential_env else []
             )
-            if missing_credential_refs:
-                raise ValueError(
-                    "Codex provider credential environment references must "
-                    "also appear in provider_env: "
-                    + ", ".join(missing_credential_refs)
-                )
 
-            external_provider = uses_external_codex_provider(settings)
+            external_provider = spec.external
             if not external_provider:
                 needs_codex_cloud_auth = True
                 credential_domains.add("codex:openai")
                 add_destination(_data_destination("model", "codex:openai"))
             else:
                 has_external_access = True
-                effective_endpoints = (
-                    [env_override]
-                    if env_override and oss
-                    else endpoints
-                )
+                effective_endpoints = endpoints
                 model_destination = add_destination(_data_destination(
                     "model", f"codex:{provider or 'external'}",
                     effective_endpoints,
@@ -445,10 +380,22 @@ def resolve_runtime(config: dict | None = None) -> dict:
                             model_destination
                         )
 
+            provider_metadata = spec.metadata()
+            if provider_metadata.get("endpoint"):
+                provider_metadata["endpoint"] = _sanitize_endpoint(
+                    provider_metadata["endpoint"]
+                )
             role_runtime.update({
                 "oss": oss,
                 "model_provider": provider or "openai",
-                "search": settings.get("search"),
+                "provider": {
+                    **provider_metadata,
+                    "deployment": plan.deployment,
+                    "native_search": plan.native_search,
+                    "concurrency_key": plan.concurrency_key,
+                },
+                "deployment": plan.deployment,
+                "search": plan.native_search,
                 "web_search": web_search.get("provider"),
                 "provider_env": list(dict.fromkeys([
                     *configured_env,

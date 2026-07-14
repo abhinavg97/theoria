@@ -39,6 +39,7 @@ from pathlib import Path
 import harness
 import llm
 import loaders
+import providers as provider_config
 import sandbox
 import search_cli
 
@@ -272,25 +273,6 @@ def cmd_doctor(args) -> None:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    def is_external_codex_provider(settings):
-        return harness.uses_external_codex_provider(settings)
-
-    def provider_endpoint(settings):
-        if settings.get("oss"):
-            endpoint = os.environ.get("CODEX_OSS_BASE_URL")
-            if endpoint:
-                return endpoint
-        endpoint = settings.get("oss_base_url")
-        if endpoint:
-            return endpoint
-        codex_config = settings.get("codex_config") or {}
-        if not isinstance(codex_config, dict):
-            return None
-        provider = codex_config.get("model_provider")
-        if provider:
-            return codex_config.get(f"model_providers.{provider}.base_url")
-        return None
-
     def endpoint_reachable(url):
         """Probe an OpenAI-compatible endpoint without printing its URL."""
         target = url.rstrip("/") + "/models"
@@ -344,31 +326,41 @@ def cmd_doctor(args) -> None:
         role: settings for role, settings in roles.items()
         if settings["backend"] == "codex"
     }
-    cloud_codex_roles = {
-        role: settings for role, settings in codex_roles.items()
-        if not is_external_codex_provider(settings)
-    }
-    provider_roles = {
-        role: settings for role, settings in codex_roles.items()
-        if is_external_codex_provider(settings)
-    }
-
     effective_config = {
         key: value for key, value in config.items()
         if str(key).startswith("_")
     }
     effective_config.update(roles)
+    cloud_codex_roles = {}
+    provider_roles = {}
+    codex_role_plans = {}
     runtime_provider_env = []
     web_search = {}
     try:
+        # Keep every provider/role normalization operation inside this one
+        # validation boundary. A malformed provider must become a failed
+        # doctor check, not escape through a classification or probe path as
+        # an uncaught traceback.
+        codex_role_plans = {
+            role: provider_config.resolve_codex_role(settings)
+            for role, settings in codex_roles.items()
+        }
         runtime = harness.resolve_runtime(effective_config)
+        cloud_codex_roles = {
+            role: settings for role, settings in codex_roles.items()
+            if not codex_role_plans[role].provider.external
+        }
+        provider_roles = {
+            role: settings for role, settings in codex_roles.items()
+            if codex_role_plans[role].provider.external
+        }
+        web_search = llm.web_search_config(
+            effective_config.get("_web_search")
+        )
     except ValueError as exc:
         check("provider security configuration is valid", False, str(exc))
     else:
         runtime_provider_env = runtime["provider_env"]
-        web_search = llm.web_search_config(
-            effective_config.get("_web_search")
-        )
         requirements = runtime["requirements"]
         mixed_credentials = requirements["mixed_provider_credentials"]
         mixed_credentials_allowed = requirements[
@@ -509,6 +501,7 @@ def cmd_doctor(args) -> None:
     placeholder_models = {
         "CHANGE_ME", "YOUR_MODEL", "YOUR_MODEL_ID",
         "REPLACE_WITH_MODEL", "REPLACE_WITH_OLLAMA_MODEL",
+        "REPLACE_WITH_AZURE_DEPLOYMENT",
     }
     if provider_roles:
         unresolved_models = sorted(
@@ -521,29 +514,82 @@ def cmd_doctor(args) -> None:
               "--codex-model MODEL "
               "(unresolved: " + ", ".join(unresolved_models) + ")")
 
+    azure_native_search_roles = sorted(
+        role for role in provider_roles
+        if codex_role_plans[role].provider.kind == "azure_openai"
+        and codex_role_plans[role].native_search
+    )
+    if azure_native_search_roles:
+        print(
+            "  ! Azure native web search explicitly enabled for: "
+            + ", ".join(azure_native_search_roles)
+        )
+        print(
+            "      → search traffic can cross the configured Azure data and "
+            "compliance boundary; verify your organization's policy"
+        )
+
     if args.check_endpoint:
         endpoint_groups = {}
-        for role, settings in provider_roles.items():
-            endpoint = provider_endpoint(settings)
+        for role in provider_roles:
+            plan = codex_role_plans[role]
+            spec = plan.provider
+            endpoint = spec.base_url
             if isinstance(endpoint, str) and endpoint:
-                provider = settings.get("local_provider") or (
-                    (settings.get("codex_config") or {}).get("model_provider")
-                ) or "custom"
-                endpoint_groups.setdefault((provider, endpoint), []).append(role)
+                group = (
+                    spec.kind, spec.id, endpoint, spec.credential_env,
+                )
+                endpoint_groups.setdefault(group, {
+                    "roles": [], "spec": spec,
+                })["roles"].append(role)
             else:
                 check(f"endpoint configured for provider role {role}", False,
                       "set the selected provider's base URL")
-        for (provider, endpoint), endpoint_roles in endpoint_groups.items():
-            reachable = (
-                sandbox.endpoint_reachable_from_image(
-                    args.image, endpoint, add_host_gateway=True,
+        azure_probe_hints = {
+            "missing_credential": "set the configured Azure API-key environment variable",
+            "unauthorized": "verify the Azure API key",
+            "forbidden": "verify that the key can access this Azure resource",
+            "not_found": "verify the Azure hostname and /openai/v1 endpoint path",
+            "rate_limited": "reduce provider.max_parallel or increase Azure quota",
+            "dns": "verify the Azure resource hostname and DNS configuration",
+            "tls": "verify TLS inspection, certificates, and outbound HTTPS access",
+            "timeout": "verify outbound network access and private endpoint routing",
+            "network": "verify outbound network access to the Azure endpoint",
+            "http_error": "inspect the Azure resource status and endpoint configuration",
+        }
+        for group in endpoint_groups.values():
+            spec = group["spec"]
+            endpoint_roles = group["roles"]
+            if spec.kind == "azure_openai":
+                probe = (
+                    sandbox.azure_endpoint_probe_from_image(
+                        args.image, spec.base_url, spec.credential_env,
+                    )
+                    if args.docker
+                    else provider_config.probe_azure_endpoint(spec)
                 )
-                if args.docker
-                else endpoint_reachable(endpoint)
-            )
-            check(f"{provider} endpoint reachable ({len(endpoint_roles)} role(s))",
-                  reachable,
-                  "verify the provider service and its configured base URL")
+                check(
+                    f"Azure endpoint/auth reachable ({len(endpoint_roles)} role(s))",
+                    probe.ok,
+                    azure_probe_hints.get(
+                        probe.category,
+                        "verify the Azure endpoint/auth configuration",
+                    ),
+                )
+            else:
+                endpoint = spec.base_url
+                reachable = (
+                    sandbox.endpoint_reachable_from_image(
+                        args.image, endpoint, add_host_gateway=True,
+                    )
+                    if args.docker
+                    else endpoint_reachable(endpoint)
+                )
+                check(
+                    f"{spec.id} endpoint reachable ({len(endpoint_roles)} role(s))",
+                    reachable,
+                    "verify the provider service and its configured base URL",
+                )
         if web_search:
             if web_search["provider"] == "brave":
                 # Hosted API on a fixed endpoint. Any HTTP status (401
@@ -732,7 +778,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.add_argument(
         "--check-endpoint", action="store_true",
-        help="Probe configured OSS provider endpoints without displaying URLs.",
+        help=("Probe configured external provider endpoints without "
+              "displaying URLs."),
     )
     d.set_defaults(func=cmd_doctor)
 

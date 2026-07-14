@@ -26,6 +26,7 @@ py-modules = [
     "export_problem",
     "cli",
     "search_cli",
+    "providers",
 ]
 
 [tool.pytest.ini_options]

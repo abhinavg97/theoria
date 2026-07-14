@@ -141,6 +141,31 @@ Keep Docker enabled for external providers. With `--no-docker`, the provider-con
 
 Codex's native web search is deliberately off in the supplied OSS provider profiles — and cannot be turned on there: local providers reject the Responses API `web_search` tool type (and MCP `namespace` tools) before the model sees the prompt, which surfaces as a misleading provider error. Fetching a known URL can verify that source, but it is not search or source discovery. Citation-heavy problems will therefore decline more often and have lower verification coverage unless a search profile is stacked on top.
 
+## Azure OpenAI (unaudited)
+
+The first-class [`configs/azure_openai.yaml`](configs/azure_openai.yaml) profile keeps Codex as the agent runtime and targets Azure OpenAI's GA Responses endpoint. Edit the resource name in the profile, export a dedicated API key, and pass the Azure **deployment name** as the model:
+
+```bash
+export AZURE_OPENAI_API_KEY=YOUR_DEDICATED_AZURE_KEY
+
+theoria doctor --config configs/azure_openai.yaml \
+  --codex-model YOUR_AZURE_DEPLOYMENT --check-endpoint
+
+theoria custom "Prove there are infinitely many primes" \
+  --config configs/azure_openai.yaml \
+  --codex-model YOUR_AZURE_DEPLOYMENT
+```
+
+Supported endpoints are `https://RESOURCE.openai.azure.com/openai/v1` and `https://RESOURCE.services.ai.azure.com/openai/v1`. The GA v1 path does not use a dated `api-version`, and legacy `/deployments/...` URLs are rejected. Theoria compiles the structured provider declaration to the exact provider block understood by the pinned Codex 0.133 image, automatically forwards `AZURE_OPENAI_API_KEY`, and records the deployment separately from the provider endpoint. For best Codex capability detection, prefer an Azure deployment name matching the underlying model slug.
+
+Azure roles share a concurrency gate per endpoint and deployment. The profile defaults to `max_parallel: 4`; tune it to the deployment's RPM/TPM quota. This bounds Theoria's concurrent processes but does not replace Azure quota management or Codex's provider retries.
+
+Azure native `web_search` is technically supported but defaults off because search traffic can cross the configured Azure data and compliance boundary. Setting a role's `search: true` is the explicit opt-in. Alternatively, stack the shell-backed Brave or SearXNG profile below. Azure plus Brave exposes two keys in the same per-problem sandbox and therefore requires `_security.allow_mixed_provider_credentials: true`; keyless SearXNG adds a data destination but not another credential issuer.
+
+`doctor --check-endpoint` performs an authenticated `GET /models` with bearer authentication, either from the selected Docker image or from the host for `--no-docker`. It distinguishes authentication, authorization, path, quota, DNS, TLS, and timeout failures without printing the endpoint or key. The probe validates endpoint/auth reachability; it is not a billable inference request and does not prove that an arbitrary deployment alias supports every Codex tool.
+
+Initial support is intentionally API-key-only. Microsoft Entra ID, APIM/custom gateways, legacy dated APIs, sovereign-cloud hostnames, custom CA/private-network bootstrapping, and Azure management-plane model discovery are not yet supported. Do not mount `~/.azure` or broad service-principal credentials into the agent sandbox.
+
 ### Live search for OSS models
 
 Source discovery is restored through a path every provider supports: a `theoria-search` command baked into both sandbox images, which the model runs with its ordinary shell tool. Nothing new is sent to the model provider, so it works identically with Ollama, LM Studio, custom providers — and cloud Codex. Two backends are supported; stack exactly one:
@@ -216,9 +241,9 @@ theoria grade runs/hle_<timestamp>.json          # one run file at a time
 | `--parallel N` | 1 | Concurrency (does not affect per-problem results). |
 | `--watch` / `--no-watch` | on | Stream live LLM events to stderr. |
 
-Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, `oss_custom_provider.example.yaml`, `brave_search.yaml`, and `searxng_search.yaml` are unaudited OSS profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
+Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, and `audit_grader.yaml` (the audited grader role). `ollama.yaml`, `ollama_audit_grader.yaml`, `oss_custom_provider.example.yaml`, `azure_openai.yaml`, `brave_search.yaml`, and `searxng_search.yaml` are unaudited provider profiles/templates. `unsafe_host_provider.yaml` is an explicit security opt-in for external-provider runs without Docker.
 
-`theoria doctor` accepts repeatable `--config` options and checks only the CLIs, credentials, environment variables, search helper, Docker image, and provider mode used by the merged configuration. Add `--check-endpoint` for a reachability probe; the command does not print the configured endpoint or any credential value. Use `--no-docker` to check a host-only run.
+`theoria doctor` accepts repeatable `--config` options and checks only the CLIs, credentials, environment variables, search helper, Docker image, and provider mode used by the merged configuration. Add `--check-endpoint` for a reachability probe; Azure uses an authenticated, non-inference `/models` probe. The command does not print the configured endpoint or any credential value. Use `--no-docker` to check a host-only run.
 
 ---
 
