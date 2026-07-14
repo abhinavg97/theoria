@@ -538,11 +538,13 @@ def _try_resume_from_cache(
     if rc not in (0, None):
         return None
     cached_identity = meta.get("cache_identity")
-    # Cache artifacts written before invocation fingerprints existed are not
-    # safe to reuse.  Treat them as a miss so the current invocation refreshes
-    # the artifacts in place.
     if not isinstance(cached_identity, dict):
-        return None
+        raise RuntimeError(
+            f"resume idempotency check failed for {call_dir}: "
+            "cached artifacts predate cache_identity fingerprints. "
+            "Refusing to overwrite the original LLM evidence; move or delete "
+            "the call directory to force a fresh invocation."
+        )
     if cached_identity.get("sha256") != expected_identity.get("sha256"):
         cached_inputs = cached_identity.get("inputs") or {}
         current_inputs = expected_identity.get("inputs") or {}
@@ -1201,6 +1203,11 @@ def _uses_external_codex_provider(settings: dict) -> bool:
     )
 
 
+def uses_external_codex_provider(settings: dict) -> bool:
+    """Public wrapper for shared Codex provider security checks."""
+    return _uses_external_codex_provider(settings)
+
+
 def _json_sha256(value) -> str:
     encoded = json.dumps(
         value,
@@ -1277,7 +1284,6 @@ def _call_cache_identity(
             (resume or "").encode("utf-8")
         ).hexdigest(),
         "invocation_settings_sha256": _json_sha256(invocation_settings),
-        "watch": bool(watch),
         "sandboxed": sandboxed,
         "image_id": image_id,
         "codex_version": codex_version if backend == "codex" else None,

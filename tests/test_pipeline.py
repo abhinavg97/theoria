@@ -192,3 +192,38 @@ def test_infrastructure_verdict_is_not_sent_to_pedantry(monkeypatch):
 
     assert updated == [verdict]
     assert records == []
+
+
+def test_infrastructure_verdict_is_non_actionable_repair_text():
+    proof = pipeline.Proof(
+        initial_state=["ANSWER = ?"],
+        steps=[
+            pipeline.Step(
+                state=["ANSWER = 1"],
+                justification_type="computation",
+                justification="computed",
+            ),
+            pipeline.Step(
+                state=["ANSWER = 2"],
+                justification_type="algebra",
+                justification="added one",
+            ),
+        ],
+    )
+
+    text = pipeline._format_failed_verdicts(
+        proof,
+        [
+            pipeline.Verdict(
+                accepted=False,
+                reason="provider schema retries exhausted",
+                infrastructure_failure=True,
+            ),
+            pipeline.Verdict(accepted=False, reason="algebra does not follow"),
+        ],
+    )
+
+    assert "Step 1 [computation] INFRASTRUCTURE FAILURE" in text
+    assert "not a proof objection" in text
+    assert "Do not revise this step" in text
+    assert "Step 2 [algebra] FAILED" in text

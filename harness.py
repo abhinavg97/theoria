@@ -31,6 +31,7 @@ from llm import (
     codex_cli_version,
     sandbox_container,
     sandbox_image_id,
+    uses_external_codex_provider,
 )
 from pipeline import run, CONFIG, load_config
 
@@ -192,21 +193,6 @@ def _codex_model_provider(settings: dict) -> str | None:
     return None
 
 
-def _uses_external_codex_provider(settings: dict) -> bool:
-    provider = _codex_model_provider(settings)
-    configured_env = settings.get("provider_env")
-    has_provider_env = bool(configured_env)
-    has_custom_endpoint = any(
-        True for _ in _codex_config_endpoints(settings.get("codex_config", {}))
-    )
-    return (
-        bool(settings.get("oss", False))
-        or (provider is not None and provider.lower() != "openai")
-        or has_provider_env
-        or has_custom_endpoint
-    )
-
-
 def _external_provider_domain(
     *,
     provider: str | None,
@@ -347,7 +333,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
                     + ", ".join(missing_credential_refs)
                 )
 
-            external_provider = _uses_external_codex_provider(settings)
+            external_provider = uses_external_codex_provider(settings)
             if not external_provider:
                 needs_codex_cloud_auth = True
                 credential_domains.add("codex:openai")

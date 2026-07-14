@@ -97,6 +97,23 @@ def test_custom_openai_endpoint_is_an_external_domain(monkeypatch):
     )
 
 
+def test_unused_custom_endpoint_does_not_make_openai_role_external(monkeypatch):
+    monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
+    runtime = harness.resolve_runtime({
+        "solver": {
+            "backend": "codex",
+            "model": "gpt-5.5",
+            "codex_config": {
+                "model_providers.other.base_url": "https://models.example/v1",
+            },
+        },
+    })
+
+    assert runtime["requirements"]["codex_cloud_auth"] is True
+    assert runtime["requirements"]["external_provider"] is False
+    assert runtime["credential_domains"] == ["codex:openai"]
+
+
 def test_same_provider_id_with_different_endpoints_is_mixed(monkeypatch):
     monkeypatch.delenv("CODEX_OSS_BASE_URL", raising=False)
 

@@ -361,12 +361,30 @@ def _format_failed_verdicts(
 ) -> str:
     lines = []
     if state0_verdict is not None and not state0_verdict.accepted:
-        lines.append(
-            f"State 0 (initial_state) FAILED: {proof.initial_state}\n"
-            f"  Reason: {state0_verdict.reason}"
-        )
+        if state0_verdict.infrastructure_failure:
+            lines.append(
+                "State 0 (initial_state) INFRASTRUCTURE FAILURE "
+                f"(not a proof objection): {proof.initial_state}\n"
+                f"  Reason: {state0_verdict.reason}\n"
+                "  Do not revise the proof for this reason; retrying the "
+                "judge/provider is the remedy."
+            )
+        else:
+            lines.append(
+                f"State 0 (initial_state) FAILED: {proof.initial_state}\n"
+                f"  Reason: {state0_verdict.reason}"
+            )
     for i, (step, v) in enumerate(zip(proof.steps, verdicts)):
-        if not v.accepted:
+        if not v.accepted and v.infrastructure_failure:
+            lines.append(
+                f"Step {i+1} [{step.justification_type}] "
+                f"INFRASTRUCTURE FAILURE (not a proof objection): "
+                f"{step.justification}\n"
+                f"  Reason: {v.reason}\n"
+                "  Do not revise this step for this reason; retrying the "
+                "judge/provider is the remedy."
+            )
+        elif not v.accepted:
             lines.append(
                 f"Step {i+1} [{step.justification_type}] FAILED: {step.justification}\n"
                 f"  Reason: {v.reason}"

@@ -196,6 +196,7 @@ Stackable config presets in `configs/`: `defaults.yaml` (base — every role's p
 - **Answers are extracted** as the first element of the proof's final state; occasionally a correct conclusion sits behind a placeholder. Read the proof, not just the headline.
 - Every run records its exact models, CLI versions, and sandbox image in `runs/artifacts/<run_id>/meta.json` for reproducibility.
 - **Published numbers apply only to the audited Claude/Codex configuration.** OSS profiles, custom providers, and their grader are unaudited and can have materially different coverage and precision.
+- This version tightens the audited Codex/Claude path too: `search: false` now explicitly disables Codex web search, judge verdict schemas reject extra fields, and Claude structured-output responses are post-validated instead of crashing on schema drift.
 - **Grading.** The bundled `theoria grade` shows the LLM grader slightly more per-attempt context than the internal audit grader it's ported from, so its grades may differ marginally on borderline cases — the JUDGE-PASSED/REJECTED verdict itself is unaffected.
 
 ---

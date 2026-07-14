@@ -536,6 +536,7 @@ def _cache_identity(
     system="system",
     schema=None,
     settings=None,
+    watch=False,
     codex_version="codex-cli 0.133.0",
 ):
     return llm._call_cache_identity(
@@ -550,7 +551,7 @@ def _cache_identity(
             "sandbox": "read-only",
             "search": True,
         },
-        watch=False,
+        watch=watch,
         resume=None,
         sandboxed=True,
         image_id="sha256:image",
@@ -603,6 +604,28 @@ def test_resume_cache_identity_covers_runtime_and_tool_inputs(tmp_path):
             llm._try_resume_from_cache(
                 str(call_dir), "prompt", None, changed_identity,
             )
+
+
+def test_resume_cache_identity_ignores_watch_mode():
+    assert _cache_identity(watch=False) == _cache_identity(watch=True)
+
+
+def test_resume_cache_identity_refuses_legacy_artifacts(tmp_path):
+    call_dir = tmp_path / "call_000_solver"
+    call_dir.mkdir()
+    (call_dir / "prompt.txt").write_text("prompt")
+    (call_dir / "response.txt").write_text("legacy response")
+    (call_dir / "meta.json").write_text(json.dumps({
+        "returncode": 0,
+        "session_id": "session",
+    }))
+
+    with pytest.raises(RuntimeError, match="predate cache_identity"):
+        llm._try_resume_from_cache(
+            str(call_dir), "prompt", None, _cache_identity(),
+        )
+
+    assert (call_dir / "response.txt").read_text() == "legacy response"
 
 
 def test_resume_cache_identity_never_contains_provider_secret(monkeypatch):

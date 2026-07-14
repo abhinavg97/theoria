@@ -26,6 +26,7 @@ import json
 from pathlib import Path
 
 from llm import llm as _llm_call
+from llm import uses_external_codex_provider
 from pipeline import load_config
 
 
@@ -219,27 +220,12 @@ async def grade_run(
     if codex_model and settings.get("backend", "claude") == "codex":
         settings["model"] = codex_model
     if settings.get("backend", "claude") == "codex":
-        codex_config = settings.get("codex_config") or {}
-        provider = (
-            codex_config.get("model_provider")
-            if isinstance(codex_config, dict)
-            else None
-        )
-        external_provider = (
-            bool(settings.get("oss"))
-            or (provider is not None and str(provider).lower() != "openai")
-            or bool(settings.get("provider_env"))
-            or (
-                isinstance(codex_config, dict)
-                and any(str(key).endswith(".base_url") for key in codex_config)
-            )
-        )
         security = config.get("_security") or {}
         allow_external_host = (
             isinstance(security, dict)
             and security.get("allow_external_provider_host_access") is True
         )
-        if external_provider and not allow_external_host:
+        if uses_external_codex_provider(settings) and not allow_external_host:
             raise SystemExit(
                 "External-provider grading runs on the host. Stack "
                 "configs/unsafe_host_provider.yaml only after accepting that "
