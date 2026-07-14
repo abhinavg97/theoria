@@ -15,8 +15,8 @@ from llm import (
     _extract_codex_metadata,
     _run_claude_streaming,
 )
-from observability import JsonFormatter, redact_text
-from telemetry import aggregate_calls, enrich_call
+from observability import JsonFormatter, configure_logging, redact_text
+from telemetry import aggregate_calls, config_for_hash, enrich_call
 
 
 class TelemetryTests(unittest.TestCase):
@@ -207,6 +207,16 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnop", text)
         self.assertNotIn("supersecretvalue", text)
         self.assertEqual(text.count("[REDACTED]"), 2)
+
+    def test_text_redaction_covers_json_quoted_credentials(self):
+        text = redact_text('{"api_key": "sk-supersecret12345"}')
+        self.assertNotIn("sk-supersecret12345", text)
+        self.assertIn("[REDACTED]", text)
+        self.assertNotIn('api_key=[REDACTED]"', text)
+
+    def test_invalid_log_level_raises_clear_error(self):
+        with self.assertRaisesRegex(ValueError, "log level must be one of"):
+            configure_logging(level="VERBOSE")
 
     def test_json_formatter_redacts_nested_secrets(self):
         stream = StringIO()

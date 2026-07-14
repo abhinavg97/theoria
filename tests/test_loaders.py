@@ -8,11 +8,6 @@ from unittest.mock import patch
 import loaders
 from loaders import build_question
 
-import json
-import sys
-import types
-import unittest
-from unittest.mock import patch
 
 class FakeDataset(list):
     _fingerprint = "dataset-fingerprint"
