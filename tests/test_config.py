@@ -1,4 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 import cli
 import pipeline
@@ -107,6 +110,47 @@ def test_doctor_parser_accepts_oss_configuration_options():
     assert args.codex_model == "local-model"
     assert args.docker is False
     assert args.check_endpoint is True
+
+
+def test_doctor_uses_shared_external_provider_predicate(monkeypatch, capsys):
+    monkeypatch.setattr(cli.harness, "load_config", lambda _paths: {
+        "_security": {"allow_external_provider_host_access": True},
+        "solver": {
+            "backend": "codex",
+            "model": "local-model",
+            "oss": True,
+            "local_provider": "ollama",
+            "search": False,
+        },
+    })
+    monkeypatch.setattr(
+        cli.shutil, "which",
+        lambda binary: "/usr/bin/codex" if binary == "codex" else None,
+    )
+
+    def fake_run(command, **_kwargs):
+        output = (
+            "codex 0.133\n"
+            "--oss --local-provider PROVIDER --output-schema FILE"
+        )
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    args = SimpleNamespace(
+        config=["ignored.yaml"],
+        codex_model=None,
+        docker=False,
+        image="unused",
+        check_endpoint=False,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.cmd_doctor(args)
+
+    output = capsys.readouterr()
+    assert exit_info.value.code == 0
+    assert "provider credential trust domains are isolated" in output.out
+    assert "Traceback" not in output.out + output.err
 
 
 def test_doctor_requires_local_only_flags_only_for_local_oss():

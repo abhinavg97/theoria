@@ -271,7 +271,7 @@ def cmd_doctor(args) -> None:
             return None
 
     def is_external_codex_provider(settings):
-        return harness._uses_external_codex_provider(settings)
+        return harness.uses_external_codex_provider(settings)
 
     def provider_endpoint(settings):
         if settings.get("oss"):
@@ -470,16 +470,18 @@ def cmd_doctor(args) -> None:
 
     env_name_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
     if provider_roles:
+        def provider_env_names(settings):
+            names = settings.get("provider_env", [])
+            if names is None:
+                return []
+            return names
+
         invalid_provider_env = sorted(
             role for role, settings in provider_roles.items()
-            if not isinstance(settings.get("provider_env", []), list)
+            if not isinstance(provider_env_names(settings), list)
             or any(
                 not isinstance(name, str) or not env_name_pattern.fullmatch(name)
-                for name in (
-                    settings.get("provider_env")
-                    if isinstance(settings.get("provider_env", []), list)
-                    else []
-                )
+                for name in provider_env_names(settings)
             )
         )
         check("provider_env contains environment-variable names",
@@ -489,8 +491,8 @@ def cmd_doctor(args) -> None:
         name
         for settings in provider_roles.values()
         for name in (
-            settings.get("provider_env")
-            if isinstance(settings.get("provider_env", []), list)
+            provider_env_names(settings)
+            if isinstance(provider_env_names(settings), list)
             else []
         )
         if isinstance(name, str) and env_name_pattern.fullmatch(name)
