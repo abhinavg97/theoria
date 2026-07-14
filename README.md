@@ -146,14 +146,16 @@ Codex's native web search is deliberately off in the supplied OSS provider profi
 Source discovery is restored through a path every provider supports: a `theoria-search` command baked into both sandbox images, which the model runs with its ordinary shell tool. Nothing new is sent to the model provider, so it works identically with Ollama, LM Studio, custom providers — and cloud Codex. Two backends are supported; stack exactly one:
 
 - [`configs/brave_search.yaml`](configs/brave_search.yaml) — the [Brave Search API](https://brave.com/search/api/): an independent index behind a stable keyed JSON API, zero infrastructure to run, free tier of ~2,000 queries/month. Best for laptop smoke tests. Costs money and rate-limits at research scale.
-- [`configs/searxng_search.yaml`](configs/searxng_search.yaml) — a self-hosted [SearXNG](https://github.com/searxng/searxng) instance: key-free (nothing to leak from the sandbox) and quota-free (parallel judges search freely), with a pinnable, inspectable retrieval stack. Best for research-scale runs. Honest caveat: SearXNG scrapes upstream engines, so result quality depends on those engines not blocking your IP — datacenter IPs are frequently captcha'd, residential IPs work well. Its `settings.yml` must enable the `json` output format, and the instance should stay bound to localhost (it is unauthenticated; Theoria routes a loopback endpoint into the sandbox the same way it routes the Ollama endpoint).
+- [`configs/searxng_search.yaml`](configs/searxng_search.yaml) — a self-hosted [SearXNG](https://github.com/searxng/searxng) instance: key-free (nothing to leak from the sandbox) and quota-free (parallel judges search freely), with a pinnable, inspectable retrieval stack. Best for research-scale runs. Honest caveat: SearXNG scrapes upstream engines, so result quality depends on those engines not blocking your IP — datacenter IPs are frequently captcha'd, residential IPs work well. Its `settings.yml` must set a non-default `server.secret_key` (SearXNG exits at startup without one; the image only auto-generates a key when no settings file is mounted) and enable the `json` output format, and the instance should stay bound to localhost (it is unauthenticated; Theoria routes a loopback endpoint into the sandbox the same way it routes the Ollama endpoint).
 
 ```bash
 # Option A: Brave
 export BRAVE_API_KEY=YOUR_BRAVE_SEARCH_API_KEY
 SEARCH=configs/brave_search.yaml
 
-# Option B: SearXNG (see configs/searxng_search.yaml for the settings.yml snippet)
+# Option B: SearXNG (settings.yml needs a random secret_key and the json format)
+mkdir -p ./searxng && printf 'use_default_settings: true\nserver:\n  secret_key: "%s"\nsearch:\n  formats: [html, json]\n' \
+  "$(openssl rand -hex 32)" > ./searxng/settings.yml
 docker run -d --name searxng -p 8888:8080 -v ./searxng:/etc/searxng searxng/searxng
 SEARCH=configs/searxng_search.yaml
 

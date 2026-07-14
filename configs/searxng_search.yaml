@@ -7,11 +7,13 @@
 #   --config configs/ollama.yaml --config configs/searxng_search.yaml
 #
 # Run the instance next to Ollama with its JSON output enabled:
+#   mkdir -p ./searxng && printf 'use_default_settings: true\nserver:\n  secret_key: "%s"\nsearch:\n  formats: [html, json]\n' \
+#     "$(openssl rand -hex 32)" > ./searxng/settings.yml
 #   docker run -d --name searxng -p 8888:8080 \
 #     -v ./searxng:/etc/searxng searxng/searxng
-#   # ./searxng/settings.yml must contain:
-#   #   use_default_settings: true
-#   #   search: { formats: [html, json] }
+#   # settings.yml must set a non-default server.secret_key: with a
+#   # mounted settings file the image does not generate one, and SearXNG
+#   # exits at startup ("server.secret_key is not changed") without it.
 #
 # Keep the instance bound to localhost — it is unauthenticated. Theoria
 # routes a loopback endpoint to host.docker.internal for the sandbox,
