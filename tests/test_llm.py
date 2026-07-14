@@ -166,6 +166,34 @@ def test_oss_calls_are_serialized_within_one_event_loop(monkeypatch):
     assert max_active > 1
 
 
+def test_oss_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
+    async def current_gate():
+        return llm._oss_gate()
+
+    # Make any legacy id(loop)-keyed implementation collide deterministically;
+    # this test must not depend on CPython happening to recycle an object id.
+    monkeypatch.setattr(llm, "id", lambda _value: 7, raising=False)
+
+    monkeypatch.setenv("THEORIA_OSS_MAX_PARALLEL", "1")
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_gate = first_loop.run_until_complete(current_gate())
+        assert first_gate._value == 1
+        assert getattr(first_loop, llm._OSS_GATE_LOOP_ATTR) is first_gate
+    finally:
+        first_loop.close()
+
+    monkeypatch.setenv("THEORIA_OSS_MAX_PARALLEL", "4")
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_gate = second_loop.run_until_complete(current_gate())
+        assert second_gate is not first_gate
+        assert second_gate._value == 4
+        assert getattr(second_loop, llm._OSS_GATE_LOOP_ATTR) is second_gate
+    finally:
+        second_loop.close()
+
+
 def test_sandboxed_codex_home_avoids_tmp_helper_warning():
     command = llm._build_codex_cmd(
         "prompt",

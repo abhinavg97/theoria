@@ -160,7 +160,7 @@ SCHEMA_RETRY_MAX = 3                   # hard cap for opt-in format retries
 # genuinely handle concurrent requests can raise the limit via
 # THEORIA_OSS_MAX_PARALLEL.
 
-_oss_gates: dict[int, asyncio.Semaphore] = {}
+_OSS_GATE_LOOP_ATTR = "_theoria_oss_provider_gate"
 
 
 def _oss_max_parallel() -> int:
@@ -177,11 +177,16 @@ def _oss_max_parallel() -> int:
 
 def _oss_gate() -> asyncio.Semaphore:
     """Per-event-loop semaphore bounding concurrent OSS provider calls."""
-    loop_id = id(asyncio.get_running_loop())
-    gate = _oss_gates.get(loop_id)
+    loop = asyncio.get_running_loop()
+    gate = getattr(loop, _OSS_GATE_LOOP_ATTR, None)
     if gate is None:
         gate = asyncio.Semaphore(_oss_max_parallel())
-        _oss_gates[loop_id] = gate
+        # The loop owns the gate so its lifetime cannot outlive that loop.
+        # A process-global id(loop) registry is unsafe because Python may
+        # recycle an object's id after asyncio.run() closes and releases it,
+        # causing a fresh loop to inherit a semaphore created for a closed
+        # loop (and an obsolete THEORIA_OSS_MAX_PARALLEL value).
+        setattr(loop, _OSS_GATE_LOOP_ATTR, gate)
     return gate
 
 
