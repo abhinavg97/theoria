@@ -26,7 +26,7 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Mapping
 from urllib.parse import urlsplit, urlunsplit
@@ -39,6 +39,7 @@ CODEX_CONFIG_KEY = re.compile(
     r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"
 )
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+SCHEDULER_LOOPBACK_HOSTS = LOOPBACK_HOSTS | {"host.docker.internal"}
 AZURE_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com")
 CODEX_AZURE_URL_MARKERS = (
     "openai.azure.",
@@ -277,6 +278,21 @@ def normalize_endpoint(value, *, sandboxed: bool, label: str = "provider endpoin
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
+def scheduler_endpoint(value: str | None) -> str | None:
+    """Canonical endpoint identity for provider-side concurrency gates."""
+    if value is None:
+        return None
+    parsed = urlsplit(value)
+    hostname = parsed.hostname or ""
+    port = parsed.port
+    if hostname.lower() in SCHEDULER_LOOPBACK_HOSTS:
+        hostname = "localhost"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
 def normalize_azure_endpoint(value, *, sandboxed: bool = False) -> str:
     endpoint = normalize_endpoint(
         value, sandboxed=sandboxed, label="Azure OpenAI endpoint",
@@ -372,11 +388,16 @@ def _credential_refs(items: list[tuple[str, object]]) -> list[str]:
     ))
 
 
-def _positive_parallel(value, *, default: int | None) -> int | None:
+def _positive_parallel(
+    value,
+    *,
+    default: int | None,
+    label: str = "provider.max_parallel",
+) -> int | None:
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("provider.max_parallel must be a positive integer")
+        raise ValueError(f"{label} must be a positive integer")
     return value
 
 
@@ -483,13 +504,9 @@ def resolve_provider_spec(
             )
         # Advanced non-provider overrides remain available alongside the
         # generated, audited provider block.
-        return ProviderSpec(
-            **{
-                **spec.__dict__,
-                "codex_config_items": (
-                    *spec.codex_config_items, *legacy_items,
-                ),
-            }
+        return replace(
+            spec,
+            codex_config_items=(*spec.codex_config_items, *legacy_items),
         )
 
     oss = settings.get("oss", False)
@@ -559,6 +576,10 @@ def resolve_provider_spec(
     selected_wire_api = next((
         value for key, value in legacy_items if key == wire_key
     ), None)
+    parallel_key = f"model_providers.{provider_id}.max_parallel"
+    selected_max_parallel = next((
+        value for key, value in legacy_items if key == parallel_key
+    ), None)
     name_key = f"model_providers.{provider_id}.name"
     selected_name = next((
         value for key, value in legacy_items if key == name_key
@@ -596,7 +617,20 @@ def resolve_provider_spec(
             "Azure OpenAI provider requires "
             f"model_providers.{provider_id}.env_key"
         )
+    max_parallel = None
     if azure:
+        if selected_wire_api is not None and selected_wire_api != "responses":
+            raise ValueError(
+                "Azure OpenAI provider requires "
+                f"{wire_key} to be 'responses'"
+            )
+        max_parallel = _positive_parallel(
+            selected_max_parallel, default=4, label=parallel_key,
+        )
+        legacy_items = [
+            (key, value) for key, value in legacy_items
+            if key != parallel_key
+        ]
         # Codex 0.133 only recognizes arbitrary Azure hostname families by
         # exact provider name. Canonicalize legacy raw declarations too, so
         # services.ai.azure.com receives Azure's required `store: true` path.
@@ -637,7 +671,7 @@ def resolve_provider_spec(
         # provider whose native search is deliberately opt-in because it can
         # cross the configured Azure data/compliance boundary.
         native_search_default=False if azure else True,
-        max_parallel=4 if azure else None,
+        max_parallel=max_parallel,
         codex_config_items=tuple(legacy_items),
     )
 
@@ -713,7 +747,7 @@ def resolve_codex_role(
                 # configs may choose an arbitrary provider id (for example
                 # `foundry`) while compiling to the same Azure transport.
                 "provider": None if spec.kind == "azure_openai" else spec.id,
-                "endpoint": spec.base_url,
+                "endpoint": scheduler_endpoint(spec.base_url),
                 # Azure quotas are deployment-scoped. A local server is one
                 # shared scheduler even when roles select different models.
                 "deployment": model if spec.kind == "azure_openai" else None,

@@ -109,6 +109,7 @@ def test_doctor_validates_local_image_before_credentialed_probe(
     output = capsys.readouterr().out
     assert exit_info.value.code == 1
     assert "image missing:test" in output
+    assert "endpoint probes skipped" in output
     assert "Azure endpoint/auth reachable" not in output
 
 
@@ -220,6 +221,7 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
         "kind": "azure_openai",
         "endpoint": endpoint,
         "api_key_env": "AZURE_OPENAI_API_KEY",
+        "max_parallel": 2,
     })
     structured["model"] = "deployment"
     assert providers.resolve_provider_spec(structured).base_url == endpoint
@@ -232,12 +234,13 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
             "model_providers.foundry.base_url": endpoint,
             "model_providers.foundry.env_key": "AZURE_OPENAI_API_KEY",
             "model_providers.foundry.wire_api": "responses",
+            "model_providers.foundry.max_parallel": 2,
         },
         "provider_env": ["AZURE_OPENAI_API_KEY"],
     }
     spec = providers.resolve_provider_spec(legacy)
     assert spec.kind == "azure_openai"
-    assert spec.max_parallel == 4
+    assert spec.max_parallel == 2
     assert providers.resolve_codex_role(legacy).concurrency_key is not None
     assert (
         providers.resolve_codex_role(structured).concurrency_key
@@ -245,6 +248,40 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
     )
     assert ("model_providers.foundry.name", "Azure") in spec.codex_config_items
     assert ("model_providers.foundry.wire_api", "responses") in spec.codex_config_items
+    assert all(
+        key != "model_providers.foundry.max_parallel"
+        for key, _ in spec.codex_config_items
+    )
+
+
+def test_raw_azure_rejects_explicit_non_responses_wire_api():
+    with pytest.raises(ValueError, match=r"wire_api.*responses"):
+        providers.resolve_provider_spec({
+            "model": "deployment",
+            "codex_config": {
+                "model_provider": "foundry",
+                "model_providers.foundry.name": "Azure",
+                "model_providers.foundry.base_url": AZURE_ENDPOINT,
+                "model_providers.foundry.env_key": "AZURE_OPENAI_API_KEY",
+                "model_providers.foundry.wire_api": "chat_completions",
+            },
+            "provider_env": ["AZURE_OPENAI_API_KEY"],
+        })
+
+
+def test_raw_azure_rejects_invalid_max_parallel():
+    with pytest.raises(ValueError, match=r"model_providers\.foundry\.max_parallel"):
+        providers.resolve_provider_spec({
+            "model": "deployment",
+            "codex_config": {
+                "model_provider": "foundry",
+                "model_providers.foundry.name": "Azure",
+                "model_providers.foundry.base_url": AZURE_ENDPOINT,
+                "model_providers.foundry.env_key": "AZURE_OPENAI_API_KEY",
+                "model_providers.foundry.max_parallel": 0,
+            },
+            "provider_env": ["AZURE_OPENAI_API_KEY"],
+        })
 
 
 def raw_named_provider(endpoint, *, name="Proxy"):
@@ -598,6 +635,28 @@ def test_local_gate_is_endpoint_scoped_across_models():
     first = providers.resolve_codex_role({**base, "model": "model-a"})
     other = providers.resolve_codex_role({**base, "model": "model-b"})
     assert first.concurrency_key == other.concurrency_key
+
+
+def test_local_gate_canonicalizes_loopback_aliases_in_host_mode():
+    base = {
+        "oss": True,
+        "local_provider": "ollama",
+        "search": False,
+    }
+    localhost = providers.resolve_codex_role({
+        **base,
+        "model": "model-a",
+        "oss_base_url": "http://localhost:11434/v1",
+    })
+    loopback_ip = providers.resolve_codex_role({
+        **base,
+        "model": "model-b",
+        "oss_base_url": "http://127.0.0.1:11434/v1",
+    })
+
+    assert localhost.provider.base_url == "http://localhost:11434/v1"
+    assert loopback_ip.provider.base_url == "http://127.0.0.1:11434/v1"
+    assert localhost.concurrency_key == loopback_ip.concurrency_key
 
 
 def test_runtime_rejects_conflicting_limits_for_same_azure_deployment():

@@ -523,28 +523,26 @@ def test_oss_calls_are_serialized_within_one_event_loop(monkeypatch):
     assert max_active > 1
 
 
-def test_oss_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
-    async def current_gate():
-        return llm._oss_gate()
+def test_provider_gate_lifetime_is_owned_by_actual_event_loop(monkeypatch):
+    async def gate_with_limit(limit):
+        return llm._provider_gate("legacy-oss", limit)
 
     # Make any legacy id(loop)-keyed implementation collide deterministically;
     # this test must not depend on CPython happening to recycle an object id.
     monkeypatch.setattr(llm, "id", lambda _value: 7, raising=False)
 
-    monkeypatch.setenv("THEORIA_OSS_MAX_PARALLEL", "1")
     first_loop = asyncio.new_event_loop()
     try:
-        first_gate = first_loop.run_until_complete(current_gate())
+        first_gate = first_loop.run_until_complete(gate_with_limit(1))
         assert first_gate._value == 1
         first_registry = getattr(first_loop, llm._PROVIDER_GATES_ATTR)
         assert first_registry["legacy-oss"][1] is first_gate
     finally:
         first_loop.close()
 
-    monkeypatch.setenv("THEORIA_OSS_MAX_PARALLEL", "4")
     second_loop = asyncio.new_event_loop()
     try:
-        second_gate = second_loop.run_until_complete(current_gate())
+        second_gate = second_loop.run_until_complete(gate_with_limit(4))
         assert second_gate is not first_gate
         assert second_gate._value == 4
         second_registry = getattr(second_loop, llm._PROVIDER_GATES_ATTR)
@@ -996,8 +994,8 @@ def test_resume_cache_identity_omits_absent_web_search(monkeypatch):
         "api_key_env": "BRAVE_API_KEY",
     })
 
-    assert "web_search" not in hashed_invocations[0]
-    assert hashed_invocations[1]["web_search"] == {
+    assert "shell_web_search" not in hashed_invocations[0]
+    assert hashed_invocations[1]["shell_web_search"] == {
         "provider": "brave",
         "api_key_env": "BRAVE_API_KEY",
     }

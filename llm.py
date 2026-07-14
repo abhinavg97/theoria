@@ -165,18 +165,6 @@ _CONTAINER_CALL_MARKER_ENV = "THEORIA_LLM_CALL_MARKER"
 _PROVIDER_GATES_ATTR = "_theoria_provider_gates"
 
 
-def _oss_max_parallel() -> int:
-    raw = os.environ.get("THEORIA_OSS_MAX_PARALLEL", "1")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        print(
-            f"[llm] ignoring non-integer THEORIA_OSS_MAX_PARALLEL={raw!r}",
-            file=sys.stderr,
-        )
-        return 1
-
-
 def _provider_gate(key: str, limit: int) -> asyncio.Semaphore:
     """Return a per-loop, provider/deployment-scoped concurrency gate."""
     loop = asyncio.get_running_loop()
@@ -201,12 +189,6 @@ def _provider_gate(key: str, limit: int) -> asyncio.Semaphore:
             f"the same max_parallel (got {configured_limit} and {limit})"
         )
     return gate
-
-
-def _oss_gate() -> asyncio.Semaphore:
-    """Backward-compatible local-provider gate helper."""
-    return _provider_gate("legacy-oss", _oss_max_parallel())
-
 
 class WatchdogKilled(RuntimeError):
     """Raised when the watchdog killed the subprocess for being hung.
@@ -1222,42 +1204,6 @@ def _route_oss_base_url(value, *, sandboxed: bool) -> str | None:
     return provider_config.normalize_endpoint(
         value, sandboxed=sandboxed, label="oss_base_url",
     )
-
-
-def _codex_provider(settings: dict) -> str | None:
-    """Return the effective configured provider without exposing secrets."""
-    return provider_config.resolve_provider_spec(settings).id
-
-
-def _configured_codex_base_url(settings: dict) -> str | None:
-    """Return a validated base URL from OSS or custom-provider settings."""
-    return provider_config.resolve_provider_spec(settings).base_url
-
-
-def _effective_codex_base_url_for_identity(settings: dict) -> str | None:
-    """Return the endpoint that can affect a cached Codex invocation.
-
-    Local OSS calls prefer the process-level ``CODEX_OSS_BASE_URL`` override
-    at launch time.  Cache identity must mirror that precedence; otherwise a
-    resumed run can reuse output produced by a different provider endpoint.
-    URL validation forbids embedded credentials, query strings, and fragments,
-    and the enclosing invocation settings are stored only through a hash.
-    """
-    if settings.get("oss"):
-        env_base_url = os.environ.get("CODEX_OSS_BASE_URL")
-        if env_base_url is not None:
-            return _route_oss_base_url(env_base_url, sandboxed=False)
-    return _configured_codex_base_url(settings)
-
-
-def _uses_external_codex_provider(settings: dict) -> bool:
-    """Return whether Codex is configured outside its native OpenAI path."""
-    return provider_config.resolve_provider_spec(settings).external
-
-
-def uses_external_codex_provider(settings: dict) -> bool:
-    """Public wrapper for shared Codex provider security checks."""
-    return _uses_external_codex_provider(settings)
 
 
 def _json_sha256(value) -> str:

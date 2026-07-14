@@ -554,6 +554,13 @@ def cmd_doctor(args) -> None:
         check(f"image {args.image}", present,
               f"theoria build  (or build/tag {args.image})")
 
+    if args.check_endpoint and args.docker and not present:
+        check(
+            "endpoint probes skipped",
+            False,
+            "the selected Docker image must exist before endpoint probes run",
+        )
+
     if args.check_endpoint and (not args.docker or present):
         endpoint_groups = {}
         for role in provider_roles:

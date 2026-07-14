@@ -183,10 +183,6 @@ def _role_settings(config: dict):
         yield str(role), settings
 
 
-def _codex_model_provider(settings: dict) -> str | None:
-    return provider_config.resolve_provider_spec(settings).id
-
-
 def _external_provider_domain(
     *,
     provider: str | None,
