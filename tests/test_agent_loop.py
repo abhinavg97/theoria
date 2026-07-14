@@ -132,7 +132,14 @@ def test_run_agent_exposes_web_search_tool(monkeypatch):
 
     def fake_search(search_config, query, *, max_results):
         seen_queries.append((search_config, query, max_results))
-        return "1. RFC 9110\nSnippet: HTTP Semantics"
+        return agent_loop.SearchResult(
+            text="1. RFC 9110\nSnippet: HTTP Semantics",
+            provider="searxng",
+            query=query,
+            result_count=1,
+            latency_ms=17,
+            endpoint="http://search",
+        )
 
     monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
     monkeypatch.setattr(agent_loop, "_search_web", fake_search)
@@ -155,7 +162,59 @@ def test_run_agent_exposes_web_search_tool(monkeypatch):
         agent_loop.DEFAULT_SEARCH_RESULTS,
     )]
     assert result.metadata["search_enabled"] is True
+    assert result.metadata["web_search_provider"] == "searxng"
+    assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_successes"] == 1
+    assert result.metadata["web_search_failures"] == 0
+    assert result.metadata["web_search_result_count"] == 1
+    assert result.metadata["web_search_latency_ms"] == 17
+    assert result.metadata["web_search_error_categories"] == {}
     assert result.metadata["tool_calls"][0]["tool_name"] == "web_search"
+    assert result.metadata["tool_calls"][0]["metadata"]["result_count"] == 1
+    assert result.metadata["tool_calls"][0]["metadata"]["latency_ms"] == 17
+
+
+def test_run_agent_records_web_search_failure_category(monkeypatch):
+    replies = iter([
+        {
+            "action": "tool",
+            "tool": "web_search",
+            "input": {"query": "rate limited query"},
+        },
+        {"action": "final", "response": "fallback"},
+    ])
+
+    def fake_chat(settings, messages):
+        return json.dumps(next(replies)), {}
+
+    def fake_search(search_config, query, *, max_results):
+        raise agent_loop.SearchFailure(
+            "http_503",
+            "web search failed with HTTP 503: busy",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+    monkeypatch.setattr(agent_loop, "_search_web", fake_search)
+
+    result = asyncio.run(agent_loop.run_agent(
+        "search",
+        settings={"model": "fake", "search": True},
+        schema=None,
+        system=None,
+        resume=None,
+        role="citation",
+        container_id=None,
+        search_config={"provider": "searxng", "endpoint": "http://search"},
+    ))
+
+    assert result.response == "fallback"
+    assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_successes"] == 0
+    assert result.metadata["web_search_failures"] == 1
+    assert result.metadata["web_search_error_categories"] == {"http_503": 1}
+    assert result.metadata["tool_calls"][0]["metadata"]["error_category"] == "http_503"
+    assert result.metadata["tool_calls"][0]["metadata"]["status_code"] == 503
 
 
 def test_run_agent_retries_schema_invalid_final(monkeypatch):

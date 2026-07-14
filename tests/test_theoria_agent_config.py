@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import cli
 import harness
 import pipeline
 from pipeline import load_config
@@ -102,3 +103,49 @@ def test_harness_codex_preset_keeps_formalizer_on_default_claude(monkeypatch):
     finally:
         pipeline.CONFIG.clear()
         pipeline.CONFIG.update(original_config)
+
+
+def test_doctor_theoria_agent_config_does_not_require_claude_or_codex():
+    args = SimpleNamespace(
+        config=["configs/theoria_agent_ollama.yaml"],
+        backend="theoria_agent",
+        docker=False,
+        image=None,
+        no_pair_preamble=False,
+    )
+
+    config, backend, docker, image = cli._doctor_effective_config(args)
+
+    assert backend == "theoria_agent"
+    assert docker is False
+    assert image == cli.SAGE_IMAGE
+    assert cli._config_uses_backend(config, "theoria_agent") is True
+    assert cli._config_uses_backend(config, "claude") is False
+    assert cli._config_uses_backend(config, "codex") is False
+    assert len(cli._theoria_agent_plans(config)) == 1
+
+
+def test_doctor_default_codex_config_keeps_claude_formalizer():
+    args = SimpleNamespace(
+        config=None,
+        backend=None,
+        docker=None,
+        image=None,
+        no_pair_preamble=False,
+    )
+
+    config, backend, docker, image = cli._doctor_effective_config(args)
+
+    assert backend == "codex"
+    assert docker is True
+    assert image == cli.SAGE_IMAGE
+    assert cli._config_uses_backend(config, "codex") is True
+    assert cli._config_uses_backend(config, "claude") is True
+
+
+def test_doctor_endpoint_validation_rejects_credentials():
+    assert cli._valid_http_endpoint("http://localhost:11434/v1") == (True, "")
+    ok, hint = cli._valid_http_endpoint("https://user:pass@example.com/openai/v1")
+
+    assert ok is False
+    assert "credentials" in hint

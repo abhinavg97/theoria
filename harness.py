@@ -407,6 +407,13 @@ async def run_one(
     total_cost = 0.0
     has_cost = False
     total_llm_duration_ms = 0
+    web_search_providers: set[str] = set()
+    web_search_requests = 0
+    web_search_successes = 0
+    web_search_failures = 0
+    web_search_result_count = 0
+    web_search_latency_ms = 0
+    web_search_error_categories: dict[str, int] = {}
     for c in calls:
         r = c.get("role", "?")
         calls_by_role[r] = calls_by_role.get(r, 0) + 1
@@ -423,6 +430,17 @@ async def run_one(
         if cost is not None:
             total_cost += cost
             has_cost = True
+        if c.get("web_search_provider") and (c.get("web_search_requests", 0) or 0):
+            web_search_providers.add(c["web_search_provider"])
+        web_search_requests += c.get("web_search_requests", 0) or 0
+        web_search_successes += c.get("web_search_successes", 0) or 0
+        web_search_failures += c.get("web_search_failures", 0) or 0
+        web_search_result_count += c.get("web_search_result_count", 0) or 0
+        web_search_latency_ms += c.get("web_search_latency_ms", 0) or 0
+        for category, count in (c.get("web_search_error_categories") or {}).items():
+            web_search_error_categories[category] = (
+                web_search_error_categories.get(category, 0) + count
+            )
 
     result["calls"] = calls
     # TODO: cost/token accounting needs an end-to-end audit before these are trusted.
@@ -444,6 +462,13 @@ async def run_one(
         "total_cache_read_input_tokens": total_cache_read,
         "total_tokens": total_input + total_output,
         "total_cost_usd": total_cost if has_cost else None,
+        "web_search_providers": sorted(web_search_providers),
+        "web_search_requests": web_search_requests,
+        "web_search_successes": web_search_successes,
+        "web_search_failures": web_search_failures,
+        "web_search_result_count": web_search_result_count,
+        "web_search_latency_ms": web_search_latency_ms,
+        "web_search_error_categories": web_search_error_categories,
     }
 
     # Carry over all problem metadata (id, category, expected, etc.)

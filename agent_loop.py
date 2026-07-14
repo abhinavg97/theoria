@@ -45,6 +45,29 @@ class AgentRunResult:
     pseudo_cmd: list[str]
 
 
+@dataclass
+class SearchResult:
+    text: str
+    provider: str
+    query: str
+    result_count: int
+    latency_ms: int
+    endpoint: str
+
+
+class SearchFailure(RuntimeError):
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+
+
 def pseudo_command(settings: dict) -> list[str]:
     endpoint = settings.get("endpoint") or settings.get("base_url") or DEFAULT_ENDPOINT
     return [
@@ -269,13 +292,20 @@ async def _run_shell(
     return combined, int(proc.returncode or 0)
 
 
-def _search_web(search_config: dict, query: str, *, max_results: int) -> str:
+def _search_web(search_config: dict, query: str, *, max_results: int) -> SearchResult:
+    started = time.perf_counter()
     provider = search_config.get("provider", "searxng")
     if provider != "searxng":
-        raise ValueError("only _web_search.provider: searxng is supported")
+        raise SearchFailure(
+            "invalid_config",
+            "only _web_search.provider: searxng is supported",
+        )
     endpoint = search_config.get("endpoint")
     if not endpoint:
-        raise ValueError("_web_search.endpoint is required for searxng")
+        raise SearchFailure(
+            "invalid_config",
+            "_web_search.endpoint is required for searxng",
+        )
     params = urllib.parse.urlencode({"q": query, "format": "json"})
     url = endpoint.rstrip("/") + "/search?" + params
     request = urllib.request.Request(url, headers={"User-Agent": "theoria-agent/0.1"})
@@ -284,18 +314,33 @@ def _search_web(search_config: dict, query: str, *, max_results: int) -> str:
             body = json.loads(response.read())
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode(errors="replace")
-        raise RuntimeError(f"web search failed with HTTP {exc.code}: {raw[:500]}") from exc
+        raise SearchFailure(
+            f"http_{exc.code}",
+            f"web search failed with HTTP {exc.code}: {raw[:500]}",
+            status_code=exc.code,
+        ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"web search failed: {exc}") from exc
+        raise SearchFailure("network_error", f"web search failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise SearchFailure("timeout", "web search timed out") from exc
 
     results = body.get("results") or []
     lines = []
-    for idx, result in enumerate(results[:max_results], 1):
+    limited = results[:max_results]
+    for idx, result in enumerate(limited, 1):
         title = result.get("title") or "(untitled)"
         url = result.get("url") or ""
         content = result.get("content") or result.get("snippet") or ""
         lines.append(f"{idx}. {title}\nURL: {url}\nSnippet: {content}")
-    return "\n\n".join(lines) if lines else "(no search results)"
+    latency_ms = int(round((time.perf_counter() - started) * 1000))
+    return SearchResult(
+        text="\n\n".join(lines) if lines else "(no search results)",
+        provider=provider,
+        query=query,
+        result_count=len(limited),
+        latency_ms=latency_ms,
+        endpoint=_redact_endpoint(str(endpoint)),
+    )
 
 
 def _tool_call_previews(events: list[dict], *, limit: int = 2000) -> list[dict]:
@@ -316,6 +361,8 @@ def _tool_call_previews(events: list[dict], *, limit: int = 2000) -> list[dict]:
             order.append(call_id)
         elif item.get("type") == "function_call_output" and call_id in calls:
             calls[call_id]["output"] = _truncate(str(item.get("output") or ""), limit)
+            if isinstance(item.get("metadata"), dict):
+                calls[call_id]["metadata"] = item["metadata"]
     return [calls[call_id] for call_id in order]
 
 
@@ -323,6 +370,21 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n...[TRUNCATED: {len(text) - limit} chars]"
+
+
+def _search_failure_category(exc: Exception) -> str:
+    category = getattr(exc, "category", None)
+    if category:
+        return str(category)
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, urllib.error.URLError):
+        return "network_error"
+    return type(exc).__name__
+
+
+def _increment_error_category(categories: dict[str, int], category: str) -> None:
+    categories[category] = categories.get(category, 0) + 1
 
 
 async def run_agent(
@@ -363,6 +425,16 @@ async def run_agent(
     stderr_lines: list[str] = []
     input_tokens = output_tokens = 0
     final_response: str | dict | None = None
+    search_provider = (
+        (search_config or {}).get("provider", "searxng")
+        if search_config else None
+    )
+    search_error_categories: dict[str, int] = {}
+    search_requests = 0
+    search_successes = 0
+    search_failures = 0
+    search_result_count = 0
+    search_latency_ms = 0
 
     for turn in range(max_turns):
         started = time.monotonic()
@@ -453,33 +525,90 @@ async def run_agent(
                 file=sys.stderr,
             )
 
+        tool_metadata: dict = {}
         try:
             if tool == "shell" and shell_enabled:
                 cmd = str(tool_input.get("cmd", ""))
                 if not cmd.strip():
                     result = "missing shell input field: cmd"
+                    tool_metadata = {"exit_code": 2}
                 else:
-                    result, _ = await _run_shell(
+                    result, exit_code = await _run_shell(
                         cmd,
                         container_id=container_id,
                         allow_host_tools=allow_host_tools,
                         timeout=tool_timeout,
                         output_limit=output_limit,
                     )
-            elif tool == "web_search" and search_enabled:
+                    tool_metadata = {"exit_code": exit_code}
+            elif tool == "web_search":
+                search_requests += 1
                 query = str(tool_input.get("query", ""))
-                if not query.strip():
+                tool_metadata = {
+                    "provider": search_provider,
+                    "query": query,
+                    "ok": False,
+                    "result_count": 0,
+                    "latency_ms": 0,
+                }
+                search_started = time.perf_counter()
+                if not search_enabled:
+                    category = "unavailable"
+                    search_failures += 1
+                    _increment_error_category(search_error_categories, category)
+                    tool_metadata["error_category"] = category
+                    result = f"tool {tool!r} is not available"
+                elif not query.strip():
+                    category = "missing_query"
+                    search_failures += 1
+                    _increment_error_category(search_error_categories, category)
+                    tool_metadata["error_category"] = category
                     result = "missing web_search input field: query"
                 else:
-                    result = await asyncio.to_thread(
-                        _search_web,
-                        search_config or {},
-                        query,
+                    search_result = await asyncio.to_thread(
+                        _search_web, search_config or {}, query,
                         max_results=max_search_results,
                     )
+                    if isinstance(search_result, SearchResult):
+                        result = search_result.text
+                        result_count = search_result.result_count
+                        latency = search_result.latency_ms
+                        provider = search_result.provider
+                        endpoint = search_result.endpoint
+                    else:
+                        # Tests and third-party monkeypatches may return a
+                        # plain string; keep that compatibility while still
+                        # marking the search as successful.
+                        result = str(search_result)
+                        result_count = 0
+                        latency = int(round((time.perf_counter() - search_started) * 1000))
+                        provider = search_provider
+                        endpoint = None
+                    search_successes += 1
+                    search_result_count += result_count
+                    search_latency_ms += latency
+                    tool_metadata.update({
+                        "provider": provider,
+                        "endpoint": endpoint,
+                        "ok": True,
+                        "result_count": result_count,
+                        "latency_ms": latency,
+                    })
             else:
                 result = f"tool {tool!r} is not available"
         except Exception as exc:
+            if tool == "web_search":
+                latency = int(round((time.perf_counter() - search_started) * 1000))
+                category = _search_failure_category(exc)
+                search_failures += 1
+                search_latency_ms += latency
+                _increment_error_category(search_error_categories, category)
+                tool_metadata.update({
+                    "ok": False,
+                    "latency_ms": latency,
+                    "error_category": category,
+                    "status_code": getattr(exc, "status_code", None),
+                })
             result = f"tool {tool!r} failed: {type(exc).__name__}: {exc}"
 
         events.append({
@@ -488,6 +617,7 @@ async def run_agent(
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": result,
+                "metadata": tool_metadata,
             },
         })
         messages.append({
@@ -511,6 +641,13 @@ async def run_agent(
         "provider_endpoint": _redact_endpoint(str(settings.get("endpoint") or settings.get("base_url") or DEFAULT_ENDPOINT)),
         "wire_api": "chat-completions",
         "search_enabled": search_enabled,
+        "web_search_provider": search_provider,
+        "web_search_requests": search_requests,
+        "web_search_successes": search_successes,
+        "web_search_failures": search_failures,
+        "web_search_result_count": search_result_count,
+        "web_search_latency_ms": search_latency_ms,
+        "web_search_error_categories": search_error_categories,
         "shell_enabled": shell_enabled,
         "role": role,
     }
