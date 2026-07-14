@@ -523,12 +523,16 @@ key = os.environ.get(env_name, "").strip()
 if not key:
     print(json.dumps({"ok": False, "category": "missing_credential", "status": None}))
     raise SystemExit(0)
-request = urllib.request.Request(
-    base.rstrip("/") + "/models",
-    headers={"Authorization": "Bearer " + key},
-    method="GET",
-)
 try:
+    key.encode("latin-1")
+    if any(ord(character) < 32 or ord(character) == 127 for character in key):
+        print(json.dumps({"ok": False, "category": "invalid_credential", "status": None}))
+        raise SystemExit(0)
+    request = urllib.request.Request(
+        base.rstrip("/") + "/models",
+        headers={"Authorization": "Bearer " + key},
+        method="GET",
+    )
     with urllib.request.urlopen(request, timeout=5) as response:
         status = getattr(response, "status", 200)
         print(json.dumps({
@@ -536,6 +540,8 @@ try:
             "category": "ok" if status == 200 else "http_error",
             "status": status,
         }))
+except ValueError:
+    print(json.dumps({"ok": False, "category": "invalid_credential", "status": None}))
 except urllib.error.HTTPError as exc:
     category = {
         401: "unauthorized", 403: "forbidden", 404: "not_found",
@@ -579,6 +585,20 @@ def azure_endpoint_probe_from_image(
     if not key or not key.strip():
         return provider_config.ProviderProbeResult(
             False, "missing_credential",
+        )
+    key = key.strip()
+    try:
+        key.encode("latin-1")
+    except UnicodeError:
+        return provider_config.ProviderProbeResult(
+            False, "invalid_credential",
+        )
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        for character in key
+    ):
+        return provider_config.ProviderProbeResult(
+            False, "invalid_credential",
         )
     endpoint = provider_config.normalize_azure_endpoint(endpoint)
     command = [

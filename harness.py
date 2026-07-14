@@ -287,6 +287,7 @@ def resolve_runtime(config: dict | None = None) -> dict:
     external_model_destinations: set[str] = set()
     external_model_credentials: set[str] = set()
     keyless_remote_model_destinations: set[str] = set()
+    concurrency_limits: dict[str, int] = {}
     has_external_access = bool(web_search)
 
     def add_destination(destination: dict) -> str:
@@ -317,6 +318,21 @@ def resolve_runtime(config: dict | None = None) -> dict:
             needs_codex = True
             plan = provider_config.resolve_codex_role(settings)
             spec = plan.provider
+            if (
+                plan.concurrency_key is not None
+                and spec.max_parallel is not None
+            ):
+                existing_limit = concurrency_limits.get(plan.concurrency_key)
+                if (
+                    existing_limit is not None
+                    and existing_limit != spec.max_parallel
+                ):
+                    raise ValueError(
+                        "roles sharing one provider/deployment concurrency "
+                        "key must use the same max_parallel "
+                        f"(got {existing_limit} and {spec.max_parallel})"
+                    )
+                concurrency_limits[plan.concurrency_key] = spec.max_parallel
             oss = spec.kind == "local"
             provider = spec.id
             endpoints = [spec.base_url] if spec.base_url else []

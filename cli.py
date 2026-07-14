@@ -547,6 +547,7 @@ def cmd_doctor(args) -> None:
                       "set the selected provider's base URL")
         azure_probe_hints = {
             "missing_credential": "set the configured Azure API-key environment variable",
+            "invalid_credential": "re-export the Azure API key as a single-line value",
             "unauthorized": "verify the Azure API key",
             "forbidden": "verify that the key can access this Azure resource",
             "not_found": "verify the Azure hostname and /openai/v1 endpoint path",

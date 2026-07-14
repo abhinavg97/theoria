@@ -40,6 +40,14 @@ CODEX_CONFIG_KEY = re.compile(
 )
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 AZURE_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com")
+CODEX_AZURE_URL_MARKERS = (
+    "openai.azure.",
+    "cognitiveservices.azure.",
+    "aoai.azure.",
+    "azure-api.",
+    "azurefd.",
+    "windows.net/openai",
+)
 AZURE_PROVIDER_FIELDS = {"kind", "endpoint", "api_key_env", "max_parallel"}
 SENSITIVE_CODEX_CONFIG_PARTS = {
     "api_key", "authorization", "bearer_token", "cookie", "credential",
@@ -159,14 +167,22 @@ def probe_azure_endpoint(
         return ProviderProbeResult(False, "missing_credential")
     key = key.strip()
     target = spec.base_url.rstrip("/") + "/models"
-    request = urllib.request.Request(
-        target, headers={"Authorization": f"Bearer {key}"}, method="GET",
-    )
     open_request = urllib.request.urlopen if opener is None else opener
     try:
+        key.encode("latin-1")
+        if any(
+            ord(character) < 32 or ord(character) == 127
+            for character in key
+        ):
+            return ProviderProbeResult(False, "invalid_credential")
+        request = urllib.request.Request(
+            target, headers={"Authorization": f"Bearer {key}"}, method="GET",
+        )
         with open_request(request, timeout=timeout) as response:
             status = getattr(response, "status", 200)
             return ProviderProbeResult(status == 200, "ok" if status == 200 else "http_error", status)
+    except ValueError:
+        return ProviderProbeResult(False, "invalid_credential")
     except urllib.error.HTTPError as exc:
         category = {
             401: "unauthorized",
@@ -532,6 +548,10 @@ def resolve_provider_spec(
     selected_wire_api = next((
         value for key, value in legacy_items if key == wire_key
     ), None)
+    name_key = f"model_providers.{provider_id}.name"
+    selected_name = next((
+        value for key, value in legacy_items if key == name_key
+    ), None)
     missing = sorted(set(refs) - set(explicit_env))
     if missing:
         raise ValueError(
@@ -541,9 +561,20 @@ def resolve_provider_spec(
     external = bool(
         provider_id != "openai" or base is not None or explicit_env
     )
-    azure = provider_id.lower() == "azure" or (
-        isinstance(base, str)
-        and (urlsplit(base).hostname or "").lower().endswith(AZURE_HOST_SUFFIXES)
+    base_lower = base.lower() if isinstance(base, str) else ""
+    azure = bool(
+        provider_id.lower() == "azure"
+        or (
+            isinstance(selected_name, str)
+            and selected_name.strip().lower() == "azure"
+        )
+        or (
+            isinstance(base, str)
+            and (urlsplit(base).hostname or "").lower().endswith(
+                AZURE_HOST_SUFFIXES
+            )
+        )
+        or any(marker in base_lower for marker in CODEX_AZURE_URL_MARKERS)
     )
     if azure:
         if base is None:
@@ -558,7 +589,6 @@ def resolve_provider_spec(
         # Codex 0.133 only recognizes arbitrary Azure hostname families by
         # exact provider name. Canonicalize legacy raw declarations too, so
         # services.ai.azure.com receives Azure's required `store: true` path.
-        name_key = f"model_providers.{provider_id}.name"
         legacy_items = [
             (key, "Azure" if key == name_key else value)
             for key, value in legacy_items
@@ -596,7 +626,7 @@ def resolve_provider_spec(
         # provider whose native search is deliberately opt-in because it can
         # cross the configured Azure data/compliance boundary.
         native_search_default=False if azure else True,
-        max_parallel=None,
+        max_parallel=4 if azure else None,
         codex_config_items=tuple(legacy_items),
     )
 

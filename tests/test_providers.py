@@ -192,8 +192,45 @@ def test_services_endpoint_and_legacy_raw_azure_are_canonicalized():
     }
     spec = providers.resolve_provider_spec(legacy)
     assert spec.kind == "azure_openai"
+    assert spec.max_parallel == 4
+    assert providers.resolve_codex_role(legacy).concurrency_key is not None
     assert ("model_providers.foundry.name", "Azure") in spec.codex_config_items
     assert ("model_providers.foundry.wire_api", "responses") in spec.codex_config_items
+
+
+def raw_named_provider(endpoint, *, name="Proxy"):
+    return {
+        "model": "deployment",
+        "codex_config": {
+            "model_provider": "proxy",
+            "model_providers.proxy.name": name,
+            "model_providers.proxy.base_url": endpoint,
+            "model_providers.proxy.env_key": "AZURE_OPENAI_API_KEY",
+            "model_providers.proxy.wire_api": "responses",
+        },
+        "provider_env": ["AZURE_OPENAI_API_KEY"],
+    }
+
+
+@pytest.mark.parametrize("name", ["Azure", "aZuRe"])
+def test_raw_exact_azure_display_name_cannot_bypass_endpoint_validation(name):
+    with pytest.raises(ValueError, match="supported Azure hostname"):
+        providers.resolve_provider_spec(raw_named_provider(
+            "https://proxy.example/openai/v1", name=name,
+        ))
+
+
+@pytest.mark.parametrize("endpoint", [
+    "https://resource.openai.azure.us/openai/v1",
+    "https://resource.cognitiveservices.azure.com/openai/v1",
+    "https://resource.aoai.azure.net/openai/v1",
+    "https://resource.azure-api.net/openai/v1",
+    "https://resource.azurefd.net/openai/v1",
+    "https://resource.windows.net/openai/v1",
+])
+def test_raw_codex_azure_url_markers_fail_closed(endpoint):
+    with pytest.raises(ValueError, match="supported Azure hostname"):
+        providers.resolve_provider_spec(raw_named_provider(endpoint))
 
 
 @pytest.mark.parametrize("endpoint", [
@@ -437,6 +474,24 @@ def test_local_gate_is_endpoint_scoped_across_models():
     assert first.concurrency_key == other.concurrency_key
 
 
+def test_runtime_rejects_conflicting_limits_for_same_azure_deployment():
+    first = azure_settings(provider={
+        "kind": "azure_openai",
+        "endpoint": AZURE_ENDPOINT,
+        "api_key_env": "AZURE_OPENAI_API_KEY",
+        "max_parallel": 2,
+    })
+    second = azure_settings(provider={
+        "kind": "azure_openai",
+        "endpoint": AZURE_ENDPOINT,
+        "api_key_env": "AZURE_OPENAI_API_KEY",
+        "max_parallel": 5,
+    })
+
+    with pytest.raises(ValueError, match="same max_parallel"):
+        harness.resolve_runtime({"solver": first, "citation": second})
+
+
 class Response:
     status = 200
 
@@ -464,6 +519,22 @@ def test_authenticated_azure_probe_uses_models_and_bearer_without_query():
     assert result == providers.ProviderProbeResult(True, "ok", 200)
     assert captured["request"].full_url == AZURE_ENDPOINT + "/models"
     assert captured["request"].get_header("Authorization") == "Bearer test-secret"
+    assert "test-secret" not in repr(result)
+
+
+def test_authenticated_azure_probe_rejects_invalid_header_without_network():
+    def opener(*_args, **_kwargs):
+        raise AssertionError("invalid credential reached the network opener")
+
+    result = providers.probe_azure_endpoint(
+        providers.resolve_provider_spec(azure_settings()),
+        environ={"AZURE_OPENAI_API_KEY": "test-secret\ninjected"},
+        opener=opener,
+    )
+
+    assert result == providers.ProviderProbeResult(
+        False, "invalid_credential",
+    )
     assert "test-secret" not in repr(result)
 
 
@@ -532,3 +603,20 @@ def test_docker_azure_probe_missing_env_does_not_spawn(monkeypatch):
         "sandbox:test", AZURE_ENDPOINT, "AZURE_OPENAI_API_KEY",
     )
     assert result.category == "missing_credential"
+
+
+def test_docker_azure_probe_invalid_header_does_not_spawn(monkeypatch):
+    monkeypatch.setenv(
+        "AZURE_OPENAI_API_KEY", "test-secret\ninjected",
+    )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("docker probe spawned with an invalid credential")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", unexpected)
+    result = sandbox.azure_endpoint_probe_from_image(
+        "sandbox:test", AZURE_ENDPOINT, "AZURE_OPENAI_API_KEY",
+    )
+    assert result == providers.ProviderProbeResult(
+        False, "invalid_credential",
+    )
