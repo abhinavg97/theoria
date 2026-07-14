@@ -977,6 +977,30 @@ def test_resume_cache_identity_ignores_watch_mode():
     assert _cache_identity(watch=False) == _cache_identity(watch=True)
 
 
+def test_resume_cache_identity_omits_absent_web_search(monkeypatch):
+    hashed_invocations = []
+    original = llm._json_sha256
+
+    def capture(value):
+        if isinstance(value, dict) and "schema_retries" in value:
+            hashed_invocations.append(dict(value))
+        return original(value)
+
+    monkeypatch.setattr(llm, "_json_sha256", capture)
+
+    _cache_identity()
+    _cache_identity(web_search={
+        "provider": "brave",
+        "api_key_env": "BRAVE_API_KEY",
+    })
+
+    assert "web_search" not in hashed_invocations[0]
+    assert hashed_invocations[1]["web_search"] == {
+        "provider": "brave",
+        "api_key_env": "BRAVE_API_KEY",
+    }
+
+
 def test_resume_cache_identity_refuses_legacy_artifacts(tmp_path):
     call_dir = tmp_path / "call_000_solver"
     call_dir.mkdir()

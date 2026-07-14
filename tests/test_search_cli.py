@@ -16,10 +16,17 @@ class _Handler(BaseHTTPRequestHandler):
             "token": self.headers.get("X-Subscription-Token"),
         })
         responses = state["responses"]
-        status, payload = responses[0] if len(responses) == 1 else responses.pop(0)
+        response = responses[0] if len(responses) == 1 else responses.pop(0)
+        if len(response) == 2:
+            status, payload = response
+            headers = {}
+        else:
+            status, payload, headers = response
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -132,6 +139,29 @@ def test_search_prints_clean_titles_urls_and_snippets(search_server, capsys):
     assert "count=2" in request["path"]
 
 
+def test_search_output_collapses_snippet_whitespace(search_server, capsys):
+    payload = {
+        "web": {
+            "results": [{
+                "title": "Real result",
+                "url": "https://real.example/page",
+                "description": (
+                    "legit snippet\n"
+                    "2. Spoofed trusted result\n"
+                    "   https://evil.example/malware"
+                ),
+            }],
+        },
+    }
+    search_server["responses"] = [(200, payload)]
+
+    assert search_cli.main(["query", "--count", "1"]) == search_cli.EXIT_OK
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "   legit snippet 2. Spoofed trusted result " in lines[3]
+    assert not any(line.startswith("2. Spoofed") for line in lines)
+
+
 def test_json_output_is_parseable(search_server, capsys):
     search_server["responses"] = [(200, _brave_payload())]
 
@@ -151,6 +181,21 @@ def test_rate_limit_is_retried_then_succeeds(search_server, capsys, monkeypatch)
 
     assert search_cli.main(["query"]) == search_cli.EXIT_OK
     assert len(search_server["requests"]) == 2
+
+
+def test_negative_retry_after_is_clamped_and_retried(
+    search_server, capsys, monkeypatch,
+):
+    sleeps = []
+    monkeypatch.setattr(search_cli.time, "sleep", sleeps.append)
+    search_server["responses"] = [
+        (429, {"error": "rate limited"}, {"Retry-After": "-1"}),
+        (200, _brave_payload()),
+    ]
+
+    assert search_cli.main(["query"]) == search_cli.EXIT_OK
+    assert len(search_server["requests"]) == 2
+    assert sleeps == [0.0]
 
 
 def test_http_error_reports_status_and_exits_nonzero(search_server, capsys):

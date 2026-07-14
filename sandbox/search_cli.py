@@ -72,13 +72,15 @@ EXIT_HTTP = 4
 
 _TAG = re.compile(r"<[^>]+>")
 _CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_SPACE = re.compile(r"\s+")
 
 
 def _clean(text) -> str:
     """Strip HTML tags/entities and control chars from API-provided text."""
     if not isinstance(text, str):
         return ""
-    return _CTRL.sub("", html.unescape(_TAG.sub("", text))).strip()
+    cleaned = _CTRL.sub("", html.unescape(_TAG.sub("", text)))
+    return _SPACE.sub(" ", cleaned).strip()
 
 
 def _provider() -> str:
@@ -159,7 +161,7 @@ def _fetch(provider: str, query: str, count: int, offset: int,
             if error.code in RETRYABLE_STATUSES and attempts <= RETRY_MAX:
                 retry_after = error.headers.get("Retry-After")
                 try:
-                    delay = min(float(retry_after), 30.0)
+                    delay = min(max(float(retry_after), 0.0), 30.0)
                 except (TypeError, ValueError):
                     delay = RETRY_DELAY_SECS
                 time.sleep(delay)

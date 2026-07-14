@@ -1399,14 +1399,15 @@ def _call_cache_identity(
             "codex_config": sorted(
                 _codex_config_items(settings), key=lambda item: item[0]
             ),
+            "schema_retries": settings.get("schema_retries", 0),
+        }
+        if web_search:
             # The normalized run-level shell-search declaration contains
             # only provider, endpoint, and environment-variable names. It
             # must participate in resume identity because changing search
             # backends changes the tools and external data source available
             # to an otherwise identical model invocation.
-            "web_search": web_search or None,
-            "schema_retries": settings.get("schema_retries", 0),
-        }
+            invocation_settings["web_search"] = web_search
         provider = _codex_provider(settings)
     else:
         effective_model = settings.get("model")
