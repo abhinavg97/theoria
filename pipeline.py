@@ -78,7 +78,12 @@ VERDICT_SCHEMA = {
 def _formalizer_decision_schema() -> dict:
     """Wrap the proof schema in the formalizer's action/reject_reason
     envelope: the formalizer either returns a proof or rejects the
-    solution with a reason for the solver."""
+    solution with a reason for the solver.
+
+    The schema only requires the discriminator. Requiring both proof and
+    reject_reason for every action is stricter than the pipeline needs and
+    causes smaller OSS models to reject otherwise valid proof responses.
+    """
     return {
         "type": "object",
         "properties": {
@@ -86,7 +91,7 @@ def _formalizer_decision_schema() -> dict:
             "proof": PROOF_SCHEMA,
             "reject_reason": {"type": "string"},
         },
-        "required": ["action", "proof", "reject_reason"],
+        "required": ["action"],
     }
 
 # The pedantry filter's decision on a single failed verdict.

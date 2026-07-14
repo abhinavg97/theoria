@@ -74,10 +74,10 @@ formalizer:
 
     - action="proof": Produce a formal proof for the solution (see
       proof format below). This is the default — start by trying to
-      formalize.
+      formalize. Include the proof field.
     - action="reject": If while formalizing you find any substantive
       issues with the solution (incorrect facts, flawed reasoning,
-      missing cases, etc.), reject the solution and set reject_reason
+      missing cases, etc.), reject the solution and include reject_reason
       to explain what's wrong; the solver will get this and retry.
 
     A proof is a sequence of states. Each state is a list of strings.

@@ -1,4 +1,5 @@
 import pipeline
+from jsonschema import validate
 from pipeline import (
     Proof,
     Step,
@@ -92,3 +93,13 @@ def test_limits_read_from_config_when_present(monkeypatch):
 
     assert max_verify_attempts() == 5
     assert max_solver_answers() == 1
+
+
+def test_formalizer_schema_accepts_proof_without_reject_reason():
+    validate({
+        "action": "proof",
+        "proof": {
+            "initial_state": ["ANSWER"],
+            "steps": [],
+        },
+    }, pipeline._formalizer_decision_schema())
