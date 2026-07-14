@@ -407,7 +407,7 @@ def start_sandbox(
     name = f"theoria-{run_id}-{safe_pid}"[:128]
 
     cmd = [
-        "docker", "run", "-d", "--rm",
+        "docker", "run", "-d", "--rm", "--pull=never",
         "--name", name,
         *network_args,
         "--tmpfs", "/home/node:rw,exec,nosuid,size=512m,uid=1000,gid=1000,mode=0700",
@@ -486,7 +486,8 @@ def command_in_image(
     try:
         r = subprocess.run(
             [
-                "docker", "run", "--rm", *(extra_docker_args or []),
+                "docker", "run", "--rm", "--pull=never",
+                *(extra_docker_args or []),
                 "--entrypoint", argv[0], image, *argv[1:],
             ],
             capture_output=True, text=True, timeout=30,
@@ -518,6 +519,10 @@ import sys
 import urllib.error
 import urllib.request
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 base, env_name = sys.argv[1], sys.argv[2]
 key = os.environ.get(env_name, "")
 if not key or not key.strip():
@@ -536,7 +541,8 @@ try:
         headers={"Authorization": "Bearer " + key},
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    with opener.open(request, timeout=5) as response:
         status = getattr(response, "status", 200)
         print(json.dumps({
             "ok": status == 200,
@@ -608,7 +614,7 @@ def azure_endpoint_probe_from_image(
         )
     endpoint = provider_config.normalize_azure_endpoint(endpoint)
     command = [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "--pull=never",
         "--env", credential_env,
         "--entrypoint", "python3",
         image, "-c", _AZURE_PROBE_SCRIPT, endpoint, credential_env,

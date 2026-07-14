@@ -68,6 +68,49 @@ def test_doctor_reports_malformed_azure_endpoint_without_traceback(
     assert "Traceback" not in output.out + output.err
 
 
+def test_doctor_validates_local_image_before_credentialed_probe(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(cli.harness, "load_config", lambda _: {
+        "solver": azure_settings(),
+    })
+    monkeypatch.setattr(
+        cli.shutil, "which",
+        lambda binary: "/usr/bin/docker" if binary == "docker" else None,
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+        ),
+    )
+    monkeypatch.setattr(cli.sandbox, "image_digest", lambda _image: None)
+
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("credentialed probe ran without a local image")
+
+    monkeypatch.setattr(
+        cli.sandbox, "azure_endpoint_probe_from_image", unexpected_probe,
+    )
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-secret")
+    args = SimpleNamespace(
+        config=["ignored.yaml"],
+        codex_model=None,
+        docker=True,
+        image="missing:test",
+        check_endpoint=True,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.cmd_doctor(args)
+
+    output = capsys.readouterr().out
+    assert exit_info.value.code == 1
+    assert "image missing:test" in output
+    assert "Azure endpoint/auth reachable" not in output
+
+
 def config_values(command):
     return [
         command[index + 1]
@@ -559,6 +602,37 @@ def test_authenticated_azure_probe_uses_models_and_bearer_without_query():
     assert "test-secret" not in repr(result)
 
 
+def test_authenticated_azure_probe_does_not_follow_redirect(monkeypatch):
+    captured = {}
+
+    class RedirectResponse:
+        def open(self, request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            raise urllib.error.HTTPError(
+                request.full_url, 302, "Found",
+                {"Location": "https://attacker.example/models"}, None,
+            )
+
+    def build_opener(handler):
+        captured["handler"] = handler
+        return RedirectResponse()
+
+    monkeypatch.setattr(providers.urllib.request, "build_opener", build_opener)
+    result = providers.probe_azure_endpoint(
+        providers.resolve_provider_spec(azure_settings()),
+        environ={"AZURE_OPENAI_API_KEY": "test-secret"},
+    )
+
+    assert isinstance(captured["handler"], providers._NoRedirectHandler)
+    assert captured["handler"].redirect_request(
+        None, None, 302, "Found", {}, "https://attacker.example/models",
+    ) is None
+    assert result == providers.ProviderProbeResult(
+        False, "http_error", 302,
+    )
+
+
 @pytest.mark.parametrize("key", [
     " test-secret",
     "test-secret ",
@@ -636,7 +710,11 @@ def test_docker_azure_probe_passes_only_env_name_and_never_secret(monkeypatch):
 
     assert result == providers.ProviderProbeResult(True, "ok", 200)
     command = captured["command"]
+    assert "--pull=never" in command
     assert command[command.index("--env") + 1] == "AZURE_OPENAI_API_KEY"
+    probe_script = command[command.index("-c") + 1]
+    assert "NoRedirectHandler" in probe_script
+    assert "build_opener(NoRedirectHandler())" in probe_script
     assert "AZURE_OPENAI_API_KEY=" not in repr(command)
     assert sentinel not in repr(command)
     assert sentinel not in captured["result"].stdout

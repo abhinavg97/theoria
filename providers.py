@@ -142,6 +142,13 @@ class ProviderProbeResult:
     status: int | None = None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep an Azure bearer token on its already-validated origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def probe_azure_endpoint(
     spec: ProviderSpec,
     *,
@@ -168,7 +175,10 @@ def probe_azure_endpoint(
     if key != key.strip():
         return ProviderProbeResult(False, "invalid_credential")
     target = spec.base_url.rstrip("/") + "/models"
-    open_request = urllib.request.urlopen if opener is None else opener
+    open_request = (
+        urllib.request.build_opener(_NoRedirectHandler()).open
+        if opener is None else opener
+    )
     try:
         key.encode("latin-1")
         if any(

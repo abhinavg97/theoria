@@ -529,7 +529,32 @@ def cmd_doctor(args) -> None:
             "compliance boundary; verify your organization's policy"
         )
 
-    if args.check_endpoint:
+    # Validate the local image before any Docker endpoint probe. In
+    # particular, an Azure probe forwards a credential by environment name;
+    # it must never cause Docker to pull or execute an unvalidated image.
+    docker_ok = False
+    daemon_ok = False
+    present = False
+    if args.docker:
+        docker_ok = shutil.which("docker") is not None
+        if docker_ok:
+            try:
+                daemon_ok = subprocess.run(
+                    ["docker", "info"], capture_output=True, timeout=15
+                ).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                daemon_ok = False
+        check("Docker installed", docker_ok, "install Docker Desktop")
+        check("Docker daemon running", daemon_ok, "start Docker")
+
+        # Use the SAME detection the run path uses (docker images -q), which
+        # works on containerd-backed daemons where `docker image inspect`
+        # fails for locally-built tags.
+        present = bool(daemon_ok and sandbox.image_digest(args.image))
+        check(f"image {args.image}", present,
+              f"theoria build  (or build/tag {args.image})")
+
+    if args.check_endpoint and (not args.docker or present):
         endpoint_groups = {}
         for role in provider_roles:
             plan = codex_role_plans[role]
@@ -625,25 +650,7 @@ def cmd_doctor(args) -> None:
             check(f"{web_search['provider']} search API reachable",
                   search_reachable, hint)
 
-    daemon_ok = False
     if args.docker:
-        docker_ok = shutil.which("docker") is not None
-        if docker_ok:
-            try:
-                daemon_ok = subprocess.run(
-                    ["docker", "info"], capture_output=True, timeout=15
-                ).returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                daemon_ok = False
-        check("Docker installed", docker_ok, "install Docker Desktop")
-        check("Docker daemon running", daemon_ok, "start Docker")
-
-        # Use the SAME detection the run path uses (docker images -q), which
-        # works on containerd-backed daemons where `docker image inspect`
-        # fails for locally-built tags.
-        present = bool(daemon_ok and sandbox.image_digest(args.image))
-        check(f"image {args.image}", present,
-              f"theoria build  (or build/tag {args.image})")
         if present:
             if claude_roles:
                 version = sandbox.command_in_image(

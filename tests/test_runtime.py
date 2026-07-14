@@ -451,6 +451,7 @@ def test_start_sandbox_forwards_env_name_and_linux_gateway(monkeypatch, tmp_path
 
     command = captured[0]
     assert container_id == "container-id"
+    assert "--pull=never" in command
     assert "--add-host=host.docker.internal:host-gateway" in command
     assert command[command.index("-e") + 1] == "MODEL_API_KEY"
     assert "secret" not in command
@@ -492,6 +493,7 @@ def test_container_capability_and_endpoint_checks_use_selected_image(monkeypatch
     )
 
     endpoint_command = commands[-1]
+    assert "--pull=never" in endpoint_command
     assert "--add-host=host.docker.internal:host-gateway" in endpoint_command
     assert "http://host.docker.internal:11434/v1/models" in endpoint_command
 
