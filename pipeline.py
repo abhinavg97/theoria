@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from jsonschema import ValidationError, validate
 
 # ── Models ──────────────────────────────────────────────────────
 
@@ -118,6 +119,16 @@ def _formalizer_decision_feedback(decision: dict) -> str | None:
             "complete proof object, or {\"action\":\"reject\","
             "\"reject_reason\": ...}."
         )
+    if action == "proof":
+        try:
+            validate(decision["proof"], PROOF_SCHEMA)
+        except ValidationError as exc:
+            return (
+                "Your previous response chose action='proof' but the 'proof' "
+                f"object did not match the required schema: {exc.message}. "
+                "Reply again with exactly one JSON decision containing either "
+                "a complete proof object or a reject_reason."
+            )
     if action == "reject":
         reason = decision.get("reject_reason")
         if not isinstance(reason, str) or not reason.strip():

@@ -158,6 +158,10 @@ def test_formalizer_decision_feedback_reports_missing_action_fields():
     assert "omitted the required 'proof' object" in _formalizer_decision_feedback({
         "action": "proof",
     })
+    assert "did not match the required schema" in _formalizer_decision_feedback({
+        "action": "proof",
+        "proof": {},
+    })
     assert "reject_reason" in _formalizer_decision_feedback({
         "action": "reject",
     })
