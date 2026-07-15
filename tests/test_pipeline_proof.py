@@ -1,3 +1,5 @@
+import asyncio
+
 import pipeline
 from jsonschema import validate
 from pipeline import (
@@ -6,6 +8,7 @@ from pipeline import (
     Verdict,
     _format_failed_verdicts,
     _format_proof,
+    _formalizer_decision_feedback,
     _proof_from_dict,
     _proof_to_dict,
     max_solver_answers,
@@ -103,3 +106,58 @@ def test_formalizer_schema_accepts_proof_without_reject_reason():
             "steps": [],
         },
     }, pipeline._formalizer_decision_schema())
+
+
+def test_formalizer_missing_proof_is_reprompted(monkeypatch):
+    calls = []
+
+    proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": ["42"],
+            "justification_type": "computation",
+            "justification": "6 * 7 = 42",
+        }],
+    }
+
+    async def fake_llm(
+        prompt,
+        *,
+        role="solver",
+        schema=None,
+        system=None,
+        resume=None,
+    ):
+        calls.append({"role": role, "prompt": prompt, "resume": resume})
+        if role == "solver":
+            return "6 * 7 = 42", "solver-session"
+        if role == "formalizer":
+            formalizer_calls = [c for c in calls if c["role"] == "formalizer"]
+            if len(formalizer_calls) == 1:
+                return {"action": "proof"}, "formalizer-session"
+            assert resume == "formalizer-session"
+            assert "omitted the required 'proof' object" in prompt
+            return {"action": "proof", "proof": proof}, "formalizer-session"
+        if role in {"initial_state", "computation"}:
+            return {"accepted": True, "reason": "ok"}, None
+        raise AssertionError(f"unexpected role {role}")
+
+    monkeypatch.setattr(pipeline, "llm", fake_llm)
+
+    result = asyncio.run(pipeline.run("Compute 6*7."))
+
+    assert result["verified"] is True
+    assert result["answer"] == "42"
+    assert result["attempts"][0]["phase"] == "formalizer_invalid"
+    assert result["attempts"][0]["decision"] == {"action": "proof"}
+    assert result["attempts"][1]["phase"] == "verify"
+    assert [c["role"] for c in calls].count("formalizer") == 2
+
+
+def test_formalizer_decision_feedback_reports_missing_action_fields():
+    assert "omitted the required 'proof' object" in _formalizer_decision_feedback({
+        "action": "proof",
+    })
+    assert "reject_reason" in _formalizer_decision_feedback({
+        "action": "reject",
+    })
