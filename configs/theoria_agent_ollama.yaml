@@ -1,0 +1,21 @@
+_theoria_agent: &theoria_agent
+  backend: theoria_agent
+  model: qwen3:8b
+  endpoint: http://localhost:11434/v1
+  max_turns: 12
+  max_tokens: 4096
+  temperature: 0
+  allow_shell: true
+  allow_host_tools: false
+  tool_timeout: 120
+  tool_output_chars: 12000
+
+solver: { <<: *theoria_agent }
+interpreter: { <<: *theoria_agent }
+formalizer: { <<: *theoria_agent }
+citation: { <<: *theoria_agent }
+problem_given: { <<: *theoria_agent }
+computation: { <<: *theoria_agent }
+pedantry: { <<: *theoria_agent }
+convention_lift: { <<: *theoria_agent }
+initial_state: { <<: *theoria_agent }

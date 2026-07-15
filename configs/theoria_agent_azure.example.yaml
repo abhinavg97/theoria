@@ -1,0 +1,27 @@
+_theoria_agent: &theoria_agent
+  backend: theoria_agent
+  # Azure deployment name, not the catalog model name.
+  model: YOUR_AZURE_DEPLOYMENT
+  # Examples:
+  #   https://YOUR_RESOURCE.openai.azure.com/openai/v1
+  #   https://YOUR_RESOURCE.services.ai.azure.com/openai/v1
+  endpoint: https://YOUR_RESOURCE.openai.azure.com/openai/v1
+  api_key_env: AZURE_OPENAI_API_KEY
+  auth_header: api-key
+  max_turns: 12
+  max_tokens: 4096
+  temperature: 0
+  allow_shell: true
+  allow_host_tools: false
+  tool_timeout: 120
+  tool_output_chars: 12000
+
+solver: { <<: *theoria_agent }
+interpreter: { <<: *theoria_agent }
+formalizer: { <<: *theoria_agent }
+citation: { <<: *theoria_agent }
+problem_given: { <<: *theoria_agent }
+computation: { <<: *theoria_agent }
+pedantry: { <<: *theoria_agent }
+convention_lift: { <<: *theoria_agent }
+initial_state: { <<: *theoria_agent }

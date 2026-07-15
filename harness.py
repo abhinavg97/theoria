@@ -164,11 +164,11 @@ def update_artifact_root_meta(root: str, updates: dict) -> None:
 
 def apply_args(args) -> None:
     """Load config and apply the backend + --codex-model overrides from the
-    args namespace (cli.py sets args.backend to "codex" — the audited setup).
+    args namespace.
 
-    The formalizer always stays on claude — it needs session resume +
-    structured output, which only claude supports together. Override with
-    an explicit config that sets formalizer.backend if you really want.
+    The audited Codex preset keeps the formalizer on Claude. Non-Codex
+    backends are experimental and should cover all roles so experiments use a
+    single agentic loop unless a config explicitly says otherwise.
 
     --codex-model is applied after the backend, so it overrides the model
     for any role currently on codex (regardless of how it got there).
@@ -177,10 +177,11 @@ def apply_args(args) -> None:
     # Role entries are dicts; top-level keys prefixed with "_" hold
     # shared values (e.g. `_preamble`) and must not be treated as roles.
     if args.backend:
+        pin_formalizer_to_claude = args.backend == "codex"
         for role, settings in CONFIG.items():
             if role.startswith("_") or not isinstance(settings, dict):
                 continue
-            if role == "formalizer":
+            if role == "formalizer" and pin_formalizer_to_claude:
                 continue
             settings["backend"] = args.backend
     if args.codex_model:
@@ -193,6 +194,16 @@ def apply_args(args) -> None:
     # Pulled in run_problems; expose here so runners don't need to thread it.
     _args_ref["docker"] = bool(getattr(args, "docker", False))
     _args_ref["image"] = getattr(args, "image", None) or sbx.DEFAULT_IMAGE
+
+
+def config_uses_backend(backend: str) -> bool:
+    """Return whether any configured role resolves to the given backend."""
+    for role, settings in CONFIG.items():
+        if role.startswith("_") or not isinstance(settings, dict):
+            continue
+        if settings.get("backend", "claude") == backend:
+            return True
+    return False
 
 
 # Parsed-args-holder so run_problems() can read --docker without
@@ -499,14 +510,16 @@ async def run_problems(
         run_id = run_id[:-5]
 
     if use_docker:
-        claude_creds_path = sbx.refresh_claude_credentials()
-        claude_config_path = sbx.prepare_claude_config()
+        needs_claude = config_uses_backend("claude")
+        if needs_claude:
+            claude_creds_path = sbx.refresh_claude_credentials()
+            claude_config_path = sbx.prepare_claude_config()
         image_digest = sbx.image_digest(sandbox_image)
         print(f"Docker mode: image={sandbox_image} "
               f"image_digest={image_digest} "
               f"creds={'present' if claude_creds_path else 'MISSING'} "
               f"config_snapshot={'present' if claude_config_path else 'MISSING'}")
-        if claude_creds_path is None:
+        if needs_claude and claude_creds_path is None:
             raise RuntimeError(
                 "Docker mode requested but could not read Claude credentials "
                 "from the macOS Keychain (not logged in, or not on macOS). "
@@ -520,7 +533,7 @@ async def run_problems(
                 f"not available locally. Build it first with the "
                 f"appropriate Dockerfile (see sandbox/ or sandbox-sage/)."
             )
-        if claude_config_path is None:
+        if needs_claude and claude_config_path is None:
             raise RuntimeError(
                 "Docker mode requested but could not snapshot "
                 "~/.claude.json (file missing or repeatedly corrupted "
