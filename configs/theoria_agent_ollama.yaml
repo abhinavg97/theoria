@@ -1,6 +1,7 @@
 _theoria_agent: &theoria_agent
   backend: theoria_agent
   model: qwen3:8b
+  model_source: ollama
   endpoint: http://localhost:11434/v1
   max_turns: 12
   max_tokens: 4096

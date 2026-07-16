@@ -23,6 +23,7 @@ import shlex
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 
@@ -135,6 +136,23 @@ class WatchdogKilled(RuntimeError):
     can treat it as a transient failure (codex CLI hang on a specific
     HTTP connection) rather than a real error."""
     pass
+
+
+class ProviderProcessError(RuntimeError):
+    """A streamed provider failure carrying output needed for artifacts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_stdout: bytes,
+        raw_stderr: bytes,
+        events: list[dict],
+    ) -> None:
+        super().__init__(message)
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
+        self.events = events
 
 
 async def _find_subprocess_pid(
@@ -393,6 +411,7 @@ def _extract_claude_metadata(result_event: dict) -> dict:
     usage = result_event.get("usage") or {}
     server_tools = usage.get("server_tool_use") or {}
     return {
+        "usage_reported": bool(usage),
         "input_tokens": usage.get("input_tokens", 0),
         "output_tokens": usage.get("output_tokens", 0),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
@@ -416,14 +435,17 @@ def _extract_codex_metadata(events: list) -> dict:
     input_tokens = 0
     output_tokens = 0
     cached_input_tokens = 0
+    usage_reported = False
     for event in events:
         if event.get("type") != "turn.completed":
             continue
         usage = event.get("usage") or {}
+        usage_reported = usage_reported or bool(usage)
         input_tokens += usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("output_tokens", 0) or 0
         cached_input_tokens += usage.get("cached_input_tokens", 0) or 0
     return {
+        "usage_reported": usage_reported,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_input_tokens": cached_input_tokens,
@@ -504,7 +526,34 @@ def _extract_codex_tool_calls(events: list, *, truncate: bool = True) -> list:
             calls[cid]["output"] = _maybe_truncate(
                 item.get("output"), TOOL_CALL_OUTPUT_LIMIT, truncate=truncate,
             )
+            if isinstance(item.get("metadata"), dict):
+                calls[cid]["metadata"] = item["metadata"]
     return [calls[cid] for cid in order]
+
+
+def _metadata_from_events(backend: str, events: list[dict]) -> dict:
+    """Best-effort usage and tool metadata for a completed or failed attempt."""
+    if not events:
+        return {}
+    try:
+        if backend == "claude":
+            result_event = next(
+                (event for event in reversed(events)
+                 if event.get("type") == "result"),
+                None,
+            )
+            metadata = (
+                _extract_claude_metadata(result_event) if result_event else {}
+            )
+            metadata["tool_calls"] = _extract_claude_tool_calls(events)
+            return metadata
+        if backend in {"codex", "theoria_agent"}:
+            metadata = _extract_codex_metadata(events)
+            metadata["tool_calls"] = _extract_codex_tool_calls(events)
+            return metadata
+    except Exception:
+        return {}
+    return {}
 
 
 # ── Failure diagnostics ─────────────────────────────────────────
@@ -699,7 +748,12 @@ async def _run_claude_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("claude", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("claude", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if result_event is None:
         raise RuntimeError("claude stream ended without result event")
@@ -932,7 +986,12 @@ async def _run_codex_streaming(proc, schema, *, last_event_ref=None):
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
-        raise RuntimeError(_format_failure("codex", proc.returncode, stderr))
+        raise ProviderProcessError(
+            _format_failure("codex", proc.returncode, stderr, raw_stdout),
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     if last_message_text is None:
         raise RuntimeError("codex stream ended without agent message")
@@ -962,6 +1021,45 @@ def _add_additional_properties(schema):
                 else:
                     out[key] = {k: _add_additional_properties(v) for k, v in val.items()}
     return out
+
+
+def effective_settings(
+    settings: dict | None,
+    *,
+    web_search_config: dict | None = None,
+) -> dict:
+    """Return the exact role settings used by :func:`llm`.
+
+    Keeping backend defaults in one non-mutating resolver makes run manifests
+    and provider calls agree.  Previously ``llm`` applied defaults in place
+    after run metadata had already been written, so omitted values appeared as
+    null in the audit record even though concrete values were sent.
+    """
+    resolved = dict(settings or {})
+    backend = resolved.get("backend", "claude")
+    if backend == "codex":
+        resolved.setdefault("model", "gpt-5.5")
+        resolved.setdefault("effort", "xhigh")
+        resolved.setdefault("sandbox", "read-only")
+        resolved.setdefault("search", True)
+    elif backend == "claude":
+        resolved.setdefault("model", "opus")
+        resolved.setdefault("effort", "max")
+    elif backend == "theoria_agent":
+        resolved.setdefault("model", "qwen3:4b")
+        resolved.setdefault("endpoint", agent_loop.DEFAULT_ENDPOINT)
+        resolved.setdefault("allow_shell", True)
+        resolved.setdefault("allow_host_tools", False)
+        resolved.setdefault("search", bool(web_search_config))
+        resolved.setdefault("max_turns", agent_loop.DEFAULT_MAX_TURNS)
+        resolved.setdefault("tool_timeout", agent_loop.DEFAULT_TOOL_TIMEOUT_SECS)
+        resolved.setdefault(
+            "tool_output_chars", agent_loop.DEFAULT_TOOL_OUTPUT_CHARS,
+        )
+        resolved.setdefault("search_results", agent_loop.DEFAULT_SEARCH_RESULTS)
+        resolved.setdefault("request_timeout", 180)
+        resolved.setdefault("max_retries", 3)
+    return resolved
 
 
 # ── Main entry point ────────────────────────────────────────────
@@ -998,24 +1096,11 @@ async def llm(
     The call_log entry keeps its existing truncated fields as previews;
     full source of truth is the files on disk.
     """
-    settings = config.get(role, {})
+    settings = effective_settings(
+        config.get(role, {}),
+        web_search_config=config.get("_web_search"),
+    )
     backend = settings.get("backend", "claude")
-
-    # Apply backend-specific defaults (config values take precedence)
-    if backend == "codex":
-        settings.setdefault("model", "gpt-5.5")
-        settings.setdefault("effort", "xhigh")
-        settings.setdefault("sandbox", "read-only")
-        settings.setdefault("search", True)
-    elif backend == "claude":
-        settings.setdefault("model", "opus")
-        settings.setdefault("effort", "max")
-    elif backend == "theoria_agent":
-        settings.setdefault("model", "qwen3:4b")
-        settings.setdefault("endpoint", agent_loop.DEFAULT_ENDPOINT)
-        settings.setdefault("allow_shell", True)
-        settings.setdefault("allow_host_tools", False)
-        settings.setdefault("search", bool(config.get("_web_search")))
 
     # ── Reserve a slot in the call log ───────────────────────────
     #
@@ -1085,6 +1170,13 @@ async def llm(
     events: list[dict] = []
     cmd: list[str] = []
     returncode: int | None = None
+    provider_meta: dict = {}
+    session_id: str | None = None
+    attempt_records: list[dict] = []
+    retry_count = 0
+    agent_messages: list[dict] | None = None
+    call_started_at = _utc_now_iso()
+    call_started_perf = time.perf_counter()
     try:
         # Build command
         if backend == "theoria_agent":
@@ -1161,21 +1253,63 @@ async def llm(
                 _write_artifact(
                     os.path.join(call_dir, "system.txt"), system,
                 )
+            if schema is not None:
+                _write_artifact(
+                    os.path.join(call_dir, "schema.json"),
+                    json.dumps(schema, indent=2, ensure_ascii=False),
+                )
 
         if backend == "theoria_agent":
-            started_at = _utc_now_iso()
-            started = time.perf_counter()
-            result = await agent_loop.run_agent(
-                prompt,
-                settings=settings,
-                schema=schema,
-                system=system,
-                resume=resume,
-                role=role,
-                container_id=container_id,
-                search_config=config.get("_web_search"),
-                watch=watch,
-            )
+            attempt_started_at = _utc_now_iso()
+            attempt_started_perf = time.perf_counter()
+            try:
+                result = await agent_loop.run_agent(
+                    prompt,
+                    settings=settings,
+                    schema=schema,
+                    system=system,
+                    resume=resume,
+                    role=role,
+                    container_id=container_id,
+                    search_config=config.get("_web_search"),
+                    watch=watch,
+                )
+            except agent_loop.AgentRunError as exc:
+                provider_meta = exc.metadata
+                events = exc.events
+                raw_stdout = exc.raw_stdout
+                raw_stderr = exc.raw_stderr
+                cmd = exc.pseudo_cmd
+                agent_messages = exc.messages
+                retry_count = int(provider_meta.get("http_retry_count", 0) or 0)
+                attempt_records.append({
+                    "attempt": 1,
+                    "started_at": attempt_started_at,
+                    "ended_at": _utc_now_iso(),
+                    "duration_ms": int(round(
+                        (time.perf_counter() - attempt_started_perf) * 1000
+                    )),
+                    "returncode": None,
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "http_retry_count": retry_count,
+                    "usage_reported": bool(
+                        provider_meta.get("usage_observed")
+                    ),
+                    "stdout_bytes": len(raw_stdout),
+                    "stderr_bytes": len(raw_stderr),
+                    "usage": {
+                        key: provider_meta.get(key)
+                        for key in (
+                            "input_tokens", "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        )
+                        if provider_meta.get(key) is not None
+                    },
+                    "tool_calls": provider_meta.get("tool_calls") or [],
+                })
+                raise
             response = result.response
             session_id = result.session_id
             provider_meta = result.metadata
@@ -1183,19 +1317,59 @@ async def llm(
             raw_stdout = result.raw_stdout
             raw_stderr = result.raw_stderr
             cmd = result.pseudo_cmd
+            agent_messages = result.messages
             returncode = 0
-            duration_ms = int(round((time.perf_counter() - started) * 1000))
+            retry_count = int(provider_meta.get("http_retry_count", 0) or 0)
+            attempt_records.append({
+                "attempt": 1,
+                "started_at": attempt_started_at,
+                "ended_at": _utc_now_iso(),
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started_perf) * 1000
+                )),
+                "returncode": 0,
+                "status": "success",
+                "http_retry_count": retry_count,
+                "usage_reported": bool(
+                    provider_meta.get("usage_observed")
+                ),
+                "stdout_bytes": len(raw_stdout),
+                "stderr_bytes": len(raw_stderr),
+                "usage": {
+                    key: provider_meta.get(key)
+                    for key in (
+                        "input_tokens", "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    )
+                    if provider_meta.get(key) is not None
+                },
+                "tool_calls": provider_meta.get("tool_calls") or [],
+            })
             if call_dir:
                 if raw_stdout:
                     _write_artifact(
-                        os.path.join(call_dir, "stdout.jsonl"),
+                        os.path.join(call_dir, "attempt_001_stdout.jsonl"),
                         raw_stdout, gzip_it=True,
                     )
                 if raw_stderr:
                     _write_artifact(
-                        os.path.join(call_dir, "stderr.txt"),
+                        os.path.join(call_dir, "attempt_001_stderr.txt"),
                         raw_stderr, gzip_it=True,
                     )
+                if agent_messages is not None:
+                    _write_artifact(
+                        os.path.join(call_dir, "messages.json"),
+                        json.dumps(
+                            agent_messages, indent=2, ensure_ascii=False,
+                            default=str,
+                        ),
+                    )
+                    if agent_messages and agent_messages[0].get("role") == "system":
+                        _write_artifact(
+                            os.path.join(call_dir, "effective_system.txt"),
+                            str(agent_messages[0].get("content") or ""),
+                        )
         else:
             # Retry loop for watchdog-killed subprocesses. Codex CLI
             # sometimes hangs indefinitely on a specific HTTP connection;
@@ -1207,8 +1381,9 @@ async def llm(
             call_label = (f"call_{call_index:03d}_{role}"
                           if call_index is not None else role)
             while True:
-                started_at = _utc_now_iso()
-                started = time.perf_counter()
+                attempt_number = len(attempt_records) + 1
+                attempt_started_at = _utc_now_iso()
+                attempt_started_perf = time.perf_counter()
 
                 # Run
                 proc = await asyncio.create_subprocess_exec(
@@ -1237,6 +1412,9 @@ async def llm(
 
                 raw_stdout = b""
                 raw_stderr = b""
+                events = []
+                provider_meta = {}
+                attempt_error: Exception | None = None
                 try:
                     if watch:
                         # Stream mode: read line by line, print events
@@ -1273,7 +1451,12 @@ async def llm(
                     returncode = proc.returncode
                     # Success — exit retry loop.
                     break
-                except Exception:
+                except Exception as run_error:
+                    attempt_error = run_error
+                    if isinstance(run_error, ProviderProcessError):
+                        raw_stdout = run_error.raw_stdout
+                        raw_stderr = run_error.raw_stderr
+                        events = run_error.events
                     # Was this a watchdog kill (transient hang) and do we
                     # have retries left? If so, swallow and retry.
                     if (watchdog_killed[0]
@@ -1297,37 +1480,127 @@ async def llm(
                             await watchdog_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                    # Save raw stdout/stderr for the most recent attempt.
-                    # On retry the previous attempt's data is overwritten —
-                    # last attempt wins. The retry message printed above
-                    # is the only signal that earlier attempts existed.
+                    attempt_metadata = _metadata_from_events(backend, events)
+                    attempt_records.append({
+                        "attempt": attempt_number,
+                        "started_at": attempt_started_at,
+                        "ended_at": _utc_now_iso(),
+                        "duration_ms": int(round(
+                            (time.perf_counter() - attempt_started_perf) * 1000
+                        )),
+                        "returncode": proc.returncode,
+                        "status": (
+                            "success" if attempt_error is None
+                            else "watchdog_killed" if watchdog_killed[0]
+                            else "failed"
+                        ),
+                        "error_type": (
+                            type(attempt_error).__name__
+                            if attempt_error is not None else None
+                        ),
+                        "watchdog_killed": watchdog_killed[0],
+                        "usage_reported": bool(
+                            attempt_metadata.get("usage_reported")
+                        ),
+                        "stdout_bytes": len(raw_stdout),
+                        "stderr_bytes": len(raw_stderr),
+                        "usage": {
+                            key: attempt_metadata.get(key)
+                            for key in (
+                                "input_tokens", "output_tokens",
+                                "cache_read_input_tokens",
+                                "cache_creation_input_tokens",
+                            )
+                            if attempt_metadata.get(key) is not None
+                        },
+                        "tool_calls": attempt_metadata.get("tool_calls") or [],
+                        "total_cost_usd": attempt_metadata.get("total_cost_usd"),
+                    })
                     if call_dir:
                         if raw_stdout:
                             _write_artifact(
-                                os.path.join(call_dir, "stdout.jsonl"),
+                                os.path.join(
+                                    call_dir,
+                                    f"attempt_{attempt_number:03d}_stdout.jsonl",
+                                ),
                                 raw_stdout, gzip_it=True,
                             )
                         if raw_stderr:
                             _write_artifact(
-                                os.path.join(call_dir, "stderr.txt"),
+                                os.path.join(
+                                    call_dir,
+                                    f"attempt_{attempt_number:03d}_stderr.txt",
+                                ),
                                 raw_stderr, gzip_it=True,
                             )
 
-            duration_ms = int(round((time.perf_counter() - started) * 1000))
+            retry_count = watchdog_attempts
+
+            provider_meta["usage_observed"] = any(
+                bool(attempt.get("usage_reported"))
+                for attempt in attempt_records
+            )
+            provider_meta["usage_complete"] = bool(attempt_records) and all(
+                attempt.get("status") == "success"
+                and bool(attempt.get("usage_reported"))
+                for attempt in attempt_records
+            )
+
+            usage_fields = (
+                "input_tokens", "output_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+            for field in usage_fields:
+                observed = [
+                    int((attempt.get("usage") or {}).get(field, 0) or 0)
+                    for attempt in attempt_records
+                    if field in (attempt.get("usage") or {})
+                ]
+                if observed:
+                    provider_meta[field] = sum(observed)
+            attempt_costs = [
+                attempt.get("total_cost_usd") for attempt in attempt_records
+                if attempt.get("total_cost_usd") is not None
+            ]
+            if attempt_costs and len(attempt_costs) == len(attempt_records):
+                provider_meta["total_cost_usd"] = sum(attempt_costs)
+            elif attempt_records:
+                provider_meta["total_cost_usd"] = None
+
+        duration_ms = int(round((time.perf_counter() - call_started_perf) * 1000))
+        all_tool_calls = [
+            tool_call
+            for attempt in attempt_records
+            for tool_call in (attempt.get("tool_calls") or [])
+        ]
 
         # ── Save post-parse artifacts ────────────────────────────
         artifact_paths: dict[str, str] = {}
         if call_dir:
             response_text = response if isinstance(response, str) else json.dumps(response, indent=2)
+            final_attempt = attempt_records[-1]["attempt"] if attempt_records else 1
             artifact_paths["artifact_dir"] = call_dir
             artifact_paths["cmd_path"] = os.path.join(call_dir, "cmd.json")
             artifact_paths["prompt_path"] = os.path.join(call_dir, "prompt.txt")
             if system:
                 artifact_paths["system_path"] = os.path.join(call_dir, "system.txt")
+            if schema is not None:
+                artifact_paths["schema_path"] = os.path.join(call_dir, "schema.json")
+            if agent_messages is not None:
+                artifact_paths["messages_path"] = os.path.join(call_dir, "messages.json")
+                artifact_paths["effective_system_path"] = os.path.join(
+                    call_dir, "effective_system.txt",
+                )
             if raw_stdout:
-                artifact_paths["stdout_path"] = os.path.join(call_dir, "stdout.jsonl.gz")
+                artifact_paths["stdout_path"] = os.path.join(
+                    call_dir,
+                    f"attempt_{final_attempt:03d}_stdout.jsonl.gz",
+                )
             if raw_stderr:
-                artifact_paths["stderr_path"] = os.path.join(call_dir, "stderr.txt.gz")
+                artifact_paths["stderr_path"] = os.path.join(
+                    call_dir,
+                    f"attempt_{final_attempt:03d}_stderr.txt.gz",
+                )
 
             _write_artifact(
                 os.path.join(call_dir, "response.txt"), response_text,
@@ -1370,13 +1643,29 @@ async def llm(
                 "model": _effective_model(cmd) or settings.get("model"),
                 "model_config": settings.get("model"),
                 "effort": settings.get("effort"),
-                "started_at": started_at,
+                "temperature": settings.get("temperature"),
+                "top_p": settings.get("top_p"),
+                "seed": settings.get("seed"),
+                "max_tokens": settings.get("max_tokens"),
+                "context_length": settings.get("context_length"),
+                "max_turns": settings.get("max_turns"),
+                "started_at": call_started_at,
                 "ended_at": _utc_now_iso(),
                 "duration_ms": duration_ms,
+                "retry_count": retry_count,
+                "attempts": attempt_records,
+                "all_tool_calls": all_tool_calls,
                 "session_id": session_id,
                 "resumed": bool(resume),
                 "has_schema": schema is not None,
+                "schema_sha256": (
+                    hashlib.sha256(json.dumps(
+                        schema, sort_keys=True, separators=(",", ":"),
+                    ).encode()).hexdigest()
+                    if schema is not None else None
+                ),
                 "returncode": returncode,
+                "failed": False,
                 "argv_hash": _cmd_hash(cmd),
                 # Which sandbox this call ran in (if any). Enables
                 # post-hoc reasoning about the container image version.
@@ -1404,29 +1693,172 @@ async def llm(
         return response, session_id
 
     except Exception as e:
-        # Failure path: at minimum record enough to reconstruct what
-        # happened. Raw stdout/stderr were already saved in the inner
-        # finally. Write a failure meta.json so the call dir is
-        # self-describing for post-mortem.
+        if isinstance(e, agent_loop.AgentRunError):
+            provider_meta = e.metadata
+            events = e.events
+            raw_stdout = e.raw_stdout
+            raw_stderr = e.raw_stderr
+            cmd = e.pseudo_cmd
+            agent_messages = e.messages
+        elif events:
+            try:
+                if backend == "claude":
+                    result_event = next(
+                        (event for event in reversed(events)
+                         if event.get("type") == "result"),
+                        {},
+                    )
+                    provider_meta = _extract_claude_metadata(result_event)
+                    provider_meta["tool_calls"] = _extract_claude_tool_calls(events)
+                elif backend == "codex":
+                    provider_meta = _extract_codex_metadata(events)
+                    provider_meta["tool_calls"] = _extract_codex_tool_calls(events)
+            except Exception:
+                provider_meta = {}
+
+        if not attempt_records:
+            attempt_records.append({
+                "attempt": 1,
+                "started_at": call_started_at,
+                "ended_at": _utc_now_iso(),
+                "duration_ms": int(round(
+                    (time.perf_counter() - call_started_perf) * 1000
+                )),
+                "returncode": returncode,
+                "status": "failed",
+                "error_type": type(e).__name__,
+                "usage_reported": False,
+                "stdout_bytes": len(raw_stdout),
+                "stderr_bytes": len(raw_stderr),
+            })
+        duration_ms = int(round((time.perf_counter() - call_started_perf) * 1000))
+        failure_meta = {
+            "role": role,
+            "backend": backend,
+            "model": _effective_model(cmd) or settings.get("model"),
+            "model_config": settings.get("model"),
+            "effort": settings.get("effort"),
+            "temperature": settings.get("temperature"),
+            "top_p": settings.get("top_p"),
+            "seed": settings.get("seed"),
+            "max_tokens": settings.get("max_tokens"),
+            "context_length": settings.get("context_length"),
+            "max_turns": settings.get("max_turns"),
+            "started_at": call_started_at,
+            "ended_at": _utc_now_iso(),
+            "duration_ms": duration_ms,
+            "retry_count": retry_count,
+            "attempts": attempt_records,
+            "all_tool_calls": [
+                tool_call
+                for attempt in attempt_records
+                for tool_call in (attempt.get("tool_calls") or [])
+            ],
+            "resumed": bool(resume),
+            "has_schema": schema is not None,
+            "schema_sha256": (
+                hashlib.sha256(json.dumps(
+                    schema, sort_keys=True, separators=(",", ":"),
+                ).encode()).hexdigest()
+                if schema is not None else None
+            ),
+            "returncode": returncode,
+            "argv_hash": _cmd_hash(cmd),
+            "sandboxed": container_id is not None,
+            "container_id": container_id,
+            "container_cwd": container_call_cwd,
+            "image_id": image_id,
+            "prompt": _truncate(prompt, 8000),
+            "system": _truncate(system or "", 8000),
+            "response": "",
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "failed": True,
+            **provider_meta,
+        }
+        failure_meta["failed"] = True
+        failure_meta["usage_complete"] = False
+        failure_meta["usage_observed"] = bool(
+            failure_meta.get("usage_observed")
+            or any(
+                bool(attempt.get("usage_reported"))
+                for attempt in attempt_records
+            )
+        )
+        failure_meta["error_type"] = type(e).__name__
+        failure_meta["error"] = str(e)
+
         if call_dir:
             try:
+                final_attempt = attempt_records[-1]["attempt"]
+                if raw_stdout:
+                    stdout_path = os.path.join(
+                        call_dir,
+                        f"attempt_{final_attempt:03d}_stdout.jsonl",
+                    )
+                    _write_artifact(stdout_path, raw_stdout, gzip_it=True)
+                    failure_meta["stdout_path"] = stdout_path + ".gz"
+                if raw_stderr:
+                    stderr_path = os.path.join(
+                        call_dir,
+                        f"attempt_{final_attempt:03d}_stderr.txt",
+                    )
+                    _write_artifact(stderr_path, raw_stderr, gzip_it=True)
+                    failure_meta["stderr_path"] = stderr_path + ".gz"
+                if events:
+                    events_path = os.path.join(call_dir, "events.json")
+                    _write_artifact(
+                        events_path,
+                        json.dumps(events, ensure_ascii=False, default=str),
+                        gzip_it=True,
+                    )
+                    failure_meta["events_path"] = events_path + ".gz"
+                if agent_messages is not None:
+                    messages_path = os.path.join(call_dir, "messages.json")
+                    _write_artifact(
+                        messages_path,
+                        json.dumps(
+                            agent_messages, indent=2, ensure_ascii=False,
+                            default=str,
+                        ),
+                    )
+                    failure_meta["messages_path"] = messages_path
+                    if agent_messages and agent_messages[0].get("role") == "system":
+                        effective_system_path = os.path.join(
+                            call_dir, "effective_system.txt",
+                        )
+                        _write_artifact(
+                            effective_system_path,
+                            str(agent_messages[0].get("content") or ""),
+                        )
+                        failure_meta["effective_system_path"] = effective_system_path
+                if events:
+                    full_tools = (
+                        _extract_claude_tool_calls(events, truncate=False)
+                        if backend == "claude"
+                        else _extract_codex_tool_calls(events, truncate=False)
+                    )
+                    if full_tools:
+                        tool_path = os.path.join(call_dir, "tool_calls.json")
+                        _write_artifact(
+                            tool_path,
+                            json.dumps(
+                                full_tools, ensure_ascii=False, indent=2,
+                                default=str,
+                            ),
+                        )
+                        failure_meta["tool_calls_path"] = tool_path
+                traceback_path = os.path.join(call_dir, "traceback.txt")
+                _write_artifact(traceback_path, traceback.format_exc())
+                failure_meta["traceback_path"] = traceback_path
                 _write_artifact(
                     os.path.join(call_dir, "meta.json"),
-                    json.dumps({
-                        "role": role,
-                        "backend": backend,
-                        "model": settings.get("model"),
-                        "effort": settings.get("effort"),
-                        "argv": cmd,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                        "failed": True,
-                    }, indent=2, default=str),
+                    json.dumps(failure_meta, indent=2, default=str),
                 )
             except Exception:
                 pass
-        # Leave the placeholder None in call_log so an operator can
-        # spot it (and the partial save will persist it).
+        if log is not None and call_index is not None:
+            log[call_index] = failure_meta
         raise
 
     finally:

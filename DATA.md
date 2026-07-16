@@ -22,6 +22,10 @@ to a source you can check.
 The retained `hle_id` column lets anyone re-fetch the original questions from
 Hugging Face themselves. **This repository never redistributes HLE content.**
 
+New runs pin `skylenage/HLE-Verified` to commit
+`0bc83643672d4f68a5f89998617a639d85e7318b` and record the resolved
+Hugging Face `datasets` fingerprint in every problem and run manifest.
+
 ## What is published separately, and gated
 
 The full per-problem audit — complete proofs, every judge verdict, both

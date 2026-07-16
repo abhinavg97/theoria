@@ -72,7 +72,7 @@ theoria hle 1               # reproduce HLE problem 1 (streams live by default)
 
 `theoria doctor` tells you exactly what's missing and how to fix it. `theoria build` builds both sandbox images (`theoria-sandbox` and the Sage math/science variant `theoria-sandbox-sage`); the Sage image installs SageMath via conda, so its first build takes several minutes.
 
-Results land in `runs/<command>_<tag>_<timestamp>.json`; full per-call artifacts (every prompt, response, tool call, and event stream) under `runs/artifacts/`. Both are gitignored.
+Results land in `runs/<command>_<tag>_<timestamp>.json`; full per-call artifacts (every prompt, response, retry, failure, tool call, and event stream) under `runs/artifacts/`. Both are gitignored. See [`docs/RESEARCH_AUDIT.md`](docs/RESEARCH_AUDIT.md) for the paper audit contract.
 
 ### Reproducing the HLE results
 

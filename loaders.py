@@ -17,6 +17,11 @@ from __future__ import annotations
 import json
 
 
+HLE_DATASET_NAME = "skylenage/HLE-Verified"
+HLE_DATASET_REVISION = "0bc83643672d4f68a5f89998617a639d85e7318b"
+HLE_DATASET_SPLIT = "train"
+
+
 # ── Humanity's Last Exam ──────────────────────────────────────────
 
 def load_hle(
@@ -26,6 +31,7 @@ def load_hle(
     skip_images: bool = True,
     ids: list[str] | None = None,
     subset: str = "Gold subset",
+    revision: str = HLE_DATASET_REVISION,
 ) -> list[dict]:
     """Load HLE-Verified (https://arxiv.org/abs/2602.13964).
 
@@ -43,7 +49,13 @@ def load_hle(
     from datasets import load_dataset  # imported lazily so other CLI
                                        # commands don't need `datasets`
 
-    ds = load_dataset("skylenage/HLE-Verified", split="train")
+    ds = load_dataset(
+        HLE_DATASET_NAME,
+        split=HLE_DATASET_SPLIT,
+        revision=revision,
+    )
+    dataset_fingerprint = getattr(ds, "_fingerprint", None)
+    dataset_config = getattr(getattr(ds, "info", None), "config_name", None)
     problems = []
     id_set = set(ids) if ids else None
     skipped = 0
@@ -73,9 +85,12 @@ def load_hle(
             "question": ex["question"],
             "answer": ex["answer"],
             "dataset": "HLE-Verified",
-            "dataset_source": "skylenage/HLE-Verified",
-            "dataset_split": "train",
+            "dataset_source": HLE_DATASET_NAME,
+            "dataset_split": HLE_DATASET_SPLIT,
             "dataset_subset": subset if subset and id_set is None else "ids",
+            "dataset_revision": revision,
+            "dataset_fingerprint": dataset_fingerprint,
+            "dataset_config": dataset_config,
             "answer_type": meta.get("answer_type", ""),
             "category": ex["category"],
             "verified_class": ex["Verified_Classes"],

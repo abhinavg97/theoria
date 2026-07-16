@@ -1,10 +1,17 @@
+import asyncio
+import json
 import re
 
+import pytest
+
+import harness
+from llm import call_log
 from harness import (
     _problem_set_manifest,
     _research_audit_metadata,
     _safe_version,
     make_save_path,
+    record_problem_set_manifest,
 )
 
 
@@ -54,6 +61,8 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(tmp_path):
             "api_key": "secret-value",
             "api_key_env": "AZURE_OPENAI_API_KEY",
             "bearer-token": "secret-token",
+            "account_key": "secret-account-key",
+            "connection_string": "Endpoint=secret",
             "prompt": "Solve carefully.",
             "preamble": True,
             "temperature": 0,
@@ -72,6 +81,8 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(tmp_path):
     assert solver["api_key"] == "<redacted>"
     assert solver["api_key_env"] == "AZURE_OPENAI_API_KEY"
     assert solver["bearer-token"] == "<redacted>"
+    assert solver["account_key"] == "<redacted>"
+    assert solver["connection_string"] == "<redacted>"
     assert solver["max_tokens"] == 1024
     assert solver["endpoint"] == "https://example.test/openai/v1"
     assert audit["config_sha256"]
@@ -95,6 +106,7 @@ def test_problem_set_manifest_records_ids_and_dataset_identity():
             "dataset": "HLE-Verified",
             "dataset_source": "skylenage/HLE-Verified",
             "dataset_split": "train",
+            "dataset_config": "default",
             "dataset_subset": "Gold subset",
             "category": "Math",
             "verified_class": "Gold subset",
@@ -106,6 +118,7 @@ def test_problem_set_manifest_records_ids_and_dataset_identity():
             "dataset": "HLE-Verified",
             "dataset_source": "skylenage/HLE-Verified",
             "dataset_split": "train",
+            "dataset_config": "default",
             "dataset_subset": "Gold subset",
             "category": "Physics",
             "verified_class": "Gold subset",
@@ -121,5 +134,387 @@ def test_problem_set_manifest_records_ids_and_dataset_identity():
     assert manifest["datasets"] == ["HLE-Verified"]
     assert manifest["dataset_sources"] == ["skylenage/HLE-Verified"]
     assert manifest["dataset_splits"] == ["train"]
+    assert manifest["dataset_configs"] == ["default"]
     assert manifest["categories"] == {"Math": 1, "Physics": 1}
     assert manifest["verified_classes"] == {"Gold subset": 2}
+
+
+def test_role_manifest_uses_effective_backend_defaults():
+    manifest = harness._role_model_manifest({
+        "solver": {"backend": "theoria_agent", "prompt": "solve"},
+    })
+
+    solver = manifest["solver"]
+    assert solver["model"] == "qwen3:4b"
+    assert solver["endpoint"] == "http://localhost:11434/v1"
+    assert solver["max_turns"] == 8
+    assert solver["allow_shell"] is True
+    assert solver["allow_host_tools"] is False
+
+
+def test_config_identity_distinguishes_redacted_endpoint_queries(monkeypatch):
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
+    base = {
+        "solver": {
+            "backend": "theoria_agent",
+            "model": "model",
+            "endpoint": "https://example.test/v1?api-version=1",
+        },
+    }
+    changed = json.loads(json.dumps(base))
+    changed["solver"]["endpoint"] = "https://example.test/v1?api-version=2"
+
+    first = _research_audit_metadata(base, {})
+    second = _research_audit_metadata(changed, {})
+
+    assert first["config"]["solver"]["endpoint"] == "https://example.test/v1"
+    assert second["config"]["solver"]["endpoint"] == "https://example.test/v1"
+    assert first["config_sha256"] != second["config_sha256"]
+
+
+def test_problem_set_manifest_is_immutable_on_resume(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    harness._write_meta(str(root), {"run_id": "test"})
+    first = _problem_set_manifest([{
+        "id": "p1", "question": "Q1", "answer": "A1",
+    }])
+    changed = _problem_set_manifest([{
+        "id": "p2", "question": "Q2", "answer": "A2",
+    }])
+
+    record_problem_set_manifest(str(root), first)
+    record_problem_set_manifest(str(root), first)
+    with pytest.raises(RuntimeError, match="problem-set mismatch"):
+        record_problem_set_manifest(str(root), changed)
+
+    assert harness._read_meta(str(root))["problem_set"]["ids"] == ["p1"]
+
+
+def test_rejected_resume_does_not_capture_new_environment(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+    monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
+        "sha": "same", "diff_sha256": None, "untracked_sha256": None,
+    })
+    captures = []
+    monkeypatch.setattr(
+        harness,
+        "_capture_host_environment",
+        lambda *_args, **_kwargs: captures.append("capture") or {"available": True},
+    )
+    original = dict(harness.CONFIG)
+    harness.CONFIG.clear()
+    try:
+        harness.CONFIG.update({"solver": {"model": "first"}})
+        first_manifest = _problem_set_manifest([{
+            "id": "p1", "question": "Q1", "answer": "A1",
+        }])
+        changed_manifest = _problem_set_manifest([{
+            "id": "p2", "question": "Q2", "answer": "A2",
+        }])
+        root = harness.make_artifact_root(
+            "runs/resume-test.json", problem_manifest=first_manifest,
+        )
+        record_problem_set_manifest(root, first_manifest)
+        assert captures == ["capture"]
+
+        harness.CONFIG["solver"]["model"] = "changed"
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root("runs/resume-test.json")
+        assert captures == ["capture"]
+
+        harness.CONFIG["solver"]["model"] = "first"
+        with pytest.raises(RuntimeError, match="problem-set mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=changed_manifest,
+            )
+        assert captures == ["capture"]
+    finally:
+        harness.CONFIG.clear()
+        harness.CONFIG.update(original)
+
+
+def test_resume_rejects_unreadable_metadata(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    meta_path = tmp_path / "runs" / "artifacts" / "broken" / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text("{not-json")
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+
+    with pytest.raises(RuntimeError, match="metadata is unreadable"):
+        harness.make_artifact_root("runs/broken.json")
+
+    assert meta_path.read_text() == "{not-json"
+
+
+def test_resume_rejects_missing_original_problem_manifest(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+    monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
+        "sha": "same", "diff_sha256": None, "untracked_sha256": None,
+    })
+    harness.make_artifact_root("runs/legacy.json")
+    manifest = _problem_set_manifest([{
+        "id": "p1", "question": "Q1", "answer": "A1",
+    }])
+
+    with pytest.raises(RuntimeError, match="problem-set provenance is missing"):
+        harness.make_artifact_root(
+            "runs/legacy.json", problem_manifest=manifest,
+        )
+
+
+def test_host_environment_falls_back_when_pip_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    class Result:
+        returncode = 1
+        stdout = b""
+        stderr = b"No module named pip"
+
+    monkeypatch.setattr(harness.subprocess, "run", lambda *_args, **_kwargs: Result())
+    record = harness._capture_host_environment(str(tmp_path), "test")
+
+    assert record["available"] is True
+    assert record["source"] == "importlib.metadata"
+    assert record["sha256"]
+    assert (tmp_path / "host_packages_test.txt").exists()
+
+
+def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
+    async def fake_run(*_args, **_kwargs):
+        call_log.get().extend([
+            {
+                "role": "computation",
+                "backend": "theoria_agent",
+                "model": "fake",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "duration_ms": 5,
+                "retry_count": 1,
+                "failed": False,
+                "total_cost_usd": None,
+                "tool_calls": [{
+                    "tool_name": "shell",
+                    "metadata": {"ok": True, "exit_code": 0},
+                }],
+            },
+            {
+                "role": "citation",
+                "backend": "theoria_agent",
+                "model": "fake",
+                "duration_ms": 3,
+                "retry_count": 2,
+                "failed": True,
+                "tool_calls": [{
+                    "tool_name": "web_search",
+                    "metadata": {"ok": False},
+                }],
+            },
+        ])
+        return {"answer": "42", "verified": False}
+
+    monkeypatch.setattr(harness, "run", fake_run)
+    result = asyncio.run(harness.run_one({
+        "id": "p1", "question": "Q", "answer": "42",
+    }))
+
+    metrics = result["metrics"]
+    assert metrics["num_calls"] == 2
+    assert metrics["failed_calls"] == 1
+    assert metrics["total_retries"] == 3
+    assert metrics["tool_status_counts"] == {
+        "success": 1, "failure": 1, "unknown": 0,
+    }
+    assert metrics["mechanistic_evidence_by_role"]["computation"][
+        "successful_shell_calls"
+    ] == 1
+    assert metrics["mechanistic_evidence_by_role"]["citation"][
+        "failed_tool_calls"
+    ] == 1
+
+
+def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
+    results = [
+        {
+            "verified": True,
+            "expected": "4",
+            "correct": True,
+            "metrics": {
+                "num_calls": 2,
+                "successful_calls": 2,
+                "usage_available_calls": 2,
+                "usage_complete_calls": 2,
+                "total_llm_duration_ms": 30,
+                "calls_by_role": {"solver": 1, "computation": 1},
+                "calls_by_model": {"theoria_agent:qwen": 2},
+                "tokens_by_role": {"solver": 20, "computation": 10},
+                "duration_by_role": {"solver": 20, "computation": 10},
+                "total_tool_calls": 1,
+                "tool_calls_by_name": {"shell": 1},
+                "tool_calls_by_role": {"computation": {"shell": 1}},
+                "tool_status_counts": {"success": 1},
+                "tool_status_by_role": {"computation": {"success": 1}},
+                "mechanistic_evidence_by_role": {
+                    "computation": {
+                        "calls": 1,
+                        "shell_calls": 1,
+                        "successful_shell_calls": 1,
+                    },
+                },
+                "web_search_providers": ["searxng"],
+                "web_search_requests": 1,
+                "web_search_error_categories": {"timeout": 1},
+            },
+        },
+        {
+            "verified": False,
+            "expected": "B",
+            "correct": False,
+            "metrics": {
+                "num_calls": 1,
+                "successful_calls": 1,
+                "usage_available_calls": 0,
+                "usage_complete_calls": 0,
+                "total_llm_duration_ms": 5,
+                "calls_by_role": {"computation": 1},
+                "calls_by_model": {"theoria_agent:qwen": 1},
+                "tokens_by_role": {"computation": 5},
+                "duration_by_role": {"computation": 5},
+                "total_tool_calls": 1,
+                "tool_calls_by_name": {"shell": 1},
+                "tool_calls_by_role": {"computation": {"shell": 1}},
+                "tool_status_counts": {"failure": 1},
+                "tool_status_by_role": {"computation": {"failure": 1}},
+                "mechanistic_evidence_by_role": {
+                    "computation": {
+                        "calls": 1,
+                        "shell_calls": 1,
+                        "failed_tool_calls": 1,
+                    },
+                },
+            },
+        },
+    ]
+
+    metrics = harness._aggregate_run_metrics(
+        results, requested=2, duration_ms=50,
+    )
+
+    assert metrics["calls_by_role"] == {"solver": 1, "computation": 2}
+    assert metrics["calls_by_model"] == {"theoria_agent:qwen": 3}
+    assert metrics["tokens_by_role"] == {"solver": 20, "computation": 15}
+    assert metrics["total_llm_duration_ms"] == 35
+    assert metrics["usage_coverage_fraction"] == pytest.approx(2 / 3)
+    assert metrics["usage_complete_fraction"] == pytest.approx(2 / 3)
+    assert metrics["tool_calls_by_role"] == {"computation": {"shell": 2}}
+    assert metrics["tool_status_by_role"]["computation"] == {
+        "success": 1,
+        "failure": 1,
+    }
+    assert metrics["mechanistic_evidence_by_role"]["computation"] == {
+        "calls": 2,
+        "shell_calls": 2,
+        "successful_shell_calls": 1,
+        "failed_tool_calls": 1,
+    }
+    assert metrics["web_search_providers"] == ["searxng"]
+    assert metrics["web_search_error_categories"] == {"timeout": 1}
+
+
+def test_run_problems_records_completion_status_and_integrity_manifest(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        harness,
+        "_prepare_sandbox_run",
+        lambda *_args, **_kwargs: (None, None, None),
+    )
+
+    async def fake_run_one(problem, **_kwargs):
+        return {
+            "id": problem["id"],
+            "answer": "A",
+            "verified": True,
+            "correct": True,
+            "calls": [],
+            "metrics": {"num_calls": 0},
+        }
+
+    monkeypatch.setattr(harness, "run_one", fake_run_one)
+    results = asyncio.run(harness.run_problems(
+        [{"id": "p1", "question": "Q", "answer": "A"}],
+        parallel=1,
+        save_path="runs/test.json",
+    ))
+
+    assert len(results) == 1
+    root = tmp_path / "runs" / "artifacts" / "test"
+    meta = json.loads((root / "meta.json").read_text())
+    assert meta["status"] == "completed"
+    assert meta["requested_problems"] == 1
+    assert meta["completed_problems"] == 1
+    assert meta["metrics"]["judge_passed"] == 1
+    assert (root / "artifact_manifest.json").exists()
+
+
+def test_run_problems_marks_setup_failure(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def fail_setup(*_args, **_kwargs):
+        raise RuntimeError("sandbox setup failed")
+
+    monkeypatch.setattr(harness, "_prepare_sandbox_run", fail_setup)
+    with pytest.raises(RuntimeError, match="sandbox setup failed"):
+        asyncio.run(harness.run_problems(
+            [{"id": "p1", "question": "Q", "answer": "A"}],
+            parallel=1,
+            save_path="runs/failed.json",
+        ))
+
+    root = tmp_path / "runs" / "artifacts" / "failed"
+    meta = json.loads((root / "meta.json").read_text())
+    assert meta["status"] == "failed"
+    assert meta["completed_problems"] == 0
+    assert meta["run_error"]["message"] == "sandbox setup failed"
+
+
+def test_run_problems_rejects_duplicate_ids_before_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    setup_called = False
+
+    def record_setup(*_args, **_kwargs):
+        nonlocal setup_called
+        setup_called = True
+        return None, None, None
+
+    monkeypatch.setattr(harness, "_prepare_sandbox_run", record_setup)
+    problems = [
+        {"id": "same", "question": "Q1", "answer": "A1"},
+        {"id": "same", "question": "Q2", "answer": "A2"},
+    ]
+
+    with pytest.raises(ValueError, match="problem IDs must be unique"):
+        asyncio.run(harness.run_problems(
+            problems, parallel=1, save_path="runs/duplicates.json",
+        ))
+
+    assert setup_called is False
+    root = tmp_path / "runs" / "artifacts" / "duplicates"
+    meta = json.loads((root / "meta.json").read_text())
+    assert meta["status"] == "failed"
+    assert meta["problem_set"]["duplicate_ids"] == ["same"]
+    assert (root / "artifact_manifest.json").exists()

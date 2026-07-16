@@ -119,9 +119,13 @@ runs/partial/<id>.json                    crash-safe live snapshot
 runs/artifacts/<run_id>/
     meta.json                             argv, redacted config, config/prompt/model
                                           fingerprints, problem-set manifest,
-                                          git sha, sandbox image digest
+                                          Git patch, status, dataset/model/runtime
+                                          provenance, aggregate metrics
+    artifact_manifest.json                SHA-256 + size of every retained artifact
     <problem_id>/call_NNN_<role>/         every prompt, response, tool call,
+                                          retry attempt, failure, transcript,
                                           and raw event stream, per LLM call
 ```
 
-Everything needed to reproduce or audit a run is on disk.
+See [RESEARCH_AUDIT.md](RESEARCH_AUDIT.md) for the audit contract and the
+additional declarations required for remote model deployments.

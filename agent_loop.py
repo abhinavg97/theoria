@@ -43,6 +43,36 @@ class AgentRunResult:
     raw_stdout: bytes
     raw_stderr: bytes
     pseudo_cmd: list[str]
+    messages: list[dict] | None = None
+
+
+class ChatCompletionError(RuntimeError):
+    def __init__(self, message: str, *, attempts: list[dict]) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+class AgentRunError(RuntimeError):
+    """A failed agent run carrying the complete partial audit trace."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        metadata: dict,
+        events: list[dict],
+        raw_stdout: bytes,
+        raw_stderr: bytes,
+        pseudo_cmd: list[str],
+        messages: list[dict],
+    ) -> None:
+        super().__init__(message)
+        self.metadata = metadata
+        self.events = events
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
+        self.pseudo_cmd = pseudo_cmd
+        self.messages = messages
 
 
 def pseudo_command(settings: dict) -> list[str]:
@@ -146,17 +176,27 @@ def _validate_schema(value, schema: dict | None) -> None:
     validator.validate(value)
 
 
-def _chat_completion(settings: dict, messages: list[dict[str, str]]) -> tuple[str, dict]:
+def _chat_completion(
+    settings: dict,
+    messages: list[dict[str, str]],
+) -> tuple[str, dict, dict]:
     endpoint = str(settings.get("endpoint") or settings.get("base_url") or DEFAULT_ENDPOINT)
     url = endpoint.rstrip("/") + "/chat/completions"
     payload: dict = {
         "model": settings.get("model", "qwen3:4b"),
         "messages": messages,
     }
-    if settings.get("max_tokens") is not None:
-        payload["max_tokens"] = settings["max_tokens"]
-    if settings.get("temperature") is not None:
-        payload["temperature"] = settings["temperature"]
+    for key in (
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+    ):
+        if settings.get(key) is not None:
+            payload[key] = settings[key]
 
     headers = {"Content-Type": "application/json"}
     api_key_env = settings.get("api_key_env")
@@ -176,34 +216,98 @@ def _chat_completion(settings: dict, messages: list[dict[str, str]]) -> tuple[st
         method="POST",
     )
     max_retries = int(settings.get("max_retries", 3))
+    attempts: list[dict] = []
     for attempt in range(max_retries + 1):
+        attempt_started = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read())
+                response_headers = {
+                    key.lower(): value
+                    for key, value in response.headers.items()
+                    if key.lower() in {
+                        "apim-request-id",
+                        "request-id",
+                        "x-request-id",
+                        "x-ratelimit-limit-requests",
+                        "x-ratelimit-remaining-requests",
+                        "x-ratelimit-reset-requests",
+                    }
+                }
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "success",
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                )),
+            })
             break
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode(errors="replace")
+            attempt_record = {
+                "attempt": attempt + 1,
+                "status": "http_error",
+                "status_code": exc.code,
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                )),
+            }
+            attempts.append(attempt_record)
             if exc.code == 429 and attempt < max_retries:
                 retry_after = exc.headers.get("Retry-After")
                 try:
                     delay = max(1.0, float(retry_after or 0))
                 except ValueError:
                     delay = 5.0
-                time.sleep(min(delay, float(settings.get("max_retry_sleep", 65))))
+                sleep_seconds = min(
+                    delay, float(settings.get("max_retry_sleep", 65))
+                )
+                attempt_record["retry_sleep_seconds"] = sleep_seconds
+                time.sleep(sleep_seconds)
                 continue
-            raise RuntimeError(
-                f"chat completion failed with HTTP {exc.code}: {raw[:1500]}"
+            raise ChatCompletionError(
+                f"chat completion failed with HTTP {exc.code}: {raw[:1500]}",
+                attempts=attempts,
             ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"chat completion failed: {exc}") from exc
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "network_error",
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                )),
+                "error": str(exc),
+            })
+            raise ChatCompletionError(
+                f"chat completion failed: {exc}", attempts=attempts,
+            ) from exc
+        except Exception as exc:
+            attempts.append({
+                "attempt": attempt + 1,
+                "status": "invalid_response",
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                )),
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            })
+            raise ChatCompletionError(
+                f"chat completion returned an invalid response: {exc}",
+                attempts=attempts,
+            ) from exc
     else:
-        raise RuntimeError("chat completion retry loop exited unexpectedly")
+        raise ChatCompletionError(
+            "chat completion retry loop exited unexpectedly", attempts=attempts,
+        )
 
     try:
         choice = body["choices"][0]
         message = choice.get("message") or {}
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"unexpected chat completion response: {body!r}") from exc
+    except (AttributeError, KeyError, IndexError, TypeError) as exc:
+        raise ChatCompletionError(
+            f"unexpected chat completion response: {body!r}",
+            attempts=attempts,
+        ) from exc
 
     content = message.get("content")
     if isinstance(content, list):
@@ -214,8 +318,24 @@ def _chat_completion(settings: dict, messages: list[dict[str, str]]) -> tuple[st
     if content is None:
         content = ""
 
-    usage = body.get("usage") or {}
-    return str(content), usage
+    raw_usage = body.get("usage")
+    usage = raw_usage or {}
+    provider_metadata = {
+        "response_id": body.get("id"),
+        "response_model": body.get("model"),
+        "created": body.get("created"),
+        "object": body.get("object"),
+        "system_fingerprint": body.get("system_fingerprint"),
+        "service_tier": body.get("service_tier"),
+        "finish_reason": choice.get("finish_reason"),
+        "response_headers": response_headers,
+        "content_filter_results": choice.get("content_filter_results"),
+        "prompt_filter_results": body.get("prompt_filter_results"),
+        "http_attempts": attempts,
+        "http_retry_count": max(0, len(attempts) - 1),
+        "usage_reported": isinstance(raw_usage, dict) and bool(raw_usage),
+    }
+    return str(content), usage, provider_metadata
 
 
 async def _run_shell(
@@ -316,6 +436,8 @@ def _tool_call_previews(events: list[dict], *, limit: int = 2000) -> list[dict]:
             order.append(call_id)
         elif item.get("type") == "function_call_output" and call_id in calls:
             calls[call_id]["output"] = _truncate(str(item.get("output") or ""), limit)
+            if isinstance(item.get("metadata"), dict):
+                calls[call_id]["metadata"] = item["metadata"]
     return [calls[call_id] for call_id in order]
 
 
@@ -363,19 +485,98 @@ async def run_agent(
     stderr_lines: list[str] = []
     input_tokens = output_tokens = 0
     final_response: str | dict | None = None
+    provider_responses: list[dict] = []
 
-    for turn in range(max_turns):
+    def build_metadata(*, failed: bool = False, error: Exception | None = None) -> dict:
+        completed_turns = len([
+            event for event in events
+            if event.get("type") == "turn.completed"
+        ])
+        usage_reported_turns = sum(
+            bool(item.get("usage_reported")) for item in provider_responses
+        )
+        metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": 0,
+            "total_cost_usd": None,
+            "tool_calls": _tool_call_previews(events),
+            "num_turns": completed_turns,
+            "usage_reported_turns": usage_reported_turns,
+            "usage_observed": usage_reported_turns > 0,
+            "usage_complete": (
+                not failed
+                and completed_turns > 0
+                and usage_reported_turns == completed_turns
+            ),
+            "provider_endpoint": _redact_endpoint(str(
+                settings.get("endpoint")
+                or settings.get("base_url")
+                or DEFAULT_ENDPOINT
+            )),
+            "wire_api": "chat-completions",
+            "search_enabled": search_enabled,
+            "shell_enabled": shell_enabled,
+            "role": role,
+            "provider_responses": provider_responses,
+            "provider_response_ids": [
+                item["response_id"] for item in provider_responses
+                if item.get("response_id")
+            ],
+            "provider_models": sorted({
+                str(item["response_model"]) for item in provider_responses
+                if item.get("response_model")
+            }),
+            "system_fingerprints": sorted({
+                str(item["system_fingerprint"]) for item in provider_responses
+                if item.get("system_fingerprint")
+            }),
+            "http_retry_count": sum(
+                int(item.get("http_retry_count", 0) or 0)
+                for item in provider_responses
+            ),
+            "http_attempts": [
+                attempt
+                for item in provider_responses
+                for attempt in (item.get("http_attempts") or [])
+            ],
+            "failed": failed,
+        }
+        if error is not None:
+            metadata["error_type"] = type(error).__name__
+            metadata["error"] = str(error)
+            if isinstance(error, ChatCompletionError):
+                metadata["http_attempts"].extend(error.attempts)
+                metadata["http_retry_count"] += max(0, len(error.attempts) - 1)
+        return metadata
+
+    try:
+      for turn in range(max_turns):
         started = time.monotonic()
-        content, usage = await asyncio.to_thread(_chat_completion, settings, messages)
+        chat_result = await asyncio.to_thread(_chat_completion, settings, messages)
+        if len(chat_result) == 2:
+            content, usage = chat_result
+            provider_metadata = {}
+        else:
+            content, usage, provider_metadata = chat_result
+        provider_responses.append(provider_metadata)
         input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
         events.append({
             "type": "turn.completed",
+            "turn": turn + 1,
             "usage": {
                 "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0,
                 "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
                 "duration_ms": int(round((time.monotonic() - started) * 1000)),
             },
+            "provider": provider_metadata,
+        })
+        events.append({
+            "type": "model.response",
+            "turn": turn + 1,
+            "content": content,
+            "provider": provider_metadata,
         })
         messages.append({"role": "assistant", "content": content})
 
@@ -453,23 +654,32 @@ async def run_agent(
                 file=sys.stderr,
             )
 
+        tool_started = time.perf_counter()
+        tool_metadata: dict = {}
         try:
             if tool == "shell" and shell_enabled:
                 cmd = str(tool_input.get("cmd", ""))
                 if not cmd.strip():
                     result = "missing shell input field: cmd"
+                    tool_metadata = {"ok": False, "exit_code": 2}
                 else:
-                    result, _ = await _run_shell(
+                    result, exit_code = await _run_shell(
                         cmd,
                         container_id=container_id,
                         allow_host_tools=allow_host_tools,
                         timeout=tool_timeout,
                         output_limit=output_limit,
                     )
+                    tool_metadata = {
+                        "ok": exit_code == 0,
+                        "exit_code": exit_code,
+                        "sandboxed": container_id is not None,
+                    }
             elif tool == "web_search" and search_enabled:
                 query = str(tool_input.get("query", ""))
                 if not query.strip():
                     result = "missing web_search input field: query"
+                    tool_metadata = {"ok": False, "error_category": "missing_query"}
                 else:
                     result = await asyncio.to_thread(
                         _search_web,
@@ -477,10 +687,23 @@ async def run_agent(
                         query,
                         max_results=max_search_results,
                     )
+                    tool_metadata = {
+                        "ok": True,
+                        "provider": (search_config or {}).get("provider", "searxng"),
+                        "query": query,
+                    }
             else:
                 result = f"tool {tool!r} is not available"
+                tool_metadata = {"ok": False, "error_category": "unavailable"}
         except Exception as exc:
             result = f"tool {tool!r} failed: {type(exc).__name__}: {exc}"
+            tool_metadata = {
+                "ok": False,
+                "error_category": type(exc).__name__,
+            }
+        tool_metadata["duration_ms"] = int(round(
+            (time.perf_counter() - tool_started) * 1000
+        ))
 
         events.append({
             "type": "item.completed",
@@ -488,32 +711,54 @@ async def run_agent(
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": result,
+                "metadata": tool_metadata,
             },
         })
         messages.append({
             "role": "user",
             "content": f"Tool result for {tool}:\n{result}",
         })
+    except Exception as exc:
+        stderr_lines.append(f"{type(exc).__name__}: {exc}")
+        _SESSIONS[session_id] = messages
+        raw_stdout = (
+            "\n".join(json.dumps(event, default=str) for event in events) + "\n"
+        ).encode("utf-8")
+        raw_stderr = ("\n".join(stderr_lines) + "\n").encode("utf-8")
+        raise AgentRunError(
+            str(exc),
+            metadata=build_metadata(failed=True, error=exc),
+            events=events,
+            raw_stdout=raw_stdout,
+            raw_stderr=raw_stderr,
+            pseudo_cmd=pseudo_command(settings),
+            messages=messages,
+        ) from exc
 
     if final_response is None:
-        raise RuntimeError(f"theoria_agent exceeded max_turns={max_turns} without final response")
+        exc = RuntimeError(
+            f"theoria_agent exceeded max_turns={max_turns} without final response"
+        )
+        stderr_lines.append(str(exc))
+        _SESSIONS[session_id] = messages
+        raw_stdout = (
+            "\n".join(json.dumps(event, default=str) for event in events) + "\n"
+        ).encode("utf-8")
+        raw_stderr = ("\n".join(stderr_lines) + "\n").encode("utf-8")
+        raise AgentRunError(
+            str(exc),
+            metadata=build_metadata(failed=True, error=exc),
+            events=events,
+            raw_stdout=raw_stdout,
+            raw_stderr=raw_stderr,
+            pseudo_cmd=pseudo_command(settings),
+            messages=messages,
+        ) from exc
 
     _SESSIONS[session_id] = messages
     raw_stdout = ("\n".join(json.dumps(event) for event in events) + "\n").encode("utf-8")
     raw_stderr = ("\n".join(stderr_lines) + "\n").encode("utf-8") if stderr_lines else b""
-    metadata = {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cached_input_tokens": 0,
-        "total_cost_usd": None,
-        "tool_calls": _tool_call_previews(events),
-        "num_turns": len([e for e in events if e.get("type") == "turn.completed"]),
-        "provider_endpoint": _redact_endpoint(str(settings.get("endpoint") or settings.get("base_url") or DEFAULT_ENDPOINT)),
-        "wire_api": "chat-completions",
-        "search_enabled": search_enabled,
-        "shell_enabled": shell_enabled,
-        "role": role,
-    }
+    metadata = build_metadata()
     return AgentRunResult(
         response=final_response,
         session_id=session_id,
@@ -522,4 +767,5 @@ async def run_agent(
         raw_stdout=raw_stdout,
         raw_stderr=raw_stderr,
         pseudo_cmd=pseudo_command(settings),
+        messages=messages,
     )
