@@ -34,6 +34,7 @@ def test_llm_theoria_agent_writes_standard_artifacts(tmp_path, monkeypatch):
 
     async def fake_run_agent(*args, **kwargs):
         assert kwargs["settings"]["model"] == "fake-model"
+        assert kwargs["container_id"] == "sandbox123"
         assert kwargs["search_config"] == {"provider": "searxng", "endpoint": "http://search"}
         return agent_loop.AgentRunResult(
             response="4",
@@ -66,6 +67,7 @@ def test_llm_theoria_agent_writes_standard_artifacts(tmp_path, monkeypatch):
     log = []
     log_token = llm_module.call_log.set(log)
     artifact_token = llm_module.artifact_dir.set(str(tmp_path))
+    sandbox_token = llm_module.sandbox_container.set("sandbox123")
     try:
         response, session_id = asyncio.run(llm_module.llm(
             "What is 2+2?",
@@ -82,6 +84,7 @@ def test_llm_theoria_agent_writes_standard_artifacts(tmp_path, monkeypatch):
     finally:
         llm_module.call_log.reset(log_token)
         llm_module.artifact_dir.reset(artifact_token)
+        llm_module.sandbox_container.reset(sandbox_token)
 
     assert response == "4"
     assert session_id == "sess-1"

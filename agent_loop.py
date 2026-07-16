@@ -229,7 +229,9 @@ async def _run_shell(
     if container_id:
         argv = [
             "docker", "exec", "-w", "/workspace", container_id,
-            "bash", "-lc", cmd,
+            # Do not use a login shell here: it resets the image PATH and
+            # hides the sandbox Python/Sage environment from tool commands.
+            "bash", "-c", cmd,
         ]
     elif allow_host_tools:
         argv = ["bash", "-lc", cmd]
