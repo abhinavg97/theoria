@@ -50,3 +50,12 @@ def test_load_config_accepts_single_path_not_wrapped_in_list(tmp_path):
     config = load_config(str(override))
 
     assert config["solver"]["effort"] == "low"
+
+
+def test_no_repair_config_sets_single_pass_limits():
+    config = load_config("configs/no_repair.yaml")
+
+    assert config["_limits"] == {
+        "max_verify_attempts": 1,
+        "max_solver_answers": 1,
+    }

@@ -649,6 +649,19 @@ def print_summary(results: list[dict], by_category: bool = False) -> None:
     passed = sum(1 for r in results if r.get("verified"))
     pct_p = (100 * passed / total) if total else 0
     print(f"\n  Judge-passed: {passed}/{total} ({pct_p:.1f}%)")
+    repair_rows = [r["repair_metrics"] for r in results if r.get("repair_metrics")]
+    if repair_rows:
+        repair_attempted = sum(1 for r in repair_rows if r.get("repair_attempted"))
+        certified_by_repair = sum(1 for r in repair_rows if r.get("certified_by_repair"))
+        answer_changed = sum(
+            1 for r in repair_rows if r.get("answer_changed_during_repair")
+        )
+        print(
+            "  Repair: "
+            f"{repair_attempted}/{len(repair_rows)} attempted · "
+            f"{certified_by_repair} certified by repair · "
+            f"{answer_changed} answer changed"
+        )
     if have_key:
         correct = sum(1 for r in results if r.get("correct"))
         pct_c = (100 * correct / total) if total else 0

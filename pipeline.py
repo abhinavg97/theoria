@@ -630,6 +630,80 @@ def max_solver_answers() -> int:
     return int(_limits().get("max_solver_answers", _DEFAULT_MAX_SOLVER_ANSWERS))
 
 
+def _answer_from_proof_dict(proof_dict: dict | None) -> str | None:
+    if not proof_dict:
+        return None
+    steps = proof_dict.get("steps") or []
+    if not steps:
+        return None
+    state = steps[-1].get("state") or []
+    if not state:
+        return None
+    return str(state[0])
+
+
+def _build_repair_metrics(
+    attempts: list[dict],
+    *,
+    max_verify: int,
+    max_solver: int,
+    solver_answers: int,
+    final_answer: str | None,
+    verified: bool,
+) -> dict:
+    verify_attempt_records = [
+        attempt for attempt in attempts if attempt.get("phase") == "verify"
+    ]
+    first_attempt = attempts[0] if attempts else None
+    first_verify = verify_attempt_records[0] if verify_attempt_records else None
+    first_attempt_answer = _answer_from_proof_dict(
+        first_verify.get("proof") if first_verify else None
+    )
+    first_attempt_verified = bool(
+        first_attempt
+        and first_attempt.get("phase") == "verify"
+        and first_attempt.get("all_ok")
+    )
+    verify_attempts = len(verify_attempt_records)
+    solver_retries = max(0, solver_answers - 1)
+    judge_repair_rounds = max(0, verify_attempts - 1)
+    repair_attempted = bool(judge_repair_rounds or solver_retries)
+    answer_changed = (
+        repair_attempted
+        and first_attempt_answer is not None
+        and final_answer is not None
+        and first_attempt_answer.strip() != str(final_answer).strip()
+    )
+
+    return {
+        "repair_enabled": max_verify > 1 or max_solver > 1,
+        "repair_attempted": repair_attempted,
+        "max_verify_attempts": max_verify,
+        "max_solver_answers": max_solver,
+        "verify_attempts": verify_attempts,
+        "solver_answers": solver_answers,
+        "solver_retries": solver_retries,
+        "formalizer_reject_count": sum(
+            1 for attempt in attempts
+            if attempt.get("phase") == "formalizer_reject"
+        ),
+        "formalizer_invalid_count": sum(
+            1 for attempt in attempts
+            if attempt.get("phase") == "formalizer_invalid"
+        ),
+        "judge_repair_rounds": judge_repair_rounds,
+        "first_attempt_verified": first_attempt_verified,
+        "final_verified": bool(verified),
+        "certified_by_repair": bool(
+            verified and repair_attempted and not first_attempt_verified
+        ),
+        "first_attempt_answer": first_attempt_answer,
+        "answer_before_repair": first_attempt_answer if repair_attempted else None,
+        "final_answer": final_answer,
+        "answer_changed_during_repair": answer_changed,
+    }
+
+
 async def _solver_call(problem, solver_session, retry_reason=None):
     """First solve or retry. Returns (solution, session_id)."""
     if solver_session is None:
@@ -1084,6 +1158,14 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         verified_under_assumptions = []
 
     verified_unconditionally = bool(verified and not verified_under_assumptions)
+    repair_metrics = _build_repair_metrics(
+        attempts,
+        max_verify=max_verify,
+        max_solver=max_solver,
+        solver_answers=solver_answers,
+        final_answer=answer,
+        verified=verified,
+    )
 
     print(f"\n{'='*40}")
     if verified and verified_under_assumptions:
@@ -1105,6 +1187,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         "proof": proof_dict,
         "verdicts": verdicts_dict,
         "attempts": attempts,
+        "repair_metrics": repair_metrics,
     }
 
 if __name__ == "__main__":

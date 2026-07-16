@@ -6,6 +6,7 @@ from pipeline import (
     Proof,
     Step,
     Verdict,
+    _build_repair_metrics,
     _format_failed_verdicts,
     _format_proof,
     _formalizer_decision_feedback,
@@ -98,6 +99,116 @@ def test_limits_read_from_config_when_present(monkeypatch):
     assert max_solver_answers() == 1
 
 
+def test_repair_metrics_mark_no_repair_baseline():
+    attempts = [{
+        "phase": "verify",
+        "all_ok": True,
+        "proof": {
+            "initial_state": ["ANSWER"],
+            "steps": [{
+                "state": ["42"],
+                "justification_type": "computation",
+                "justification": "6 * 7 = 42",
+            }],
+        },
+    }]
+
+    metrics = _build_repair_metrics(
+        attempts,
+        max_verify=1,
+        max_solver=1,
+        solver_answers=1,
+        final_answer="42",
+        verified=True,
+    )
+
+    assert metrics["repair_enabled"] is False
+    assert metrics["repair_attempted"] is False
+    assert metrics["verify_attempts"] == 1
+    assert metrics["solver_answers"] == 1
+    assert metrics["first_attempt_verified"] is True
+    assert metrics["certified_by_repair"] is False
+    assert metrics["answer_changed_during_repair"] is False
+
+
+def test_repair_metrics_track_certified_answer_flip():
+    attempts = [
+        {
+            "phase": "verify",
+            "all_ok": False,
+            "proof": {
+                "initial_state": ["ANSWER"],
+                "steps": [{
+                    "state": ["41"],
+                    "justification_type": "computation",
+                    "justification": "bad arithmetic",
+                }],
+            },
+        },
+        {
+            "phase": "verify",
+            "all_ok": True,
+            "proof": {
+                "initial_state": ["ANSWER"],
+                "steps": [{
+                    "state": ["42"],
+                    "justification_type": "computation",
+                    "justification": "6 * 7 = 42",
+                }],
+            },
+        },
+    ]
+
+    metrics = _build_repair_metrics(
+        attempts,
+        max_verify=3,
+        max_solver=1,
+        solver_answers=1,
+        final_answer="42",
+        verified=True,
+    )
+
+    assert metrics["repair_enabled"] is True
+    assert metrics["repair_attempted"] is True
+    assert metrics["judge_repair_rounds"] == 1
+    assert metrics["first_attempt_verified"] is False
+    assert metrics["certified_by_repair"] is True
+    assert metrics["first_attempt_answer"] == "41"
+    assert metrics["answer_before_repair"] == "41"
+    assert metrics["final_answer"] == "42"
+    assert metrics["answer_changed_during_repair"] is True
+
+
+def test_repair_metrics_track_solver_retry():
+    metrics = _build_repair_metrics(
+        [
+            {"phase": "formalizer_reject", "reject_reason": "bad answer"},
+            {
+                "phase": "verify",
+                "all_ok": True,
+                "proof": {
+                    "initial_state": ["ANSWER"],
+                    "steps": [{
+                        "state": ["42"],
+                        "justification_type": "computation",
+                        "justification": "6 * 7 = 42",
+                    }],
+                },
+            },
+        ],
+        max_verify=3,
+        max_solver=3,
+        solver_answers=2,
+        final_answer="42",
+        verified=True,
+    )
+
+    assert metrics["repair_attempted"] is True
+    assert metrics["solver_retries"] == 1
+    assert metrics["formalizer_reject_count"] == 1
+    assert metrics["certified_by_repair"] is True
+
+
 def test_formalizer_schema_accepts_proof_without_reject_reason():
     validate({
         "action": "proof",
@@ -152,6 +263,83 @@ def test_formalizer_missing_proof_is_reprompted(monkeypatch):
     assert result["attempts"][0]["decision"] == {"action": "proof"}
     assert result["attempts"][1]["phase"] == "verify"
     assert [c["role"] for c in calls].count("formalizer") == 2
+    assert result["repair_metrics"]["formalizer_invalid_count"] == 1
+    assert result["repair_metrics"]["repair_attempted"] is False
+
+
+def test_run_records_repair_metrics_after_judge_repair(monkeypatch):
+    calls = []
+    bad_proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": ["41"],
+            "justification_type": "computation",
+            "justification": "6 * 7 = 41",
+        }],
+    }
+    repaired_proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": ["42"],
+            "justification_type": "computation",
+            "justification": "6 * 7 = 42",
+        }],
+    }
+
+    async def fake_llm(
+        prompt,
+        *,
+        role="solver",
+        schema=None,
+        system=None,
+        resume=None,
+    ):
+        calls.append({"role": role, "prompt": prompt, "resume": resume})
+        if role == "solver":
+            return "6 * 7 = 42", "solver-session"
+        if role == "formalizer":
+            formalizer_calls = [c for c in calls if c["role"] == "formalizer"]
+            if len(formalizer_calls) == 1:
+                return {"action": "proof", "proof": bad_proof}, "formalizer-session"
+            assert "Your proof failed verification" in prompt
+            return {"action": "proof", "proof": repaired_proof}, "formalizer-session"
+        if role == "initial_state":
+            return {"accepted": True, "reason": "ok"}, None
+        if role == "computation":
+            accepted = "6 * 7 = 42" in prompt and "['42']" in prompt
+            return {
+                "accepted": accepted,
+                "reason": "ok" if accepted else "wrong arithmetic",
+            }, None
+        if role == "pedantry":
+            return {"is_pedantic": False, "reason": "legitimate"}, None
+        if role == "convention_lift":
+            return {
+                "can_lift": False,
+                "convention": "",
+                "source": "",
+                "reasoning": "no convention fixes arithmetic",
+            }, None
+        raise AssertionError(f"unexpected role {role}")
+
+    monkeypatch.setattr(pipeline, "llm", fake_llm)
+    monkeypatch.setitem(pipeline.CONFIG, "_limits", {
+        "max_verify_attempts": 3,
+        "max_solver_answers": 1,
+    })
+
+    result = asyncio.run(pipeline.run("Compute 6*7."))
+
+    assert result["verified"] is True
+    assert [a["phase"] for a in result["attempts"]] == ["verify", "verify"]
+    assert result["repair_metrics"]["repair_enabled"] is True
+    assert result["repair_metrics"]["repair_attempted"] is True
+    assert result["repair_metrics"]["judge_repair_rounds"] == 1
+    assert result["repair_metrics"]["solver_retries"] == 0
+    assert result["repair_metrics"]["certified_by_repair"] is True
+    assert result["repair_metrics"]["answer_before_repair"] == "41"
+    assert result["repair_metrics"]["final_answer"] == "42"
+    assert result["repair_metrics"]["answer_changed_during_repair"] is True
 
 
 def test_formalizer_decision_feedback_reports_missing_action_fields():
