@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone
 
 import pipeline
@@ -28,6 +32,214 @@ from pipeline import run, CONFIG, load_config
 
 
 # ── Run-level metadata capture ───────────────────────────────────
+
+_REDACTED = "<redacted>"
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_json(value) -> str:
+    return _sha256_text(_canonical_json(value))
+
+
+def _file_sha256(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ""
+    return urllib.parse.urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
+
+
+def _is_secret_key(key: str) -> bool:
+    key = key.lower().replace("-", "_")
+    if key.endswith("_env"):
+        return False
+    secret_names = {
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "credentials",
+    }
+    return key in secret_names or any(key.endswith(f"_{name}") for name in secret_names)
+
+
+def _redact_config_value(key: str | None, value):
+    if key and _is_secret_key(key):
+        return _REDACTED if value else value
+    if key in {"endpoint", "base_url"} and isinstance(value, str):
+        return _redact_url(value)
+    if isinstance(value, dict):
+        return {
+            k: _redact_config_value(str(k), v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, list):
+        return [_redact_config_value(None, item) for item in value]
+    return value
+
+
+def _redact_config(config: dict) -> dict:
+    return _redact_config_value(None, config)
+
+
+def _role_items(config: dict) -> list[tuple[str, dict]]:
+    return [
+        (role, settings)
+        for role, settings in sorted(config.items())
+        if not role.startswith("_") and isinstance(settings, dict)
+    ]
+
+
+def _role_model_manifest(config: dict) -> dict:
+    manifest = {}
+    for role, settings in _role_items(config):
+        redacted = _redact_config_value(role, settings)
+        manifest[role] = {
+            "backend": settings.get("backend", "claude"),
+            "model": settings.get("model"),
+            "endpoint": (
+                _redact_url(str(settings.get("endpoint") or settings.get("base_url")))
+                if (settings.get("endpoint") or settings.get("base_url"))
+                else None
+            ),
+            "effort": settings.get("effort"),
+            "temperature": settings.get("temperature"),
+            "max_tokens": settings.get("max_tokens"),
+            "context_length": settings.get("context_length"),
+            "settings_sha256": _sha256_json(redacted),
+        }
+    return manifest
+
+
+def _prompt_fingerprints(config: dict) -> dict:
+    fingerprints = {}
+    for role, settings in _role_items(config):
+        prompt = settings.get("prompt", "")
+        if settings.get("preamble") and config.get("_preamble"):
+            prompt = f"{config['_preamble']}\n\n{prompt}"
+        fingerprints[role] = {
+            "prompt_sha256": _sha256_text(prompt),
+            "prompt_chars": len(prompt),
+            "preamble_enabled": bool(settings.get("preamble")),
+        }
+    return fingerprints
+
+
+def _config_source_fingerprints(paths: list[str]) -> list[dict]:
+    return [
+        {
+            "path": path,
+            "sha256": _file_sha256(path),
+        }
+        for path in paths
+    ]
+
+
+def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
+    redacted_config = _redact_config(config)
+    config_sources = [str(pipeline.DEFAULTS_PATH)] + [
+        str(p) for p in args_ref.get("config_paths", [])
+    ]
+    return {
+        "config": redacted_config,
+        "config_sha256": _sha256_json(redacted_config),
+        "config_sources": config_sources,
+        "config_source_fingerprints": _config_source_fingerprints(config_sources),
+        "role_model_manifest": _role_model_manifest(config),
+        "prompt_fingerprints": _prompt_fingerprints(config),
+        "limits": dict(config.get("_limits") or {}),
+        "run_args": {
+            "backend": args_ref.get("backend"),
+            "codex_model": args_ref.get("codex_model"),
+            "watch": args_ref.get("watch"),
+            "docker": args_ref.get("docker"),
+            "image": args_ref.get("image"),
+        },
+    }
+
+
+def _problem_set_manifest(problems: list[dict]) -> dict:
+    ids = [str(p.get("id", "")) for p in problems]
+    records = [
+        {
+            "id": p.get("id"),
+            "question": p.get("question"),
+            "answer": p.get("answer"),
+            "category": p.get("category"),
+            "dataset": p.get("dataset"),
+            "dataset_source": p.get("dataset_source"),
+            "dataset_split": p.get("dataset_split"),
+            "dataset_subset": p.get("dataset_subset"),
+            "verified_class": p.get("verified_class"),
+        }
+        for p in problems
+    ]
+    metadata_fields = sorted({
+        key
+        for problem in problems
+        for key in problem
+        if key not in {"question", "answer"}
+    })
+    return {
+        "count": len(problems),
+        "ids": ids,
+        "ids_sha256": _sha256_json(ids),
+        "records_sha256": _sha256_json(records),
+        "metadata_fields": metadata_fields,
+        "datasets": sorted({
+            str(p.get("dataset"))
+            for p in problems
+            if p.get("dataset")
+        }),
+        "dataset_sources": sorted({
+            str(p.get("dataset_source"))
+            for p in problems
+            if p.get("dataset_source")
+        }),
+        "dataset_splits": sorted({
+            str(p.get("dataset_split"))
+            for p in problems
+            if p.get("dataset_split")
+        }),
+        "categories": dict(Counter(
+            str(p.get("category", "?")) for p in problems if p.get("category")
+        )),
+        "verified_classes": dict(Counter(
+            str(p.get("verified_class")) for p in problems
+            if p.get("verified_class")
+        )),
+    }
+
 
 def _safe_version(binary: str) -> str | None:
     """Run `<binary> --version` and return the stripped output.
@@ -97,13 +309,18 @@ def make_artifact_root(save_path: str) -> str:
         "cwd": os.getcwd(),
         "hostname": __import__("socket").gethostname(),
         "python_version": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
         "save_path": save_path,
-        "config": dict(CONFIG),
+        "config": _redact_config(CONFIG),
+        "config_sha256": _sha256_json(_redact_config(CONFIG)),
         "cli_versions": {
             "claude": _safe_version("claude"),
             "codex": _safe_version("codex"),
+            "docker": _safe_version("docker"),
         },
         "git": _safe_git_state(),
+        "research_audit": _research_audit_metadata(CONFIG, _args_ref),
     }
     # If we're resuming an existing run, preserve the original metadata
     # and append resume info as a list of resume events. This keeps a
@@ -194,6 +411,10 @@ def apply_args(args) -> None:
     # Pulled in run_problems; expose here so runners don't need to thread it.
     _args_ref["docker"] = bool(getattr(args, "docker", False))
     _args_ref["image"] = getattr(args, "image", None) or sbx.DEFAULT_IMAGE
+    _args_ref["config_paths"] = list(getattr(args, "config", None) or [])
+    _args_ref["backend"] = getattr(args, "backend", None)
+    _args_ref["codex_model"] = getattr(args, "codex_model", None)
+    _args_ref["watch"] = bool(getattr(args, "watch", False))
 
 
 def config_uses_backend(backend: str) -> bool:
@@ -407,6 +628,9 @@ async def run_one(
     total_cost = 0.0
     has_cost = False
     total_llm_duration_ms = 0
+    total_tool_calls = 0
+    tool_calls_by_name: dict[str, int] = {}
+    tool_calls_by_role: dict[str, dict[str, int]] = {}
     for c in calls:
         r = c.get("role", "?")
         calls_by_role[r] = calls_by_role.get(r, 0) + 1
@@ -423,6 +647,12 @@ async def run_one(
         if cost is not None:
             total_cost += cost
             has_cost = True
+        for tool_call in c.get("tool_calls") or []:
+            name = tool_call.get("tool_name") or "unknown"
+            total_tool_calls += 1
+            tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + 1
+            role_tools = tool_calls_by_role.setdefault(r, {})
+            role_tools[name] = role_tools.get(name, 0) + 1
 
     result["calls"] = calls
     # TODO: cost/token accounting needs an end-to-end audit before these are trusted.
@@ -444,6 +674,9 @@ async def run_one(
         "total_cache_read_input_tokens": total_cache_read,
         "total_tokens": total_input + total_output,
         "total_cost_usd": total_cost if has_cost else None,
+        "total_tool_calls": total_tool_calls,
+        "tool_calls_by_name": tool_calls_by_name,
+        "tool_calls_by_role": tool_calls_by_role,
     }
 
     # Carry over all problem metadata (id, category, expected, etc.)
@@ -499,6 +732,9 @@ async def run_problems(
     """
     artifact_root = make_artifact_root(save_path)
     print(f"Artifact root: {artifact_root}")
+    update_artifact_root_meta(artifact_root, {
+        "problem_set": _problem_set_manifest(problems),
+    })
 
     use_docker = _args_ref.get("docker", False)
     sandbox_image = _args_ref.get("image") or sbx.DEFAULT_IMAGE

@@ -117,7 +117,8 @@ and is unaudited.
 runs/<command>_<tag>_<timestamp>.json     the results (one entry per problem)
 runs/partial/<id>.json                    crash-safe live snapshot
 runs/artifacts/<run_id>/
-    meta.json                             argv, config, model + CLI versions,
+    meta.json                             argv, redacted config, config/prompt/model
+                                          fingerprints, problem-set manifest,
                                           git sha, sandbox image digest
     <problem_id>/call_NNN_<role>/         every prompt, response, tool call,
                                           and raw event stream, per LLM call

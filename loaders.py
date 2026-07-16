@@ -72,6 +72,10 @@ def load_hle(
             "id": ex["id"],
             "question": ex["question"],
             "answer": ex["answer"],
+            "dataset": "HLE-Verified",
+            "dataset_source": "skylenage/HLE-Verified",
+            "dataset_split": "train",
+            "dataset_subset": subset if subset and id_set is None else "ids",
             "answer_type": meta.get("answer_type", ""),
             "category": ex["category"],
             "verified_class": ex["Verified_Classes"],
@@ -91,4 +95,5 @@ def build_question(question: str, problem_id: str = "question") -> list[dict]:
         "id": problem_id,
         "question": question,
         "answer": "",
+        "dataset": "custom",
     }]

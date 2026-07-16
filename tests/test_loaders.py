@@ -7,6 +7,7 @@ def test_build_question_default_id():
         "id": "question",
         "question": "What is 2 + 2?",
         "answer": "",
+        "dataset": "custom",
     }]
 
 
@@ -15,3 +16,4 @@ def test_build_question_custom_id():
     assert len(problems) == 1
     assert problems[0]["id"] == "primes"
     assert problems[0]["answer"] == ""
+    assert problems[0]["dataset"] == "custom"
