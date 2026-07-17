@@ -410,34 +410,45 @@ def copy_from_container(container_id: str, src: str, dst: str) -> bool:
 
 
 def copy_to_container(container_id: str, src: str, dst: str) -> bool:
-    """Restore a host directory into a container and give it to UID 1000."""
+    """Restore a host directory as UID 1000 inside a hardened container."""
     source = Path(src)
     if not source.is_dir():
         return False
     try:
         mkdir = subprocess.run(
-            ["docker", "exec", "-u", "0", container_id, "mkdir", "-p", dst],
+            [
+                "docker", "exec", "-u", "1000:1000", container_id,
+                "mkdir", "-p", dst,
+            ],
             capture_output=True,
             timeout=30,
         )
         if mkdir.returncode != 0:
             return False
-        copied = subprocess.run(
-            ["docker", "cp", f"{source}/.", f"{container_id}:{dst}"],
-            capture_output=True,
-            timeout=60,
-        )
-        if copied.returncode != 0:
-            return False
-        owned = subprocess.run(
-            [
-                "docker", "exec", "-u", "0", container_id,
-                "chown", "-R", "1000:1000", dst,
-            ],
-            capture_output=True,
-            timeout=30,
-        )
-        return owned.returncode == 0
+        # `docker cp` creates root-owned files. A container started with
+        # --cap-drop=ALL cannot chown them afterward, even via `docker exec -u
+        # 0`. Stream a tar archive into a process running as the runtime user
+        # instead, so restored files are writable without adding CAP_CHOWN.
+        with tempfile.TemporaryFile() as archive:
+            packed = subprocess.run(
+                ["tar", "-C", str(source), "-cf", "-", "."],
+                stdout=archive,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            if packed.returncode != 0:
+                return False
+            archive.seek(0)
+            restored = subprocess.run(
+                [
+                    "docker", "exec", "-i", "-u", "1000:1000",
+                    container_id, "tar", "-C", dst, "-xf", "-",
+                ],
+                stdin=archive,
+                capture_output=True,
+                timeout=60,
+            )
+        return restored.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
 

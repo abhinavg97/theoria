@@ -742,6 +742,38 @@ def test_run_one_restores_docker_provider_and_workspace_state(tmp_path, monkeypa
     assert result["verified"] is True
 
 
+def test_copy_to_container_restores_as_runtime_user_without_chown(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    (source / "state.txt").write_text("state")
+    commands = []
+
+    class Result:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **kwargs):
+        commands.append(tuple(argv))
+        if argv[0] == "tar":
+            kwargs["stdout"].write(b"archive")
+        return Result()
+
+    monkeypatch.setattr(harness.sbx.subprocess, "run", fake_run)
+
+    assert harness.sbx.copy_to_container(
+        "container123", str(source), "/workspace",
+    ) is True
+    assert commands[0][:6] == (
+        "docker", "exec", "-u", "1000:1000", "container123", "mkdir",
+    )
+    assert commands[-1][:7] == (
+        "docker", "exec", "-i", "-u", "1000:1000", "container123", "tar",
+    )
+    assert all("chown" not in command for command in commands)
+
+
 def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
     results = [
         {
