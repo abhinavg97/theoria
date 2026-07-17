@@ -96,6 +96,48 @@ def test_grade_run_captures_calls_and_reproducibility_artifacts(
     assert any(entry["path"] == "meta.json" for entry in manifest["entries"])
 
 
+def test_malformed_verdict_fails_only_its_problem(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([
+        {"id": "bad", "problem": "Q1", "expected": "A", "answer": "A"},
+        {"id": "good", "problem": "Q2", "expected": "B", "answer": "B"},
+    ]))
+    calls = 0
+
+    async def fake_grade_one(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"attempts": []}
+        return {
+            "final": {
+                "key_match": True,
+                "reasoning": "match",
+                "dispute_category": "none",
+            },
+            "attempts": [],
+        }
+
+    monkeypatch.setattr(grade, "grade_one", fake_grade_one)
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(str(source), watch=False))
+
+    assert calls == 2
+    assert summary["key_match"] == 1
+    assert summary["metrics"]["successful_grades"] == 1
+    assert "missing a valid final grade" in summary["results"][0]["error"]
+    assert summary["results"][1]["final"]["key_match"] is True
+    meta = json.loads(
+        (Path(summary["artifact_root"]) / "meta.json").read_text()
+    )
+    assert meta["status"] == "completed_with_errors"
+
+
 def test_grade_run_uses_one_immutable_source_snapshot(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _stub_audit_environment(monkeypatch)

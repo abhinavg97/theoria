@@ -51,7 +51,10 @@ logger = get_logger("harness")
 # ── Run-level metadata capture ───────────────────────────────────
 
 _REDACTED = "<redacted>"
-AUDIT_SCHEMA_VERSION = "1.2"
+AUDIT_SCHEMA_VERSION = "1.3"
+PROBLEM_CHECKPOINT_FILENAME = "_problem_checkpoint.json"
+INTERRUPTED_ATTEMPTS_DIR = "_interrupted_attempts"
+RETRY_CHECKPOINTS_DIR = "_retry_checkpoints"
 
 
 def _canonical_json(value) -> str:
@@ -719,7 +722,12 @@ def _host_runtime_metadata() -> dict:
     }
 
 
-def _capture_host_environment(root: str, label: str) -> dict:
+def _capture_host_environment(
+    root: str,
+    label: str,
+    *,
+    prefer_pip_freeze: bool = True,
+) -> dict:
     path = os.path.join(root, f"host_packages_{label}.txt")
 
     def persist(payload: bytes, source: str) -> dict:
@@ -733,18 +741,21 @@ def _capture_host_environment(root: str, label: str) -> dict:
             "size_bytes": len(payload),
         }
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "freeze"],
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            return persist(result.stdout, "pip-freeze")
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        pip_error = f"{type(exc).__name__}: {exc}"
+    if prefer_pip_freeze:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "freeze"],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return persist(result.stdout, "pip-freeze")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            pip_error = f"{type(exc).__name__}: {exc}"
+        else:
+            pip_error = result.stderr.decode(errors="replace")[:500]
     else:
-        pip_error = result.stderr.decode(errors="replace")[:500]
+        pip_error = "pip freeze skipped outside evaluation/ablation runs"
 
     try:
         packages = sorted({
@@ -865,6 +876,249 @@ def verify_artifact_manifest(root: str) -> dict:
     return manifest
 
 
+def _problem_artifact_directory(root: str, problem_id: object) -> str:
+    root = os.path.abspath(root)
+    path = os.path.abspath(os.path.join(root, str(problem_id)))
+    try:
+        inside_root = os.path.commonpath([root, path]) == root
+    except ValueError:
+        inside_root = False
+    if not inside_root or path == root:
+        raise ValueError(
+            f"problem ID escapes the artifact root: {problem_id!r}"
+        )
+    return path
+
+
+def _write_problem_checkpoint(
+    root: str,
+    problem: dict,
+    result: dict,
+) -> str:
+    """Atomically seal one completed problem for crash-safe resume.
+
+    A global run manifest cannot stay current while other problems are still
+    writing concurrently. Per-problem checkpoints are immutable once written,
+    so a later process can reuse only complete, hash-verified results and
+    quarantine every partial problem directory left by an unclean shutdown.
+    """
+    problem_id = str(problem.get("id", "?"))
+    problem_dir = _problem_artifact_directory(root, problem_id)
+    os.makedirs(problem_dir, exist_ok=True)
+    checkpoint_path = os.path.join(
+        problem_dir, PROBLEM_CHECKPOINT_FILENAME,
+    )
+    checkpoint_tmp = checkpoint_path + ".tmp"
+    result_path = os.path.join(problem_dir, "result.json")
+    result_tmp = result_path + ".tmp"
+
+    with open(result_tmp, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    os.replace(result_tmp, result_path)
+    try:
+        os.unlink(checkpoint_tmp)
+    except FileNotFoundError:
+        pass
+
+    entries = []
+    for directory, _, filenames in os.walk(problem_dir):
+        for filename in sorted(filenames):
+            path = os.path.abspath(os.path.join(directory, filename))
+            if path in {checkpoint_path, checkpoint_tmp}:
+                continue
+            if os.path.islink(path):
+                raise OSError(
+                    f"refusing to checkpoint symlinked artifact: {path}"
+                )
+            digest = _file_sha256(path)
+            if digest is None:
+                raise OSError(f"could not hash problem artifact: {path}")
+            entries.append({
+                "path": os.path.relpath(path, problem_dir),
+                "size_bytes": os.path.getsize(path),
+                "sha256": digest,
+            })
+    payload = {
+        "schema_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "problem_id": problem_id,
+        "problem_record_sha256": _sha256_json(problem),
+        "result_path": "result.json",
+        "entries": sorted(entries, key=lambda entry: entry["path"]),
+    }
+    with open(checkpoint_tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(checkpoint_tmp, checkpoint_path)
+    return checkpoint_path
+
+
+def _verify_problem_checkpoint(
+    root: str,
+    problem: dict,
+) -> tuple[dict, dict]:
+    """Verify one immutable problem checkpoint and return its result."""
+    problem_id = str(problem.get("id", "?"))
+    problem_dir = _problem_artifact_directory(root, problem_id)
+    checkpoint_path = os.path.join(
+        problem_dir, PROBLEM_CHECKPOINT_FILENAME,
+    )
+    try:
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"problem checkpoint is missing or unreadable: {checkpoint_path}"
+        ) from exc
+    if (
+        checkpoint.get("schema_version") != "1.0"
+        or checkpoint.get("problem_id") != problem_id
+        or checkpoint.get("problem_record_sha256") != _sha256_json(problem)
+        or not isinstance(checkpoint.get("entries"), list)
+    ):
+        raise RuntimeError(
+            f"problem checkpoint identity mismatch: {checkpoint_path}"
+        )
+
+    expected_files: set[str] = set()
+    for entry in checkpoint["entries"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise RuntimeError(
+                f"invalid problem checkpoint entry: {entry!r}"
+            )
+        recorded_path = entry["path"]
+        if os.path.isabs(recorded_path):
+            raise RuntimeError(
+                f"problem checkpoint path is absolute: {recorded_path!r}"
+            )
+        normalized = os.path.normpath(recorded_path)
+        path = os.path.abspath(os.path.join(problem_dir, normalized))
+        try:
+            inside_problem = os.path.commonpath([problem_dir, path]) == problem_dir
+        except ValueError:
+            inside_problem = False
+        if not inside_problem or normalized in {".", ".."}:
+            raise RuntimeError(
+                f"problem checkpoint path escapes its directory: {recorded_path!r}"
+            )
+        if normalized in expected_files:
+            raise RuntimeError(
+                f"duplicate problem checkpoint path: {recorded_path!r}"
+            )
+        expected_files.add(normalized)
+        if os.path.islink(path):
+            raise RuntimeError(f"checkpointed artifact is a symlink: {path}")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"checkpointed artifact is missing: {path}")
+        if os.path.getsize(path) != entry.get("size_bytes"):
+            raise RuntimeError(
+                f"checkpointed artifact size mismatch: {path}"
+            )
+        if _file_sha256(path) != entry.get("sha256"):
+            raise RuntimeError(
+                f"checkpointed artifact hash mismatch: {path}"
+            )
+
+    actual_files: set[str] = set()
+    for directory, _, filenames in os.walk(problem_dir):
+        for filename in filenames:
+            path = os.path.abspath(os.path.join(directory, filename))
+            if path == checkpoint_path:
+                continue
+            actual_files.add(os.path.relpath(path, problem_dir))
+    if actual_files != expected_files:
+        raise RuntimeError(
+            "checkpointed problem file set mismatch: "
+            f"missing={sorted(expected_files - actual_files)} "
+            f"unexpected={sorted(actual_files - expected_files)}"
+        )
+
+    result_relpath = checkpoint.get("result_path")
+    if result_relpath not in expected_files:
+        raise RuntimeError(
+            f"problem checkpoint has no sealed result: {checkpoint_path}"
+        )
+    result_path = os.path.join(problem_dir, result_relpath)
+    try:
+        with open(result_path) as f:
+            result = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"checkpointed result is unreadable: {result_path}"
+        ) from exc
+    if not isinstance(result, dict) or str(result.get("id")) != problem_id:
+        raise RuntimeError(
+            f"checkpointed result identity mismatch: {result_path}"
+        )
+    return result, checkpoint
+
+
+def _recover_problem_checkpoints(
+    root: str,
+    problems: list[dict],
+    *,
+    integrity_mode: str | None,
+) -> list[dict]:
+    """Load sealed results and isolate unsealed crash residue."""
+    recovered = []
+    quarantined = []
+    retryable = []
+    recovery_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    for index, problem in enumerate(problems):
+        problem_id = str(problem.get("id", "?"))
+        problem_dir = _problem_artifact_directory(root, problem_id)
+        checkpoint_path = os.path.join(
+            problem_dir, PROBLEM_CHECKPOINT_FILENAME,
+        )
+        if os.path.isfile(checkpoint_path):
+            result, _ = _verify_problem_checkpoint(root, problem)
+            if result.get("error"):
+                archive_root = os.path.join(
+                    root, RETRY_CHECKPOINTS_DIR, recovery_label,
+                )
+                os.makedirs(archive_root, exist_ok=True)
+                archive_name = (
+                    f"problem_{index:05d}_{_sha256_text(problem_id)[:12]}.json"
+                )
+                archive_path = os.path.join(archive_root, archive_name)
+                os.replace(checkpoint_path, archive_path)
+                retryable.append({
+                    "problem_id": problem_id,
+                    "prior_checkpoint": os.path.relpath(archive_path, root),
+                    "reason": "prior completed result contained an error",
+                })
+                continue
+            recovered.append(result)
+            continue
+        if not os.path.isdir(problem_dir) or integrity_mode != "problem_checkpoints":
+            continue
+
+        archive_root = os.path.join(
+            root, INTERRUPTED_ATTEMPTS_DIR, recovery_label,
+        )
+        os.makedirs(archive_root, exist_ok=True)
+        archive_name = (
+            f"problem_{index:05d}_{_sha256_text(problem_id)[:12]}"
+        )
+        archive_path = os.path.join(archive_root, archive_name)
+        os.replace(problem_dir, archive_path)
+        quarantined.append({
+            "problem_id": problem_id,
+            "path": os.path.relpath(archive_path, root),
+            "reason": "no valid completed-problem checkpoint",
+        })
+
+    meta = _read_meta(root)
+    resumes = meta.get("resumes") or []
+    if resumes:
+        resumes[-1]["verified_problem_checkpoint_ids"] = [
+            str(result.get("id")) for result in recovered
+        ]
+        resumes[-1]["quarantined_incomplete_artifacts"] = quarantined
+        resumes[-1]["retryable_error_checkpoints"] = retryable
+        _write_meta(root, meta)
+    return recovered
+
+
 def _resume_identity(meta: dict) -> dict:
     audit = meta.get("research_audit") or {}
     git = meta.get("git") or {}
@@ -909,13 +1163,41 @@ def make_artifact_root(
 
     meta_path = os.path.join(root, "meta.json")
     is_resume = os.path.exists(meta_path)
+    existing: dict | None = None
     verified_manifest: dict | None = None
     prior_manifest_sha256: str | None = None
+    manifest_error: str | None = None
+    integrity_mode: str | None = None
     if is_resume:
-        verified_manifest = verify_artifact_manifest(root)
-        prior_manifest_sha256 = _file_sha256(
-            os.path.join(root, "artifact_manifest.json")
-        )
+        try:
+            with open(meta_path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(
+                "cannot resume because the existing run metadata is "
+                f"unreadable: {meta_path}. Start a new run instead."
+            ) from exc
+        if not isinstance(existing, dict):
+            raise RuntimeError(
+                "cannot resume because the existing run metadata is not an "
+                f"object: {meta_path}. Start a new run instead."
+            )
+        try:
+            verified_manifest = verify_artifact_manifest(root)
+        except RuntimeError as exc:
+            if existing.get("status") != "running":
+                raise
+            # A hard-killed run has readable identity metadata but may have no
+            # final run manifest, or a stale one from an earlier resume. Only
+            # independently sealed completed-problem checkpoints can be
+            # reused; all other problem artifacts are quarantined below.
+            manifest_error = str(exc)
+            integrity_mode = "problem_checkpoints"
+        else:
+            prior_manifest_sha256 = _file_sha256(
+                os.path.join(root, "artifact_manifest.json")
+            )
+            integrity_mode = "sealed_manifest"
     invocation_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     research_audit = _research_audit_metadata(CONFIG, _args_ref)
     new_meta = {
@@ -931,7 +1213,14 @@ def make_artifact_root(
         "host_runtime": _host_runtime_metadata(),
         "host_environment": (
             None if is_resume
-            else _capture_host_environment(root, invocation_label)
+            else _capture_host_environment(
+                root,
+                invocation_label,
+                prefer_pip_freeze=(
+                    _args_ref.get("experiment_phase")
+                    in {"evaluation", "ablation"}
+                ),
+            )
         ),
         "save_path": save_path,
         "config": _redact_config(CONFIG),
@@ -950,14 +1239,14 @@ def make_artifact_root(
         ),
         "research_audit": research_audit,
     }
+    if problem_manifest is not None:
+        new_meta["problem_set"] = problem_manifest
     new_meta["resume_identity"] = _resume_identity(new_meta)
     # If we're resuming an existing run, preserve the original metadata
     # and append resume info as a list of resume events. This keeps a
     # full audit trail of every (re-)invocation against this run dir.
-    if os.path.exists(meta_path):
+    if existing is not None:
         try:
-            with open(meta_path) as f:
-                existing = json.load(f)
             existing_audit = existing.get("research_audit") or {}
             if existing_audit.get("model_runtime_identity_complete") is False:
                 raise RuntimeError(
@@ -999,17 +1288,18 @@ def make_artifact_root(
                         f"current={problem_identity}. Start a new run instead."
                     )
             resumes = existing.get("resumes", [])
-            archive_dir = os.path.join(root, "resume_manifests")
-            os.makedirs(archive_dir, exist_ok=True)
-            archive_path = os.path.join(
-                archive_dir, f"artifact_manifest_{invocation_label}.json",
-            )
-            with open(archive_path, "w") as f:
-                json.dump(verified_manifest, f, indent=2)
-            new_meta["host_environment"] = _capture_host_environment(
-                root, invocation_label,
-            )
-            resumes.append({
+            archive_path = None
+            if verified_manifest is not None:
+                archive_dir = os.path.join(root, "resume_manifests")
+                os.makedirs(archive_dir, exist_ok=True)
+                archive_path = os.path.join(
+                    archive_dir,
+                    f"artifact_manifest_{invocation_label}.json",
+                )
+                with open(archive_path, "w") as f:
+                    json.dump(verified_manifest, f, indent=2)
+            original_environment = existing.get("host_environment") or {}
+            resume_event = {
                 "resumed_at": new_meta["started_at"],
                 "argv": new_meta["argv"],
                 "cli_versions": new_meta["cli_versions"],
@@ -1017,9 +1307,20 @@ def make_artifact_root(
                 "config_sha256": new_meta["config_sha256"],
                 "research_audit": new_meta["research_audit"],
                 "resume_identity": new_identity,
-                "host_environment": new_meta["host_environment"],
+                "host_runtime": new_meta["host_runtime"],
+                "host_environment": {
+                    "captured": False,
+                    "reason": "resume identity matched the original host runtime",
+                    "original_sha256": original_environment.get("sha256"),
+                    "original_source": original_environment.get("source"),
+                },
+                "integrity_mode": integrity_mode,
+                "global_manifest_error": manifest_error,
                 "verified_prior_manifest_sha256": prior_manifest_sha256,
-                "prior_manifest_archive": os.path.relpath(archive_path, root),
+                "prior_manifest_archive": (
+                    os.path.relpath(archive_path, root)
+                    if archive_path else None
+                ),
                 "problem_set_identity": (
                     {
                         "ids_sha256": problem_manifest.get("ids_sha256"),
@@ -1027,8 +1328,10 @@ def make_artifact_root(
                     }
                     if problem_manifest else None
                 ),
-            })
+            }
+            resumes.append(resume_event)
             existing["resumes"] = resumes
+            existing["status"] = "running"
             _write_meta(root, existing)
             return root
         except RuntimeError:
@@ -1131,11 +1434,19 @@ def write_artifact_manifest(
     """Write SHA-256 integrity records for every retained run artifact."""
     root = os.path.abspath(root)
     manifest_path = os.path.join(root, "artifact_manifest.json")
+    manifest_tmp = manifest_path + ".tmp"
+    try:
+        os.unlink(manifest_tmp)
+    except FileNotFoundError:
+        pass
     entries = []
     for directory, _, filenames in os.walk(root):
         for filename in sorted(filenames):
             path = os.path.join(directory, filename)
-            if os.path.abspath(path) == manifest_path or not os.path.isfile(path):
+            if (
+                os.path.abspath(path) in {manifest_path, manifest_tmp}
+                or not os.path.isfile(path)
+            ):
                 continue
             if os.path.islink(path):
                 raise OSError(f"refusing to seal symlinked artifact: {path}")
@@ -1165,10 +1476,9 @@ def write_artifact_manifest(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "entries": sorted(entries, key=lambda entry: entry["path"]),
     }
-    tmp = manifest_path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(manifest_tmp, "w") as f:
         json.dump(payload, f, indent=2)
-    os.replace(tmp, manifest_path)
+    os.replace(manifest_tmp, manifest_path)
     return manifest_path
 
 
@@ -1409,7 +1719,7 @@ async def run_one(
     art_token = None
     prob_art_dir: str | None = None
     if artifact_root is not None:
-        prob_art_dir = os.path.join(artifact_root, pid)
+        prob_art_dir = _problem_artifact_directory(artifact_root, pid)
         os.makedirs(prob_art_dir, exist_ok=True)
         art_token = artifact_dir.set(prob_art_dir)
 
@@ -1626,8 +1936,12 @@ async def run_one(
     mechanistic_evidence: dict[str, dict] = {}
     web_search_providers: set[str] = set()
     web_search_requests = 0
+    web_search_attempts = 0
+    web_search_provider_requests = 0
     web_search_successes = 0
     web_search_failures = 0
+    web_search_client_failures = 0
+    web_search_provider_failures = 0
     web_search_result_count = 0
     web_search_latency_ms = 0
     web_search_error_categories: dict[str, int] = {}
@@ -1716,13 +2030,33 @@ async def run_one(
                     evidence["successful_web_search_calls"] += 1
 
         call_search_requests = int(c.get("web_search_requests", 0) or 0)
+        call_search_attempts = int(
+            c.get("web_search_attempts", call_search_requests) or 0
+        )
+        call_provider_requests = int(
+            c.get("web_search_provider_requests", call_search_requests) or 0
+        )
         if c.get("web_search_provider") and call_search_requests:
             web_search_providers.add(str(c["web_search_provider"]))
         web_search_requests += call_search_requests
+        web_search_attempts += call_search_attempts
+        web_search_provider_requests += call_provider_requests
         web_search_successes += int(c.get("web_search_successes", 0) or 0)
-        web_search_failures += int(c.get("web_search_failures", 0) or 0)
+        call_search_failures = int(c.get("web_search_failures", 0) or 0)
+        web_search_failures += call_search_failures
+        web_search_client_failures += int(
+            c.get("web_search_client_failures", 0) or 0
+        )
+        web_search_provider_failures += int(
+            c.get("web_search_provider_failures", call_search_failures) or 0
+        )
         web_search_result_count += int(c.get("web_search_result_count", 0) or 0)
-        web_search_latency_ms += int(c.get("web_search_latency_ms", 0) or 0)
+        web_search_latency_ms += int(
+            c.get(
+                "web_search_total_latency_ms",
+                c.get("web_search_latency_ms", 0),
+            ) or 0
+        )
         for category, count in (c.get("web_search_error_categories") or {}).items():
             web_search_error_categories[category] = (
                 web_search_error_categories.get(category, 0) + int(count or 0)
@@ -1782,10 +2116,19 @@ async def run_one(
         "mechanistic_evidence_by_role": mechanistic_evidence,
         "web_search_providers": sorted(web_search_providers),
         "web_search_requests": web_search_requests,
+        "web_search_attempts": web_search_attempts,
+        "web_search_provider_requests": web_search_provider_requests,
         "web_search_successes": web_search_successes,
         "web_search_failures": web_search_failures,
+        "web_search_client_failures": web_search_client_failures,
+        "web_search_provider_failures": web_search_provider_failures,
         "web_search_result_count": web_search_result_count,
         "web_search_latency_ms": web_search_latency_ms,
+        "web_search_total_latency_ms": web_search_latency_ms,
+        "web_search_mean_latency_ms": (
+            web_search_latency_ms / web_search_provider_requests
+            if web_search_provider_requests else None
+        ),
         "web_search_error_categories": web_search_error_categories,
     })
     result["metrics"] = normalized_metrics
@@ -1872,6 +2215,41 @@ def _aggregate_run_metrics(
     num_calls = sum_field("num_calls")
     usage_available_calls = sum_field("usage_available_calls")
     usage_complete_calls = sum_field("usage_complete_calls")
+    web_search_attempts = sum(
+        int(row.get("web_search_attempts", row.get("web_search_requests", 0)) or 0)
+        for row in metric_rows
+    )
+    web_search_provider_requests = sum(
+        int(
+            row.get(
+                "web_search_provider_requests",
+                row.get("web_search_requests", 0),
+            ) or 0
+        )
+        for row in metric_rows
+    )
+    web_search_total_latency_ms = sum(
+        int(
+            row.get(
+                "web_search_total_latency_ms",
+                row.get("web_search_latency_ms", 0),
+            ) or 0
+        )
+        for row in metric_rows
+    )
+    web_search_client_failures = sum(
+        int(row.get("web_search_client_failures", 0) or 0)
+        for row in metric_rows
+    )
+    web_search_provider_failures = sum(
+        int(
+            row.get(
+                "web_search_provider_failures",
+                row.get("web_search_failures", 0),
+            ) or 0
+        )
+        for row in metric_rows
+    )
     partial_costs = [
         row.get("partial_cost_usd") for row in metric_rows
         if row.get("partial_cost_usd") is not None
@@ -1929,10 +2307,19 @@ def _aggregate_run_metrics(
             for provider in (row.get("web_search_providers") or [])
         }),
         "web_search_requests": sum_field("web_search_requests"),
+        "web_search_attempts": web_search_attempts,
+        "web_search_provider_requests": web_search_provider_requests,
         "web_search_successes": sum_field("web_search_successes"),
         "web_search_failures": sum_field("web_search_failures"),
+        "web_search_client_failures": web_search_client_failures,
+        "web_search_provider_failures": web_search_provider_failures,
         "web_search_result_count": sum_field("web_search_result_count"),
         "web_search_latency_ms": sum_field("web_search_latency_ms"),
+        "web_search_total_latency_ms": web_search_total_latency_ms,
+        "web_search_mean_latency_ms": (
+            web_search_total_latency_ms / web_search_provider_requests
+            if web_search_provider_requests else None
+        ),
         "web_search_error_categories": merge_counts(
             "web_search_error_categories"
         ),
@@ -2031,6 +2418,11 @@ async def run_problems(
         run_id = run_id[:-5]
 
     results: list[dict] = []
+    result_order = {
+        str(problem.get("id", "?")): index
+        for index, problem in enumerate(problems)
+    }
+    completed_ids: set[str] = set()
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(parallel)
 
@@ -2047,11 +2439,21 @@ async def run_problems(
                 sandbox_image_digest=image_digest,
             )
         async with lock:
+            _write_problem_checkpoint(artifact_root, problem, result)
             results.append(result)
+            completed_ids.add(str(problem.get("id", "?")))
+            results.sort(
+                key=lambda row: result_order.get(str(row.get("id")), len(problems))
+            )
             tmp_path = save_path + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(results, f, indent=2)
             os.replace(tmp_path, save_path)
+            update_artifact_root_meta(artifact_root, {
+                "checkpointed_problem_ids": sorted(
+                    completed_ids, key=lambda pid: result_order.get(pid, len(problems)),
+                ),
+            }, strict=True)
             print(f"\n  [{len(results)}/{len(problems)} saved to {save_path}]")
         return result
 
@@ -2065,6 +2467,30 @@ async def run_problems(
                 "problem IDs must be unique because IDs key result and "
                 f"artifact records; duplicates={duplicate_ids}"
             )
+        meta = _read_meta(artifact_root)
+        resumes = meta.get("resumes") or []
+        integrity_mode = (
+            resumes[-1].get("integrity_mode") if resumes else None
+        )
+        recovered = _recover_problem_checkpoints(
+            artifact_root,
+            problems,
+            integrity_mode=integrity_mode,
+        )
+        if recovered:
+            results.extend(recovered)
+            completed_ids.update(str(result.get("id")) for result in recovered)
+            results.sort(
+                key=lambda row: result_order.get(str(row.get("id")), len(problems))
+            )
+        if resumes:
+            # Rebuild the mutable external results file exclusively from
+            # verified checkpoints. It may have been updated after the last
+            # durable checkpoint when the previous process was killed.
+            tmp_path = save_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(results, f, indent=2)
+            os.replace(tmp_path, save_path)
         (
             claude_creds_path,
             claude_config_path,
@@ -2074,7 +2500,11 @@ async def run_problems(
             use_docker=use_docker,
             sandbox_image=sandbox_image,
         )
-        await asyncio.gather(*[run_and_save(p) for p in problems])
+        pending_problems = [
+            problem for problem in problems
+            if str(problem.get("id", "?")) not in completed_ids
+        ]
+        await asyncio.gather(*[run_and_save(p) for p in pending_problems])
     except BaseException as exc:
         run_error = exc
         run_error_traceback = exc.__traceback__

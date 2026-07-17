@@ -606,208 +606,208 @@ async def run_agent(
         return metadata
 
     try:
-      for turn in range(max_turns):
-        started = time.monotonic()
-        chat_result = await asyncio.to_thread(_chat_completion, settings, messages)
-        if len(chat_result) == 2:
-            content, usage = chat_result
-            provider_metadata = {}
-        else:
-            content, usage, provider_metadata = chat_result
-        provider_responses.append({
-            **provider_metadata,
-            "usage": usage,
-        })
-        input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
-        output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
-        token_details = (
-            usage.get("prompt_tokens_details")
-            or usage.get("input_tokens_details")
-            or {}
-        )
-        turn_cache_read = (
-            usage.get("cache_read_input_tokens", 0)
-            or usage.get("cached_input_tokens", 0)
-            or token_details.get("cached_tokens", 0)
-            or 0
-        )
-        cache_read_input_tokens += int(turn_cache_read)
-        turn_cache_creation = (
-            usage.get("cache_creation_input_tokens", 0)
-            or token_details.get("cache_creation_tokens", 0)
-            or 0
-        )
-        cache_creation_input_tokens += int(turn_cache_creation)
-        output_details = (
-            usage.get("completion_tokens_details")
-            or usage.get("output_tokens_details")
-            or {}
-        )
-        turn_reasoning = (
-            usage.get("reasoning_output_tokens", 0)
-            or output_details.get("reasoning_tokens", 0)
-            or 0
-        )
-        reasoning_output_tokens += int(turn_reasoning)
-        events.append({
-            "type": "turn.completed",
-            "turn": turn + 1,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0,
-                "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
-                "cache_read_input_tokens": int(turn_cache_read),
-                "cache_creation_input_tokens": int(turn_cache_creation),
-                "reasoning_output_tokens": int(turn_reasoning),
-                "duration_ms": int(round((time.monotonic() - started) * 1000)),
-            },
-            "provider": provider_metadata,
-        })
-        events.append({
-            "type": "model.response",
-            "turn": turn + 1,
-            "content": content,
-            "provider": provider_metadata,
-        })
-        messages.append({"role": "assistant", "content": content})
-
-        try:
-            action = _extract_json_object(content)
-        except ValueError as exc:
-            stderr_lines.append(str(exc))
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Your previous response was not a JSON action object. "
-                    "Return exactly one JSON object using the documented format."
-                ),
-            })
-            continue
-
-        if schema is not None:
-            try:
-                _validate_schema(action, schema)
-            except ValidationError:
-                pass
+        for turn in range(max_turns):
+            started = time.monotonic()
+            chat_result = await asyncio.to_thread(_chat_completion, settings, messages)
+            if len(chat_result) == 2:
+                content, usage = chat_result
+                provider_metadata = {}
             else:
-                final_response = action
-                events.append({
-                    "type": "item.completed",
-                    "item": {"type": "agent_message", "text": json.dumps(action)},
-                })
-                break
+                content, usage, provider_metadata = chat_result
+            provider_responses.append({
+                **provider_metadata,
+                "usage": usage,
+            })
+            input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+            output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+            token_details = (
+                usage.get("prompt_tokens_details")
+                or usage.get("input_tokens_details")
+                or {}
+            )
+            turn_cache_read = (
+                usage.get("cache_read_input_tokens", 0)
+                or usage.get("cached_input_tokens", 0)
+                or token_details.get("cached_tokens", 0)
+                or 0
+            )
+            cache_read_input_tokens += int(turn_cache_read)
+            turn_cache_creation = (
+                usage.get("cache_creation_input_tokens", 0)
+                or token_details.get("cache_creation_tokens", 0)
+                or 0
+            )
+            cache_creation_input_tokens += int(turn_cache_creation)
+            output_details = (
+                usage.get("completion_tokens_details")
+                or usage.get("output_tokens_details")
+                or {}
+            )
+            turn_reasoning = (
+                usage.get("reasoning_output_tokens", 0)
+                or output_details.get("reasoning_tokens", 0)
+                or 0
+            )
+            reasoning_output_tokens += int(turn_reasoning)
+            events.append({
+                "type": "turn.completed",
+                "turn": turn + 1,
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0,
+                    "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
+                    "cache_read_input_tokens": int(turn_cache_read),
+                    "cache_creation_input_tokens": int(turn_cache_creation),
+                    "reasoning_output_tokens": int(turn_reasoning),
+                    "duration_ms": int(round((time.monotonic() - started) * 1000)),
+                },
+                "provider": provider_metadata,
+            })
+            events.append({
+                "type": "model.response",
+                "turn": turn + 1,
+                "content": content,
+                "provider": provider_metadata,
+            })
+            messages.append({"role": "assistant", "content": content})
 
-        if action.get("action") == "final":
-            candidate = action.get("response", "")
-            if schema is None and not isinstance(candidate, str):
-                candidate = json.dumps(candidate, ensure_ascii=False)
             try:
-                _validate_schema(candidate, schema)
-            except ValidationError as exc:
+                action = _extract_json_object(content)
+            except ValueError as exc:
+                stderr_lines.append(str(exc))
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your final response did not match the required JSON "
-                        f"schema: {exc.message}. Return a corrected final "
-                        "JSON action only."
+                        "Your previous response was not a JSON action object. "
+                        "Return exactly one JSON object using the documented format."
                     ),
                 })
                 continue
-            final_response = candidate
+
+            if schema is not None:
+                try:
+                    _validate_schema(action, schema)
+                except ValidationError:
+                    pass
+                else:
+                    final_response = action
+                    events.append({
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": json.dumps(action)},
+                    })
+                    break
+
+            if action.get("action") == "final":
+                candidate = action.get("response", "")
+                if schema is None and not isinstance(candidate, str):
+                    candidate = json.dumps(candidate, ensure_ascii=False)
+                try:
+                    _validate_schema(candidate, schema)
+                except ValidationError as exc:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your final response did not match the required JSON "
+                            f"schema: {exc.message}. Return a corrected final "
+                            "JSON action only."
+                        ),
+                    })
+                    continue
+                final_response = candidate
+                events.append({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": json.dumps(candidate) if isinstance(candidate, (dict, list)) else str(candidate)},
+                })
+                break
+
+            if action.get("action") != "tool":
+                messages.append({
+                    "role": "user",
+                    "content": "Unknown action. Use action=\"tool\" or action=\"final\".",
+                })
+                continue
+
+            tool = action.get("tool")
+            tool_input = action.get("input") or {}
+            call_id = f"call_{uuid.uuid4().hex[:12]}"
             events.append({
                 "type": "item.completed",
-                "item": {"type": "agent_message", "text": json.dumps(candidate) if isinstance(candidate, (dict, list)) else str(candidate)},
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": tool,
+                    "arguments": json.dumps(tool_input, ensure_ascii=False),
+                },
             })
-            break
+            if watch:
+                print(
+                    f"      [tool] {tool}({json.dumps(tool_input)[:100]})",
+                    file=sys.stderr,
+                )
 
-        if action.get("action") != "tool":
+            tool_started = time.perf_counter()
+            tool_metadata: dict = {}
+            try:
+                if tool == "shell" and shell_enabled:
+                    cmd = str(tool_input.get("cmd", ""))
+                    if not cmd.strip():
+                        result = "missing shell input field: cmd"
+                        tool_metadata = {"ok": False, "exit_code": 2}
+                    else:
+                        result, exit_code = await _run_shell(
+                            cmd,
+                            container_id=container_id,
+                            allow_host_tools=allow_host_tools,
+                            timeout=tool_timeout,
+                            output_limit=output_limit,
+                        )
+                        tool_metadata = {
+                            "ok": exit_code == 0,
+                            "exit_code": exit_code,
+                            "sandboxed": container_id is not None,
+                        }
+                elif tool == "web_search" and search_enabled:
+                    query = str(tool_input.get("query", ""))
+                    if not query.strip():
+                        result = "missing web_search input field: query"
+                        tool_metadata = {"ok": False, "error_category": "missing_query"}
+                    else:
+                        result = await asyncio.to_thread(
+                            _search_web,
+                            search_config or {},
+                            query,
+                            max_results=max_search_results,
+                        )
+                        tool_metadata = {
+                            "ok": True,
+                            "provider": (search_config or {}).get("provider", "searxng"),
+                            "query": query,
+                        }
+                else:
+                    result = f"tool {tool!r} is not available"
+                    tool_metadata = {"ok": False, "error_category": "unavailable"}
+            except Exception as exc:
+                result = f"tool {tool!r} failed: {type(exc).__name__}: {exc}"
+                tool_metadata = {
+                    "ok": False,
+                    "error_category": type(exc).__name__,
+                }
+            tool_metadata["duration_ms"] = int(round(
+                (time.perf_counter() - tool_started) * 1000
+            ))
+
+            events.append({
+                "type": "item.completed",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": result,
+                    "metadata": tool_metadata,
+                },
+            })
             messages.append({
                 "role": "user",
-                "content": "Unknown action. Use action=\"tool\" or action=\"final\".",
+                "content": f"Tool result for {tool}:\n{result}",
             })
-            continue
-
-        tool = action.get("tool")
-        tool_input = action.get("input") or {}
-        call_id = f"call_{uuid.uuid4().hex[:12]}"
-        events.append({
-            "type": "item.completed",
-            "item": {
-                "type": "function_call",
-                "call_id": call_id,
-                "name": tool,
-                "arguments": json.dumps(tool_input, ensure_ascii=False),
-            },
-        })
-        if watch:
-            print(
-                f"      [tool] {tool}({json.dumps(tool_input)[:100]})",
-                file=sys.stderr,
-            )
-
-        tool_started = time.perf_counter()
-        tool_metadata: dict = {}
-        try:
-            if tool == "shell" and shell_enabled:
-                cmd = str(tool_input.get("cmd", ""))
-                if not cmd.strip():
-                    result = "missing shell input field: cmd"
-                    tool_metadata = {"ok": False, "exit_code": 2}
-                else:
-                    result, exit_code = await _run_shell(
-                        cmd,
-                        container_id=container_id,
-                        allow_host_tools=allow_host_tools,
-                        timeout=tool_timeout,
-                        output_limit=output_limit,
-                    )
-                    tool_metadata = {
-                        "ok": exit_code == 0,
-                        "exit_code": exit_code,
-                        "sandboxed": container_id is not None,
-                    }
-            elif tool == "web_search" and search_enabled:
-                query = str(tool_input.get("query", ""))
-                if not query.strip():
-                    result = "missing web_search input field: query"
-                    tool_metadata = {"ok": False, "error_category": "missing_query"}
-                else:
-                    result = await asyncio.to_thread(
-                        _search_web,
-                        search_config or {},
-                        query,
-                        max_results=max_search_results,
-                    )
-                    tool_metadata = {
-                        "ok": True,
-                        "provider": (search_config or {}).get("provider", "searxng"),
-                        "query": query,
-                    }
-            else:
-                result = f"tool {tool!r} is not available"
-                tool_metadata = {"ok": False, "error_category": "unavailable"}
-        except Exception as exc:
-            result = f"tool {tool!r} failed: {type(exc).__name__}: {exc}"
-            tool_metadata = {
-                "ok": False,
-                "error_category": type(exc).__name__,
-            }
-        tool_metadata["duration_ms"] = int(round(
-            (time.perf_counter() - tool_started) * 1000
-        ))
-
-        events.append({
-            "type": "item.completed",
-            "item": {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": result,
-                "metadata": tool_metadata,
-            },
-        })
-        messages.append({
-            "role": "user",
-            "content": f"Tool result for {tool}:\n{result}",
-        })
     except Exception as exc:
         stderr_lines.append(f"{type(exc).__name__}: {exc}")
         _SESSIONS[session_id] = messages

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -430,7 +431,7 @@ def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
         assert (tmp_path / "runs" / "artifacts" / "resume-test" /
                 prior_manifest["prior_manifest_archive"]).exists()
         harness.write_artifact_manifest(root)
-        assert captures == ["capture", "capture"]
+        assert captures == ["capture"]
 
         harness._args_ref["experiment_id"] = "different-experiment"
         with pytest.raises(RuntimeError, match="resume provenance mismatch"):
@@ -467,7 +468,7 @@ def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
             harness.make_artifact_root(
                 "runs/resume-test.json", problem_manifest=manifest,
             )
-        assert captures == ["capture", "capture"]
+        assert captures == ["capture"]
     finally:
         harness.CONFIG.clear()
         harness.CONFIG.update(original_config)
@@ -611,6 +612,163 @@ def test_host_environment_falls_back_when_pip_is_unavailable(
     assert (tmp_path / "host_packages_test.txt").exists()
 
 
+def test_host_environment_skips_pip_outside_paper_runs(
+    tmp_path, monkeypatch,
+):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("pip freeze should not run for smoke/dev metadata")
+
+    monkeypatch.setattr(harness.subprocess, "run", fail_if_called)
+    record = harness._capture_host_environment(
+        str(tmp_path), "smoke", prefer_pip_freeze=False,
+    )
+
+    assert record["available"] is True
+    assert record["source"] == "importlib.metadata"
+    assert "skipped outside evaluation/ablation" in record["pip_error"]
+
+
+def test_hard_killed_run_recovers_only_sealed_problem_checkpoints(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+    monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
+        "sha": "same", "diff_sha256": None, "untracked_sha256": None,
+    })
+    monkeypatch.setattr(harness, "_safe_version", lambda _binary: None)
+    monkeypatch.setattr(
+        harness,
+        "_capture_host_environment",
+        lambda *_args, **_kwargs: {"available": True, "sha256": "env"},
+    )
+
+    problems = [
+        {"id": "p1", "question": "Q1", "answer": "A1"},
+        {"id": "p2", "question": "Q2", "answer": "A2"},
+    ]
+    manifest = _problem_set_manifest(problems)
+    original_config = copy.deepcopy(harness.CONFIG)
+    original_args = copy.deepcopy(harness._args_ref)
+    try:
+        harness.CONFIG.clear()
+        harness.CONFIG.update({"solver": {"model": "fixed"}})
+        harness._args_ref.clear()
+        harness._args_ref.update({
+            "docker": False,
+            "parallel": 1,
+            "resume": None,
+            "cli_args": {"resume": None},
+        })
+        root = harness.make_artifact_root(
+            "runs/crashed.json", problem_manifest=manifest,
+        )
+        assert harness._read_meta(root)["problem_set"]["ids"] == ["p1", "p2"]
+
+        p1 = Path(root) / "p1"
+        p1.mkdir()
+        (p1 / "evidence.txt").write_text("sealed")
+        harness._write_problem_checkpoint(root, problems[0], {
+            "id": "p1",
+            "answer": "A1",
+            "verified": True,
+            "calls": [],
+            "metrics": {"num_calls": 0},
+        })
+        p2 = Path(root) / "p2"
+        p2.mkdir()
+        (p2 / "partial-response.txt").write_text("unsealed")
+
+        harness._args_ref["resume"] = "crashed"
+        harness._args_ref["cli_args"]["resume"] = "crashed"
+        monkeypatch.setattr(
+            harness,
+            "_prepare_sandbox_run",
+            lambda *_args, **_kwargs: (None, None, None),
+        )
+        executed = []
+
+        async def fake_run_one(problem, **_kwargs):
+            executed.append(problem["id"])
+            return {
+                "id": problem["id"],
+                "answer": problem["answer"],
+                "verified": True,
+                "calls": [],
+                "metrics": {"num_calls": 0},
+            }
+
+        monkeypatch.setattr(harness, "run_one", fake_run_one)
+        results = asyncio.run(harness.run_problems(
+            problems, parallel=1, save_path="runs/crashed.json",
+        ))
+
+        assert [result["id"] for result in results] == ["p1", "p2"]
+        assert executed == ["p2"]
+        assert (Path(root) / "p1" / "evidence.txt").read_text() == "sealed"
+        archived = list(
+            (Path(root) / harness.INTERRUPTED_ATTEMPTS_DIR).glob(
+                "*/problem_00001_*/partial-response.txt"
+            )
+        )
+        assert len(archived) == 1
+        resume = harness._read_meta(root)["resumes"][-1]
+        assert resume["integrity_mode"] == "problem_checkpoints"
+        assert resume["verified_problem_checkpoint_ids"] == ["p1"]
+        assert len(resume["quarantined_incomplete_artifacts"]) == 1
+        assert harness._read_meta(root)["status"] == "completed"
+        harness.verify_artifact_manifest(root)
+    finally:
+        harness.CONFIG.clear()
+        harness.CONFIG.update(original_config)
+        harness._args_ref.clear()
+        harness._args_ref.update(original_args)
+
+
+def test_problem_checkpoint_rejects_tampering(tmp_path):
+    problem = {"id": "p1", "question": "Q", "answer": "A"}
+    problem_dir = tmp_path / "p1"
+    problem_dir.mkdir()
+    evidence = problem_dir / "evidence.txt"
+    evidence.write_text("original")
+    harness._write_problem_checkpoint(str(tmp_path), problem, {
+        "id": "p1", "answer": "A", "verified": True,
+    })
+
+    evidence.write_text("tampered")
+
+    with pytest.raises(RuntimeError, match="hash mismatch|size mismatch"):
+        harness._verify_problem_checkpoint(str(tmp_path), problem)
+
+
+def test_error_checkpoint_is_verified_then_left_retryable(tmp_path):
+    problem = {"id": "p1", "question": "Q", "answer": "A"}
+    problem_dir = tmp_path / "p1"
+    problem_dir.mkdir()
+    (problem_dir / "successful-call.txt").write_text("cached")
+    harness._write_problem_checkpoint(str(tmp_path), problem, {
+        "id": "p1",
+        "answer": None,
+        "verified": False,
+        "error": "provider timeout",
+    })
+
+    recovered = harness._recover_problem_checkpoints(
+        str(tmp_path), [problem], integrity_mode="sealed_manifest",
+    )
+
+    assert recovered == []
+    assert (problem_dir / "successful-call.txt").read_text() == "cached"
+    assert not (problem_dir / harness.PROBLEM_CHECKPOINT_FILENAME).exists()
+    archived = list(
+        (tmp_path / harness.RETRY_CHECKPOINTS_DIR).glob("*/problem_00000_*.json")
+    )
+    assert len(archived) == 1
+
+
 def test_sandbox_setup_rejects_image_digest_race(tmp_path, monkeypatch):
     harness._write_meta(str(tmp_path), {
         "research_audit": {
@@ -660,6 +818,20 @@ def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
                 "duration_ms": 3,
                 "retry_count": 2,
                 "failed": True,
+                "web_search_provider": "searxng",
+                "web_search_requests": 2,
+                "web_search_attempts": 2,
+                "web_search_provider_requests": 1,
+                "web_search_successes": 0,
+                "web_search_failures": 2,
+                "web_search_client_failures": 1,
+                "web_search_provider_failures": 1,
+                "web_search_result_count": 0,
+                "web_search_total_latency_ms": 12,
+                "web_search_error_categories": {
+                    "missing_query": 1,
+                    "timeout": 1,
+                },
                 "tool_calls": [{
                     "tool_name": "web_search",
                     "metadata": {"ok": False},
@@ -688,6 +860,12 @@ def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
     assert metrics["mechanistic_evidence_by_role"]["citation"][
         "failed_tool_calls"
     ] == 1
+    assert metrics["web_search_attempts"] == 2
+    assert metrics["web_search_provider_requests"] == 1
+    assert metrics["web_search_client_failures"] == 1
+    assert metrics["web_search_provider_failures"] == 1
+    assert metrics["web_search_total_latency_ms"] == 12
+    assert metrics["web_search_mean_latency_ms"] == 12
 
 
 def test_run_one_restores_docker_provider_and_workspace_state(tmp_path, monkeypatch):
@@ -809,8 +987,18 @@ def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
                     },
                 },
                 "web_search_providers": ["searxng"],
-                "web_search_requests": 1,
-                "web_search_error_categories": {"timeout": 1},
+                "web_search_requests": 2,
+                "web_search_attempts": 2,
+                "web_search_provider_requests": 1,
+                "web_search_failures": 2,
+                "web_search_client_failures": 1,
+                "web_search_provider_failures": 1,
+                "web_search_latency_ms": 20,
+                "web_search_total_latency_ms": 20,
+                "web_search_error_categories": {
+                    "unavailable": 1,
+                    "timeout": 1,
+                },
             },
         },
         {
@@ -865,7 +1053,17 @@ def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
         "failed_tool_calls": 1,
     }
     assert metrics["web_search_providers"] == ["searxng"]
-    assert metrics["web_search_error_categories"] == {"timeout": 1}
+    assert metrics["web_search_requests"] == 2
+    assert metrics["web_search_attempts"] == 2
+    assert metrics["web_search_provider_requests"] == 1
+    assert metrics["web_search_client_failures"] == 1
+    assert metrics["web_search_provider_failures"] == 1
+    assert metrics["web_search_total_latency_ms"] == 20
+    assert metrics["web_search_mean_latency_ms"] == 20
+    assert metrics["web_search_error_categories"] == {
+        "unavailable": 1,
+        "timeout": 1,
+    }
 
 
 def test_run_problems_records_completion_status_and_integrity_manifest(
@@ -904,6 +1102,11 @@ def test_run_problems_records_completion_status_and_integrity_manifest(
     assert meta["completed_problems"] == 1
     assert meta["metrics"]["judge_passed"] == 1
     assert (root / "artifact_manifest.json").exists()
+    result, checkpoint = harness._verify_problem_checkpoint(
+        str(root), {"id": "p1", "question": "Q", "answer": "A"},
+    )
+    assert result["id"] == "p1"
+    assert checkpoint["result_path"] == "result.json"
 
 
 def test_run_problems_marks_setup_failure(tmp_path, monkeypatch):
@@ -944,6 +1147,18 @@ def test_verify_artifact_manifest_rejects_tampering(tmp_path):
     (root / "unsealed.txt").write_text("unexpected")
     with pytest.raises(RuntimeError, match="file set mismatch"):
         harness.verify_artifact_manifest(str(root))
+
+
+def test_artifact_manifest_replaces_stale_interrupted_temp_file(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    (root / "evidence.txt").write_text("complete")
+    (root / "artifact_manifest.json.tmp").write_text("partial manifest")
+
+    harness.write_artifact_manifest(str(root))
+
+    assert not (root / "artifact_manifest.json.tmp").exists()
+    harness.verify_artifact_manifest(str(root))
 
 
 def test_run_problems_marks_manifest_failure_as_failed(tmp_path, monkeypatch):

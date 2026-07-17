@@ -25,16 +25,31 @@ tool action, repair outcome, and grading decision.
   mechanistic tool evidence, search, cost coverage, and repair metrics when
   available.
 
-Resume is fail-closed. Before any cached response is reused, Theoria verifies
-the prior manifest, every internal artifact, the exact internal file set, and
-each external result file. The verified seal is archived before a replacement
-seal is written. A changed experiment argument, concurrency setting, config,
-code state, Python executable/version, installed-package fingerprint, CLI
-version, sandbox image digest, runtime model identity, problem ID list, problem
-record hash, missing cohort manifest, or unreadable prior metadata must start a
-new run instead of rewriting the original identity. The `--resume` value itself
-is the only CLI argument excluded from comparison. Local runs whose model probe
-did not resolve cannot be resumed.
+Resume is fail-closed. For a cleanly finalized run, Theoria verifies the prior
+global manifest, every internal artifact, the exact internal file set, and each
+external result file. The verified seal is archived before a replacement seal
+is written.
+
+Every completed problem also has an atomic `_problem_checkpoint.json` covering
+its exact artifact set and `result.json`. If a process is hard-killed while the
+run status is still `running`, the next resume may proceed without a final
+global manifest, but it reuses only completed problems whose independent
+checkpoint verifies. Incomplete problem directories are moved under
+`_interrupted_attempts/` for forensic retention and are never read as caches.
+A present but corrupted completed-problem checkpoint aborts the resume rather
+than silently rerunning or resealing it. This supports SIGKILL, OOM, preemption,
+and power-loss recovery without trusting unsealed responses.
+Completed results that contain an execution error are not skipped: their valid
+prior checkpoint is retained under `_retry_checkpoints/`, and the problem is
+rerun so successful earlier calls can be reused while the failed call retries.
+
+A changed experiment argument, concurrency setting, config, code state, Python
+executable/version, installed-package fingerprint, CLI version, sandbox image
+digest, runtime model identity, problem ID list, problem record hash, missing
+cohort manifest, or unreadable prior metadata must start a new run instead of
+rewriting the original identity. The `--resume` value itself is the only CLI
+argument excluded from comparison. Local runs whose model probe did not resolve
+cannot be resumed.
 
 ## Model identity
 
@@ -80,8 +95,11 @@ true and `usage_complete` is false.
 Tool counts are evidence, not proof of correctness. The audit distinguishes
 successful, failed, and unknown-status tool calls by role. Search-provider
 latency, result counts, and error categories are populated when the configured
-search backend exposes them. A search snippet is not equivalent to a fetched
-primary source, and analyses must not label it as one.
+search backend exposes them. Search attempts and client-side failures are kept
+separate from requests that reached the provider and provider-side failures, so
+provider reliability must use `web_search_provider_requests` as its denominator.
+A search snippet is not equivalent to a fetched primary source, and analyses
+must not label it as one.
 
 ## Grading evidence
 
@@ -101,6 +119,10 @@ numbers.
 
 Each completed pipeline or grading run writes `artifact_manifest.json` with
 the size and SHA-256 of every retained artifact and external result file.
+Evaluation and ablation runs additionally retain `pip freeze`; smoke and dev
+runs use the equivalent installed-distribution inventory without spawning pip.
+Resume invocations verify the recorded host-runtime identity and reference the
+original package inventory instead of running `pip freeze` again.
 
 Before using a run in a paper table:
 
