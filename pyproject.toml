@@ -7,10 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
     "pyyaml>=6.0",
     "datasets>=4.0",
+    "jsonschema>=4.21",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "pytest>=8.0",
+]
+test = [
     "pytest>=8.0",
 ]
 
@@ -29,4 +33,5 @@ py-modules = [
     "telemetry",
     "export_problem",
     "cli",
+    "agent_loop",
 ]

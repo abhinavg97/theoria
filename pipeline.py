@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from jsonschema import ValidationError, validate
 
 # ── Models ──────────────────────────────────────────────────────
 
@@ -78,7 +79,12 @@ VERDICT_SCHEMA = {
 def _formalizer_decision_schema() -> dict:
     """Wrap the proof schema in the formalizer's action/reject_reason
     envelope: the formalizer either returns a proof or rejects the
-    solution with a reason for the solver."""
+    solution with a reason for the solver.
+
+    The schema only requires the discriminator. Requiring both proof and
+    reject_reason for every action is stricter than the pipeline needs and
+    causes smaller OSS models to reject otherwise valid proof responses.
+    """
     return {
         "type": "object",
         "properties": {
@@ -86,8 +92,54 @@ def _formalizer_decision_schema() -> dict:
             "proof": PROOF_SCHEMA,
             "reject_reason": {"type": "string"},
         },
-        "required": ["action", "proof", "reject_reason"],
+        "required": ["action"],
     }
+
+
+def _formalizer_decision_feedback(decision: dict) -> str | None:
+    """Return a retry prompt when a schema-valid formalizer decision is
+    semantically incomplete.
+
+    The schema deliberately requires only the discriminator so smaller models
+    can return {"action": "proof"} without also fabricating a reject_reason.
+    That means action-specific fields must be checked in pipeline code.
+    """
+    action = decision.get("action")
+    if action not in {"proof", "reject"}:
+        return (
+            "Your previous response did not choose a valid action. Reply again "
+            "with exactly one JSON decision whose action is either \"proof\" "
+            "or \"reject\"."
+        )
+    if action == "proof" and not isinstance(decision.get("proof"), dict):
+        return (
+            "Your previous response chose action='proof' but omitted the "
+            "required 'proof' object. Reply again with exactly one JSON "
+            "decision: either {\"action\":\"proof\",\"proof\": ...} with a "
+            "complete proof object, or {\"action\":\"reject\","
+            "\"reject_reason\": ...}."
+        )
+    if action == "proof":
+        try:
+            validate(decision["proof"], PROOF_SCHEMA)
+        except ValidationError as exc:
+            return (
+                "Your previous response chose action='proof' but the 'proof' "
+                f"object did not match the required schema: {exc.message}. "
+                "Reply again with exactly one JSON decision containing either "
+                "a complete proof object or a reject_reason."
+            )
+    if action == "reject":
+        reason = decision.get("reject_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return (
+                "Your previous response chose action='reject' but omitted the "
+                "required non-empty 'reject_reason'. Reply again with exactly "
+                "one JSON decision: either {\"action\":\"reject\","
+                "\"reject_reason\": ...}, or {\"action\":\"proof\","
+                "\"proof\": ...} with a complete proof object."
+            )
+    return None
 
 # The pedantry filter's decision on a single failed verdict.
 PEDANTRY_SCHEMA = {
@@ -596,6 +648,7 @@ async def _formalizer_call(
     formalizer_session,
     failed_verdicts_text=None,
     prior_proof=None,
+    feedback_text=None,
 ):
     """Ask the formalizer for a decision (proof or reject).
 
@@ -617,9 +670,17 @@ async def _formalizer_call(
                 f"Problem: {problem}\n\nSolution: {solution}\n\n"
                 "Formalize this into a proof, or reject if it has errors."
             )
+            if feedback_text:
+                user_msg = f"{user_msg}\n\n{feedback_text}"
             return await llm(
                 user_msg, role="formalizer", schema=_formalizer_decision_schema(),
                 system=agent_prompt("formalizer"),
+            )
+        elif feedback_text:
+            return await llm(
+                feedback_text, role="formalizer",
+                schema=_formalizer_decision_schema(),
+                resume=formalizer_session,
             )
         elif failed_verdicts_text:
             user_msg = (
@@ -658,7 +719,9 @@ async def _formalizer_call(
             "the underlying solution (action='reject') with a reason for "
             "the solver."
         )
-    else:
+    if feedback_text:
+        parts.append(feedback_text)
+    elif not failed_verdicts_text:
         parts.append("Formalize this into a proof, or reject if it has errors.")
     user_msg = "\n\n".join(parts)
     return await llm(
@@ -718,6 +781,8 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
     formalizer_session = None
     failed_verdicts_text = None  # set after a verification failure
     last_proof = None             # latest proof — used by stateless backends
+    formalizer_feedback = None    # set after an incomplete decision shape
+    malformed_formalizer_decisions = 0
     verify_attempts = 0
     solver_answers = 1  # initial solve counts as the first answer
 
@@ -733,6 +798,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         decision, new_session = await _formalizer_call(
             problem, solution, formalizer_session, failed_verdicts_text,
             prior_proof=last_proof,
+            feedback_text=formalizer_feedback,
         )
         if formalizer_session is None:
             formalizer_session = new_session
@@ -740,7 +806,29 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         log(f"    Formalizer chose: {action}")
         await save_partial(f"formalizer_returned:{action}")
 
+        formalizer_feedback = _formalizer_decision_feedback(decision)
+        if formalizer_feedback:
+            malformed_formalizer_decisions += 1
+            log(f"    Incomplete formalizer decision: {formalizer_feedback[:200]}")
+            attempts.append({
+                "attempt": len(attempts) + 1,
+                "phase": "formalizer_invalid",
+                "action": action,
+                "reason": formalizer_feedback,
+                "decision": decision,
+            })
+            await save_partial("attempt_appended:formalizer_invalid")
+            if malformed_formalizer_decisions >= max_verify:
+                log(
+                    f"\n[!] Max incomplete formalizer decisions ({max_verify}) "
+                    "reached, giving up"
+                )
+                break
+            continue
+        malformed_formalizer_decisions = 0
+
         if action == "reject":
+            formalizer_feedback = None
             reason = decision.get("reject_reason", "")
             log(f"    Rejected: {reason[:200]}")
             attempts.append({
@@ -764,6 +852,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
             continue
 
         # action == "proof": judge it
+        formalizer_feedback = None
         verify_attempts += 1
         proof = _proof_from_dict(decision["proof"])
         last_proof = proof

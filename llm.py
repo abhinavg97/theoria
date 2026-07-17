@@ -28,6 +28,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 
+import agent_loop
 from observability import event, get_logger, redact_text
 from telemetry import enrich_call
 
@@ -1082,6 +1083,12 @@ async def llm(
     elif backend == "claude":
         settings.setdefault("model", "opus")
         settings.setdefault("effort", "max")
+    elif backend == "theoria_agent":
+        settings.setdefault("model", "qwen3:4b")
+        settings.setdefault("endpoint", agent_loop.DEFAULT_ENDPOINT)
+        settings.setdefault("allow_shell", True)
+        settings.setdefault("allow_host_tools", False)
+        settings.setdefault("search", bool(config.get("_web_search")))
 
     # ── Reserve a slot in the call log ───────────────────────────
     #
@@ -1173,9 +1180,12 @@ async def llm(
     raw_stderr: bytes = b""
     events: list[dict] = []
     cmd: list[str] = []
+    returncode: int | None = None
     try:
         # Build command
-        if backend == "claude":
+        if backend == "theoria_agent":
+            cmd = agent_loop.pseudo_command(settings)
+        elif backend == "claude":
             cmd = _build_claude_cmd(
                 prompt, settings, schema, system, watch, resume,
                 sandboxed=sandboxed,
@@ -1223,7 +1233,7 @@ async def llm(
         # Wrap with `docker exec -w <per-call-cwd> <container>` when
         # sandboxed. The CLI's own cwd becomes the per-call subdir, so
         # scratch files land there.
-        if sandboxed:
+        if sandboxed and backend != "theoria_agent":
             cmd = [
                 "docker", "exec",
                 "-w", container_call_cwd,
@@ -1248,150 +1258,191 @@ async def llm(
                     os.path.join(call_dir, "system.txt"), system,
                 )
 
-        # Retry loop for watchdog-killed subprocesses. Codex CLI
-        # sometimes hangs indefinitely on a specific HTTP connection;
-        # the watchdog kills it, and we retry from scratch with a
-        # fresh subprocess (and therefore fresh codex/claude session).
-        # Up to WATCHDOG_RETRY_MAX retries; non-watchdog failures are
-        # raised immediately without retry.
         watchdog_attempts = 0
         attempt_records: list[dict] = []
         call_label = (f"call_{call_index:03d}_{role}"
                       if call_index is not None else role)
-        while True:
-            attempt_number = len(attempt_records) + 1
+        attempt_number = 0
+        final_attempt_duration_ms = 0
+
+        if backend == "theoria_agent":
+            attempt_number = 1
             attempt_started_at = _utc_now_iso()
             started = time.perf_counter()
-
-            # Run
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=SUBPROCESS_STREAM_LIMIT,
+            result = await agent_loop.run_agent(
+                prompt,
+                settings=settings,
+                schema=schema,
+                system=system,
+                resume=resume,
+                role=role,
+                container_id=container_id,
+                search_config=config.get("_web_search"),
+                watch=watch,
             )
-
-            # Hang detection. Sandboxed-only: we monitor per-process
-            # CPU ticks via /proc/<pid>/stat inside the container. The
-            # marker is a unique-per-call token (the schema file path)
-            # so we identify the right subprocess when many judges run
-            # in parallel; for calls without a schema (solver) we fall
-            # back to comm-name matching, which is fine because such
-            # calls don't run in parallel within one container.
-            last_event_ref = [time.monotonic()]
-            watchdog_killed = [False]
-            watchdog_task = None
-            if container_id is not None:
-                marker = schema_file if schema_file else None
-                watchdog_task = asyncio.create_task(_watchdog(
-                    proc, container_id, watchdog_killed,
-                    backend=backend, marker=marker, label=role,
-                ))
-
-            raw_stdout = b""
-            raw_stderr = b""
-            try:
-                if watch:
-                    # Stream mode: read line by line, print events
-                    if backend == "claude":
-                        response, session_id, provider_meta, events, raw_stdout = \
-                            await _run_claude_streaming(
-                                proc, schema, last_event_ref=last_event_ref,
-                            )
-                    else:
-                        response, session_id, provider_meta, events, raw_stdout = \
-                            await _run_codex_streaming(
-                                proc, schema, last_event_ref=last_event_ref,
-                            )
-                else:
-                    # Batch mode: collect all output, parse at end
-                    stdout_bytes, stderr_bytes = await proc.communicate()
-                    raw_stdout = stdout_bytes
-                    raw_stderr = stderr_bytes
-
-                    if proc.returncode != 0:
-                        raise RuntimeError(
-                            _format_failure(backend, proc.returncode,
-                                            stderr_bytes, stdout_bytes)
-                        )
-
-                    output = stdout_bytes.decode()
-
-                    if backend == "claude":
-                        response, session_id, provider_meta, events = \
-                            _parse_claude_output(output, schema)
-                    else:
-                        response, session_id, provider_meta, events = \
-                            _parse_codex_output(output, schema)
-                if watch:
-                    raw_stderr = await proc.stderr.read()
-                # Success — exit retry loop.
-                break
-            except Exception as run_error:
-                if isinstance(run_error, ProviderProcessError):
-                    raw_stdout = run_error.raw_stdout
-                    raw_stderr = run_error.raw_stderr
-                    events = run_error.events
-                # Was this a watchdog kill (transient hang) and do we
-                # have retries left? If so, swallow and retry.
-                if (watchdog_killed[0]
-                        and watchdog_attempts < WATCHDOG_RETRY_MAX):
-                    watchdog_attempts += 1
-                    print(
-                        f"[retry] watchdog killed {call_label}; "
-                        f"retrying attempt {watchdog_attempts + 1}/"
-                        f"{WATCHDOG_RETRY_MAX + 1}",
-                        file=sys.stderr,
+            response = result.response
+            session_id = result.session_id
+            provider_meta = result.metadata
+            events = result.events
+            raw_stdout = result.raw_stdout
+            raw_stderr = result.raw_stderr
+            cmd = result.pseudo_cmd
+            returncode = 0
+            final_attempt_duration_ms = duration_ms = int(round(
+                (time.perf_counter() - started) * 1000
+            ))
+            attempt_records.append({
+                "attempt": attempt_number,
+                "started_at": attempt_started_at,
+                "ended_at": _utc_now_iso(),
+                "duration_ms": final_attempt_duration_ms,
+                "returncode": returncode,
+                "watchdog_killed": False,
+                "stdout_bytes": len(raw_stdout),
+                "stderr_bytes": len(raw_stderr),
+            })
+            if call_dir:
+                if raw_stdout:
+                    _write_artifact(
+                        os.path.join(
+                            call_dir,
+                            f"attempt_{attempt_number:03d}_stdout.jsonl",
+                        ),
+                        raw_stdout, gzip_it=True,
                     )
-                    continue  # finally runs, then loop iterates
-                # Non-watchdog failure or out of retries: propagate.
-                raise
-            finally:
-                # Cancel the watchdog so it doesn't leak past this
-                # attempt. cancel() is idempotent.
-                if watchdog_task is not None:
-                    watchdog_task.cancel()
-                    try:
-                        await watchdog_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                # Save raw stdout/stderr for the most recent attempt.
-                attempt_records.append({
-                    "attempt": attempt_number,
-                    "started_at": attempt_started_at,
-                    "ended_at": _utc_now_iso(),
-                    "duration_ms": int(round(
-                        (time.perf_counter() - started) * 1000
-                    )),
-                    "returncode": proc.returncode,
-                    "watchdog_killed": watchdog_killed[0],
-                    "stdout_bytes": len(raw_stdout),
-                    "stderr_bytes": len(raw_stderr),
-                })
-                if call_dir:
-                    if raw_stdout:
-                        _write_artifact(
-                            os.path.join(
-                                call_dir,
-                                f"attempt_{attempt_number:03d}_stdout.jsonl",
-                            ),
-                            raw_stdout, gzip_it=True,
-                        )
-                    if raw_stderr:
-                        _write_artifact(
-                            os.path.join(
-                                call_dir,
-                                f"attempt_{attempt_number:03d}_stderr.txt",
-                            ),
-                            raw_stderr, gzip_it=True,
-                        )
+                if raw_stderr:
+                    _write_artifact(
+                        os.path.join(
+                            call_dir,
+                            f"attempt_{attempt_number:03d}_stderr.txt",
+                        ),
+                        raw_stderr, gzip_it=True,
+                    )
+        else:
+            # Retry loop for watchdog-killed subprocesses. Codex CLI
+            # sometimes hangs indefinitely on a specific HTTP connection;
+            # the watchdog kills it, and we retry from scratch with a
+            # fresh subprocess (and therefore fresh codex/claude session).
+            # Up to WATCHDOG_RETRY_MAX retries; non-watchdog failures are
+            # raised immediately without retry.
+            while True:
+                attempt_number = len(attempt_records) + 1
+                attempt_started_at = _utc_now_iso()
+                started = time.perf_counter()
 
-        final_attempt_duration_ms = int(round(
-            (time.perf_counter() - started) * 1000
-        ))
-        duration_ms = int(round(
-            (time.perf_counter() - call_started_perf) * 1000
-        ))
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=SUBPROCESS_STREAM_LIMIT,
+                )
+
+                last_event_ref = [time.monotonic()]
+                watchdog_killed = [False]
+                watchdog_task = None
+                if container_id is not None:
+                    marker = schema_file if schema_file else None
+                    watchdog_task = asyncio.create_task(_watchdog(
+                        proc, container_id, watchdog_killed,
+                        backend=backend, marker=marker, label=role,
+                    ))
+
+                raw_stdout = b""
+                raw_stderr = b""
+                try:
+                    if watch:
+                        if backend == "claude":
+                            response, session_id, provider_meta, events, raw_stdout = \
+                                await _run_claude_streaming(
+                                    proc, schema, last_event_ref=last_event_ref,
+                                )
+                        else:
+                            response, session_id, provider_meta, events, raw_stdout = \
+                                await _run_codex_streaming(
+                                    proc, schema, last_event_ref=last_event_ref,
+                                )
+                    else:
+                        stdout_bytes, stderr_bytes = await proc.communicate()
+                        raw_stdout = stdout_bytes
+                        raw_stderr = stderr_bytes
+
+                        if proc.returncode != 0:
+                            raise RuntimeError(
+                                _format_failure(backend, proc.returncode,
+                                                stderr_bytes, stdout_bytes)
+                            )
+
+                        output = stdout_bytes.decode()
+
+                        if backend == "claude":
+                            response, session_id, provider_meta, events = \
+                                _parse_claude_output(output, schema)
+                        else:
+                            response, session_id, provider_meta, events = \
+                                _parse_codex_output(output, schema)
+                    if watch:
+                        raw_stderr = await proc.stderr.read()
+                    returncode = proc.returncode
+                    break
+                except Exception as run_error:
+                    if isinstance(run_error, ProviderProcessError):
+                        raw_stdout = run_error.raw_stdout
+                        raw_stderr = run_error.raw_stderr
+                        events = run_error.events
+                    if (watchdog_killed[0]
+                            and watchdog_attempts < WATCHDOG_RETRY_MAX):
+                        watchdog_attempts += 1
+                        print(
+                            f"[retry] watchdog killed {call_label}; "
+                            f"retrying attempt {watchdog_attempts + 1}/"
+                            f"{WATCHDOG_RETRY_MAX + 1}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    raise
+                finally:
+                    if watchdog_task is not None:
+                        watchdog_task.cancel()
+                        try:
+                            await watchdog_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    attempt_records.append({
+                        "attempt": attempt_number,
+                        "started_at": attempt_started_at,
+                        "ended_at": _utc_now_iso(),
+                        "duration_ms": int(round(
+                            (time.perf_counter() - started) * 1000
+                        )),
+                        "returncode": proc.returncode,
+                        "watchdog_killed": watchdog_killed[0],
+                        "stdout_bytes": len(raw_stdout),
+                        "stderr_bytes": len(raw_stderr),
+                    })
+                    if call_dir:
+                        if raw_stdout:
+                            _write_artifact(
+                                os.path.join(
+                                    call_dir,
+                                    f"attempt_{attempt_number:03d}_stdout.jsonl",
+                                ),
+                                raw_stdout, gzip_it=True,
+                            )
+                        if raw_stderr:
+                            _write_artifact(
+                                os.path.join(
+                                    call_dir,
+                                    f"attempt_{attempt_number:03d}_stderr.txt",
+                                ),
+                                raw_stderr, gzip_it=True,
+                            )
+
+            final_attempt_duration_ms = int(round(
+                (time.perf_counter() - started) * 1000
+            ))
+            duration_ms = int(round(
+                (time.perf_counter() - call_started_perf) * 1000
+            ))
 
         # ── Save post-parse artifacts ────────────────────────────
         artifact_paths: dict[str, str] = {}
@@ -1465,7 +1516,7 @@ async def llm(
                 "session_id": session_id,
                 "resumed": bool(resume),
                 "has_schema": schema is not None,
-                "returncode": proc.returncode,
+                "returncode": returncode,
                 "argv_hash": _cmd_hash(cmd),
                 # Which sandbox this call ran in (if any). Enables
                 # post-hoc reasoning about the container image version.

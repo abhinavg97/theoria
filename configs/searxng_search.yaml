@@ -1,0 +1,3 @@
+_web_search:
+  provider: searxng
+  endpoint: http://localhost:8888

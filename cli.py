@@ -81,6 +81,10 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
              "Debian (defaults.yaml) preamble.",
     )
     g.add_argument(
+        "--backend", choices=["codex", "claude", "theoria_agent"], default=None,
+        help="Backend for pipeline roles. Default: codex audited preset.",
+    )
+    g.add_argument(
         "--codex-model", default=None,
         help="Override the model for codex-backed roles (e.g. gpt-5.5).",
     )
@@ -118,9 +122,10 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
 def _resolve(args) -> None:
     """Apply the audited HLE setup, letting the remaining knobs (--image /
     --no-docker / --config / ...) override, then hand off to the harness."""
-    # The audited configuration is the only one: Codex on every role except
-    # the formalizer, which apply_args pins to Claude.
-    backend, docker, image = "codex", True, SAGE_IMAGE
+    # Default to the audited setup: Codex on every role except the
+    # formalizer, which harness.apply_args pins to Claude for the Codex
+    # preset. Explicit --backend lets experimental configs use another loop.
+    backend, docker, image = args.backend or "codex", True, SAGE_IMAGE
 
     if args.docker is not None:
         docker = args.docker
