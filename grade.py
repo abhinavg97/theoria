@@ -23,10 +23,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
+import time
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
-from llm import llm as _llm_call
+from llm import (
+    artifact_dir,
+    call_log,
+    llm as _llm_call,
+    telemetry_context,
+)
 from pipeline import load_config
+from telemetry import aggregate_calls, config_for_hash, load_pricing
 
 
 # ── Structured output schema (identical to the internal audit grader) ──
@@ -179,6 +190,7 @@ def format_input(result: dict, rationale: dict | None = None) -> str:
 
 async def grade_one(
     result: dict, config: dict, prompt_text: str, rationale: dict | None = None,
+    watch: bool = True,
 ) -> dict:
     """Grade one problem result. Returns the parsed structured verdict."""
     user_prompt = format_input(result, rationale)
@@ -188,7 +200,7 @@ async def grade_one(
         schema=GRADE_SCHEMA,
         system=prompt_text,
         config=config,
-        watch=True,  # streaming parse path; also gives live progress
+        watch=watch,
     )
     if not isinstance(response, dict):
         raise RuntimeError(
@@ -201,14 +213,22 @@ async def grade_run(
     run_file: str,
     config_paths: list[str] | None = None,
     out_path: str | None = None,
+    *,
+    watch: bool = True,
+    pricing_path: str | None = None,
 ) -> dict:
     """Grade every problem in a run JSON. Writes a grades JSON and returns a
     summary dict. Defaults the output to runs/grades/<run-stem>.json."""
-    results = json.load(open(run_file))
+    with open(run_file) as f:
+        results = json.load(f)
     if isinstance(results, dict):
         results = [results]
 
     config = load_config(config_paths or [DEFAULT_GRADER_CONFIG])
+    resolved_pricing_path = pricing_path or os.getenv("THEORIA_PRICING_FILE")
+    if resolved_pricing_path:
+        load_pricing(resolved_pricing_path)
+        config.setdefault("_telemetry", {})["pricing_file"] = resolved_pricing_path
     if "audit_grader" not in config:
         raise SystemExit(
             "No 'audit_grader' role in the loaded config. Pass "
@@ -220,6 +240,28 @@ async def grade_run(
         f"{settings.get('backend', 'claude')}:"
         f"{settings.get('model')}:{settings.get('effort')}"
     )
+    grade_started_at = datetime.now(timezone.utc).isoformat()
+    grade_started_perf = time.perf_counter()
+    grade_run_id = (
+        f"grade_{Path(run_file).stem}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    )
+    grade_artifact_root = Path("runs/artifacts") / grade_run_id
+    grade_artifact_root.mkdir(parents=True, exist_ok=True)
+    (grade_artifact_root / "meta.json").write_text(json.dumps({
+        "run_id": grade_run_id,
+        "kind": "audit_grading",
+        "source_run_file": run_file,
+        "started_at": grade_started_at,
+        "grader_model": grader_model,
+        "grader_prompt_sha256": hashlib.sha256(
+            prompt_text.encode()
+        ).hexdigest(),
+        "config_sha256": hashlib.sha256(json.dumps(
+            config_for_hash(config), sort_keys=True, separators=(",", ":"), default=str,
+        ).encode()).hexdigest(),
+        "config": config,
+    }, indent=2, default=str))
 
     # Fetch canonical HLE rationales for any benchmark problems in this run
     # (no-op for custom questions, which aren't in the dataset).
@@ -228,18 +270,59 @@ async def grade_run(
         print(f"Loaded {len(rationales)} HLE rationale(s) for grader context.")
 
     graded = []
+    all_calls: list[dict] = []
     n_match = 0
     for i, result in enumerate(results, start=1):
         pid = result.get("id", f"#{i}")
         print(f"[{i}/{len(results)}] grading {pid}...", flush=True)
+        safe_pid = re.sub(r"[^\w.-]", "_", str(pid))
+        problem_artifact_dir = grade_artifact_root / safe_pid
+        problem_artifact_dir.mkdir(parents=True, exist_ok=True)
+        calls: list[dict] = []
+        call_token = call_log.set(calls)
+        artifact_token = artifact_dir.set(str(problem_artifact_dir))
+        trace_token = telemetry_context.set({
+            "run_id": grade_run_id,
+            "problem_id": str(pid),
+        })
+        problem_started_at = datetime.now(timezone.utc).isoformat()
+        problem_started_perf = time.perf_counter()
+        error: Exception | None = None
+        verdict = None
         try:
             verdict = await grade_one(
-                result, config, prompt_text, rationales.get(pid),
+                result, config, prompt_text, rationales.get(pid), watch=watch,
             )
         except Exception as e:
+            error = e
+            (problem_artifact_dir / "traceback.txt").write_text(
+                traceback.format_exc()
+            )
+        finally:
+            call_log.reset(call_token)
+            artifact_dir.reset(artifact_token)
+            telemetry_context.reset(trace_token)
+        calls = [c for c in calls if c is not None]
+        problem_metrics = aggregate_calls(
+            calls,
+            problem_started_at=problem_started_at,
+            problem_ended_at=datetime.now(timezone.utc).isoformat(),
+            problem_duration_ms=int(round(
+                (time.perf_counter() - problem_started_perf) * 1000
+            )),
+        )
+        all_calls.extend(calls)
+        if error is not None:
+            e = error
             print(f"  ! failed: {e}")
-            graded.append({"id": pid, "error": str(e)})
+            graded.append({
+                "id": pid,
+                "error": str(e),
+                "calls": calls,
+                "metrics": problem_metrics,
+            })
             continue
+        assert verdict is not None
         final = verdict["final"]
         n_match += 1 if final["key_match"] else 0
         print(
@@ -253,6 +336,8 @@ async def grade_run(
             "verified": result.get("verified"),
             "grader_model": grader_model,
             "grader_prompt_sha": prompt_sha,
+            "calls": calls,
+            "metrics": problem_metrics,
             **verdict,
         })
 
@@ -262,6 +347,7 @@ async def grade_run(
         "key_match": n_match,
         "grader_model": grader_model,
         "grader_prompt_sha": prompt_sha,
+        "artifact_root": str(grade_artifact_root),
         "results": graded,
     }
 
@@ -269,8 +355,40 @@ async def grade_run(
         Path("runs/grades").mkdir(parents=True, exist_ok=True)
         out_path = f"runs/grades/{Path(run_file).stem}.json"
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
+
+    grade_ended_at = datetime.now(timezone.utc).isoformat()
+    run_metrics = aggregate_calls(
+        all_calls,
+        problem_started_at=grade_started_at,
+        problem_ended_at=grade_ended_at,
+        problem_duration_ms=int(round(
+            (time.perf_counter() - grade_started_perf) * 1000
+        )),
+        scope="grading_run",
+    )
+    run_metrics.update({
+        "scope": "grading_run",
+        "graded_problems": len(results),
+        "successful_grades": len(results) - sum(
+            1 for item in graded if item.get("error")
+        ),
+    })
+    (grade_artifact_root / "telemetry.json").write_text(
+        json.dumps(run_metrics, indent=2, default=str)
+    )
+    meta_path = grade_artifact_root / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta.update({
+        "finished_at": grade_ended_at,
+        "telemetry_path": str(grade_artifact_root / "telemetry.json"),
+        "output_path": out_path,
+    })
+    meta_path.write_text(json.dumps(meta, indent=2, default=str))
+    summary["metrics"] = run_metrics
+    tmp_out = out_path + ".tmp"
+    with open(tmp_out, "w") as f:
         json.dump(summary, f, indent=2)
+    os.replace(tmp_out, out_path)
 
     print(
         f"\nGraded {len(results)} problems: {n_match} matched the key. "
@@ -288,5 +406,12 @@ if __name__ == "__main__":
                         help="Grader config YAML (repeatable). "
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
+    parser.add_argument(
+        "--watch", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument("--pricing", default=None)
     args = parser.parse_args()
-    asyncio.run(grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade_run(
+        args.run_file, args.config, args.out,
+        watch=args.watch, pricing_path=args.pricing,
+    ))
