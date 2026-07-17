@@ -1,6 +1,6 @@
 import re
 
-from harness import _safe_version, make_save_path
+from harness import _safe_version, make_save_path, print_summary
 
 
 def test_make_save_path_with_tag(tmp_path, monkeypatch):
@@ -34,3 +34,21 @@ def test_safe_version_missing_binary_returns_none():
 
 def test_safe_version_known_binary_returns_text():
     assert _safe_version("python3") is not None
+
+
+def test_summary_surfaces_solver_solution_text_changes(capsys):
+    print_summary([{
+        "id": "p1",
+        "answer": "42",
+        "verified": True,
+        "expected": "",
+        "repair_metrics": {
+            "repair_attempted": True,
+            "certified_by_repair": True,
+            "answer_changed_during_repair": False,
+            "answer_change_observable": True,
+            "solver_solution_text_changed_during_repair": True,
+        },
+    }])
+
+    assert "1 solver solution text changed" in capsys.readouterr().out
