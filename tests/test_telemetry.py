@@ -189,6 +189,60 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(metrics["run_duration_ms"], 100)
         self.assertNotIn("problem_duration_ms", metrics)
 
+    def test_search_aggregation_separates_attempts_from_provider_requests(self):
+        calls = [
+            {
+                "role": "citation",
+                "backend": "theoria_agent",
+                "model": "model",
+                "web_search_provider": "searxng",
+                "web_search_attempts": 2,
+                "web_search_requests": 2,
+                "web_search_provider_requests": 1,
+                "web_search_successes": 1,
+                "web_search_failures": 1,
+                "web_search_client_failures": 1,
+                "web_search_provider_failures": 0,
+                "web_search_result_count": 3,
+                "web_search_total_latency_ms": 20,
+                "web_search_error_categories": {"missing_query": 1},
+            },
+            {
+                "role": "citation",
+                "backend": "theoria_agent",
+                "model": "model",
+                "web_search_provider": "searxng",
+                "web_search_attempts": 1,
+                "web_search_requests": 1,
+                "web_search_provider_requests": 1,
+                "web_search_successes": 0,
+                "web_search_failures": 1,
+                "web_search_client_failures": 0,
+                "web_search_provider_failures": 1,
+                "web_search_total_latency_ms": 40,
+                "web_search_error_categories": {"timeout": 1},
+            },
+        ]
+
+        metrics = aggregate_calls(
+            calls,
+            problem_started_at="start",
+            problem_ended_at="end",
+            problem_duration_ms=100,
+        )
+
+        self.assertEqual(metrics["web_search_requests"], 3)
+        self.assertEqual(metrics["web_search_attempts"], 3)
+        self.assertEqual(metrics["web_search_provider_requests"], 2)
+        self.assertEqual(metrics["web_search_client_failures"], 1)
+        self.assertEqual(metrics["web_search_provider_failures"], 1)
+        self.assertEqual(metrics["web_search_total_latency_ms"], 60)
+        self.assertEqual(metrics["web_search_mean_latency_ms"], 30)
+        self.assertEqual(metrics["web_search_error_categories"], {
+            "missing_query": 1,
+            "timeout": 1,
+        })
+
     def test_config_hash_excludes_machine_local_telemetry(self):
         config = {
             "solver": {"backend": "codex"},
