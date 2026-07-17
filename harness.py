@@ -13,21 +13,55 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import pipeline
 import sandbox as sbx
-from llm import call_log, artifact_dir, sandbox_container, sandbox_image_id
+from llm import (
+    call_log,
+    artifact_dir,
+    sandbox_container,
+    sandbox_image_id,
+    telemetry_context,
+)
 from pipeline import run, CONFIG, load_config
+from observability import event, get_logger
+from telemetry import aggregate_calls, config_for_hash, load_pricing
+
+logger = get_logger("harness")
 
 
 # ── Run-level metadata capture ───────────────────────────────────
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _pricing_provenance() -> dict | None:
+    path = (CONFIG.get("_telemetry") or {}).get("pricing_file")
+    if not path:
+        path = os.getenv("THEORIA_PRICING_FILE")
+    if not path:
+        return None
+    try:
+        with open(os.path.expanduser(path), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {"path": path, "sha256": None, "available": False}
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "available": True,
+    }
 
 def _safe_version(binary: str) -> str | None:
     """Run `<binary> --version` and return the stripped output.
@@ -99,6 +133,15 @@ def make_artifact_root(save_path: str) -> str:
         "python_version": sys.version,
         "save_path": save_path,
         "config": dict(CONFIG),
+        "config_sha256": _sha256_text(json.dumps(
+            config_for_hash(CONFIG), sort_keys=True, separators=(",", ":"), default=str,
+        )),
+        "prompt_sha256": {
+            role: _sha256_text(str(settings["prompt"]))
+            for role, settings in CONFIG.items()
+            if isinstance(settings, dict) and "prompt" in settings
+        },
+        "pricing": _pricing_provenance(),
         "cli_versions": {
             "claude": _safe_version("claude"),
             "codex": _safe_version("codex"),
@@ -190,6 +233,12 @@ def apply_args(args) -> None:
                 continue
             if settings.get("backend") == "codex":
                 settings["model"] = args.codex_model
+    pricing_path = (
+        getattr(args, "pricing", None) or os.getenv("THEORIA_PRICING_FILE")
+    )
+    if pricing_path:
+        load_pricing(pricing_path)
+        CONFIG.setdefault("_telemetry", {})["pricing_file"] = pricing_path
     pipeline.WATCH = args.watch
     # Pulled in run_problems; expose here so runners don't need to thread it.
     _args_ref["docker"] = bool(getattr(args, "docker", False))
@@ -261,6 +310,10 @@ async def run_one(
     artifact dir for post-mortem.
     """
     pid = problem.get("id", "?")
+    event(
+        logger, logging.INFO, "problem.started", "Problem run started",
+        run_id=run_id, problem_id=pid, sandboxed=use_docker,
+    )
     print(f"\n{'#'*60}")
     print(f"# {pid}")
     print(f"{'#'*60}")
@@ -273,6 +326,10 @@ async def run_one(
     # all append to this same list.
     calls: list[dict] = []
     token = call_log.set(calls)
+    trace_token = telemetry_context.set({
+        "run_id": run_id,
+        "problem_id": pid,
+    })
 
     # Per-problem artifact directory. Every LLM call under this problem
     # writes its raw inputs/outputs into call_NNN_<role>/ here.
@@ -323,13 +380,27 @@ async def run_one(
         )
     except Exception as e:
         print(f"[{pid}]   ERROR: {e}")
+        traceback_path = None
+        if prob_art_dir:
+            traceback_path = os.path.join(prob_art_dir, "traceback.txt")
+            try:
+                with open(traceback_path, "w") as f:
+                    f.write(traceback.format_exc())
+            except OSError:
+                traceback_path = None
+        event(
+            logger, logging.ERROR, "problem.failed", "Problem run failed",
+            run_id=run_id, problem_id=pid, error_type=type(e).__name__,
+        )
         result = {
             "answer": None,
             "verified": False,
             "error": str(e),
+            "traceback_path": traceback_path,
         }
     finally:
         call_log.reset(token)
+        telemetry_context.reset(trace_token)
         if art_token is not None:
             artifact_dir.reset(art_token)
         if sandbox_token is not None:
@@ -390,98 +461,15 @@ async def run_one(
     problem_duration_ms = int(round((time.perf_counter() - started_perf) * 1000))
     finished_iso = datetime.now().astimezone().isoformat()
 
-    # Aggregate per-role metrics from the call log.
-    # llm() reserves placeholder slots for in-flight calls via
-    # `log.append(None)`. If a call raises before the slot is filled
-    # (subprocess error, parse error, etc.), we're left with a None in
-    # `calls`. Skip those here — they're recorded as failures elsewhere
-    # (the failure path writes a per-call meta.json artifact), and we
-    # don't have metadata to aggregate.
+    # Aggregate normalized usage, tool, retry, failure, and cost metrics.
     calls = [c for c in calls if c is not None]
-    calls_by_role: dict[str, int] = {}
-    tokens_by_role: dict[str, int] = {}
-    duration_by_role: dict[str, int] = {}
-    total_input = 0
-    total_output = 0
-    total_cache_read = 0
-    total_cost = 0.0
-    has_cost = False
-    total_llm_duration_ms = 0
-    web_search_providers: set[str] = set()
-    web_search_requests = 0
-    web_search_successes = 0
-    web_search_failures = 0
-    web_search_client_failures = 0
-    web_search_provider_failures = 0
-    web_search_result_count = 0
-    web_search_latency_ms = 0
-    web_search_error_categories: dict[str, int] = {}
-    for c in calls:
-        r = c.get("role", "?")
-        calls_by_role[r] = calls_by_role.get(r, 0) + 1
-        in_tokens = c.get("input_tokens", 0) or 0
-        out_tokens = c.get("output_tokens", 0) or 0
-        tokens_by_role[r] = tokens_by_role.get(r, 0) + in_tokens + out_tokens
-        dur = c.get("duration_ms", 0) or 0
-        duration_by_role[r] = duration_by_role.get(r, 0) + dur
-        total_input += in_tokens
-        total_output += out_tokens
-        total_cache_read += c.get("cache_read_input_tokens", 0) or 0
-        total_llm_duration_ms += dur
-        cost = c.get("total_cost_usd")
-        if cost is not None:
-            total_cost += cost
-            has_cost = True
-        if c.get("web_search_provider") and (c.get("web_search_requests", 0) or 0):
-            web_search_providers.add(c["web_search_provider"])
-        web_search_requests += c.get("web_search_requests", 0) or 0
-        web_search_successes += c.get("web_search_successes", 0) or 0
-        web_search_failures += c.get("web_search_failures", 0) or 0
-        web_search_client_failures += c.get("web_search_client_failures", 0) or 0
-        web_search_provider_failures += c.get("web_search_provider_failures", 0) or 0
-        web_search_result_count += c.get("web_search_result_count", 0) or 0
-        web_search_latency_ms += c.get("web_search_latency_ms", 0) or 0
-        for category, count in (c.get("web_search_error_categories") or {}).items():
-            web_search_error_categories[category] = (
-                web_search_error_categories.get(category, 0) + count
-            )
-
     result["calls"] = calls
-    # TODO: cost/token accounting needs an end-to-end audit before these are trusted.
-    #   - total_cost_usd is only self-reported by the formalizer (Claude Code) backend;
-    #     the codex solver/judges report no cost, so the total undercounts badly.
-    #   - deriving cost from tokens would need cache-tier pricing, which isn't modeled.
-    # The paper does not report cost/token figures for these reasons.
-    result["metrics"] = {
-        "problem_started_at": started_iso,
-        "problem_ended_at": finished_iso,
-        "problem_duration_ms": problem_duration_ms,
-        "total_llm_duration_ms": total_llm_duration_ms,
-        "num_calls": len(calls),
-        "calls_by_role": calls_by_role,
-        "tokens_by_role": tokens_by_role,
-        "duration_by_role": duration_by_role,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_cache_read_input_tokens": total_cache_read,
-        "total_tokens": total_input + total_output,
-        "total_cost_usd": total_cost if has_cost else None,
-        "web_search_providers": sorted(web_search_providers),
-        "web_search_requests": web_search_requests,
-        "web_search_successes": web_search_successes,
-        "web_search_failures": web_search_failures,
-        "web_search_client_failures": web_search_client_failures,
-        "web_search_provider_failures": web_search_provider_failures,
-        "web_search_result_count": web_search_result_count,
-        # This is the cumulative provider latency, not per-request latency.
-        "web_search_latency_ms": web_search_latency_ms,
-        "web_search_total_latency_ms": web_search_latency_ms,
-        "web_search_mean_latency_ms": (
-            web_search_latency_ms / (web_search_successes + web_search_provider_failures)
-            if web_search_successes + web_search_provider_failures else None
-        ),
-        "web_search_error_categories": web_search_error_categories,
-    }
+    result["metrics"] = aggregate_calls(
+        calls,
+        problem_started_at=started_iso,
+        problem_ended_at=finished_iso,
+        problem_duration_ms=problem_duration_ms,
+    )
 
     # Carry over all problem metadata (id, category, expected, etc.)
     for k, v in problem.items():
@@ -509,6 +497,14 @@ async def run_one(
         )
         correct = bool(re.search(pattern, given_norm))
     result["correct"] = correct
+    event(
+        logger, logging.INFO, "problem.completed", "Problem run completed",
+        run_id=run_id, problem_id=pid,
+        verified=result.get("verified"),
+        duration_ms=problem_duration_ms,
+        num_calls=result["metrics"]["num_calls"],
+        failed_calls=result["metrics"]["failed_calls"],
+    )
     return result
 
 
@@ -534,7 +530,36 @@ async def run_problems(
       - looks up the local sandbox image digest for call metadata;
       - tells each run_one to spin up its own per-problem container.
     """
+    run_started_at = datetime.now(timezone.utc).isoformat()
+    run_started_perf = time.perf_counter()
     artifact_root = make_artifact_root(save_path)
+    dataset_provenance = {
+        (
+            problem.get("dataset_name"),
+            problem.get("dataset_split"),
+            problem.get("dataset_revision"),
+            problem.get("dataset_fingerprint"),
+        )
+        for problem in problems
+        if problem.get("dataset_name")
+    }
+    if dataset_provenance:
+        update_artifact_root_meta(artifact_root, {
+            "datasets": [
+                {
+                    "name": name,
+                    "split": split,
+                    "requested_revision": revision,
+                    "fingerprint": fingerprint,
+                }
+                for name, split, revision, fingerprint
+                in sorted(dataset_provenance, key=lambda item: str(item))
+            ],
+        })
+    event(
+        logger, logging.INFO, "run.started", "Run started",
+        save_path=save_path, requested_problems=len(problems), parallel=parallel,
+    )
     print(f"Artifact root: {artifact_root}")
 
     use_docker = _args_ref.get("docker", False)
@@ -625,7 +650,44 @@ async def run_problems(
     try:
         await asyncio.gather(*[run_and_save(p) for p in problems])
     finally:
+        run_ended_at = datetime.now(timezone.utc).isoformat()
+        all_calls = [
+            call
+            for result in results
+            for call in (result.get("calls") or [])
+        ]
+        run_telemetry = aggregate_calls(
+            all_calls,
+            problem_started_at=run_started_at,
+            problem_ended_at=run_ended_at,
+            problem_duration_ms=int(round(
+                (time.perf_counter() - run_started_perf) * 1000
+            )),
+            scope="run",
+        )
+        run_telemetry["scope"] = "run"
+        run_telemetry["completed_problems"] = len(results)
+        run_telemetry["requested_problems"] = len(problems)
+        telemetry_path = os.path.join(artifact_root, "telemetry.json")
+        try:
+            tmp = telemetry_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(run_telemetry, f, indent=2, default=str)
+            os.replace(tmp, telemetry_path)
+            update_artifact_root_meta(
+                artifact_root,
+                {"telemetry_path": telemetry_path},
+            )
+        except OSError:
+            pass
         finalize_artifact_root(artifact_root)
+        event(
+            logger, logging.INFO, "run.completed", "Run completed",
+            save_path=save_path, completed_problems=len(results),
+            requested_problems=len(problems),
+            duration_ms=run_telemetry["run_duration_ms"],
+            failed_calls=run_telemetry["failed_calls"],
+        )
         if claude_creds_path:
             sbx.cleanup_credentials(claude_creds_path)
         if claude_config_path:

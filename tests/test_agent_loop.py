@@ -164,6 +164,8 @@ def test_run_agent_exposes_web_search_tool(monkeypatch):
     assert result.metadata["search_enabled"] is True
     assert result.metadata["web_search_provider"] == "searxng"
     assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_attempts"] == 1
+    assert result.metadata["web_search_provider_requests"] == 1
     assert result.metadata["web_search_successes"] == 1
     assert result.metadata["web_search_failures"] == 0
     assert result.metadata["web_search_client_failures"] == 0
@@ -214,6 +216,8 @@ def test_run_agent_records_web_search_failure_category(monkeypatch):
 
     assert result.response == "fallback"
     assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_attempts"] == 1
+    assert result.metadata["web_search_provider_requests"] == 1
     assert result.metadata["web_search_successes"] == 0
     assert result.metadata["web_search_failures"] == 1
     assert result.metadata["web_search_client_failures"] == 0
@@ -248,10 +252,91 @@ def test_run_agent_records_malformed_search_input_as_client_failure(monkeypatch)
 
     assert result.response == "fallback"
     assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_attempts"] == 1
+    assert result.metadata["web_search_provider_requests"] == 0
     assert result.metadata["web_search_client_failures"] == 1
     assert result.metadata["web_search_provider_failures"] == 0
     assert result.metadata["web_search_error_categories"] == {"invalid_input": 1}
     assert result.metadata["tool_calls"][0]["metadata"]["error_category"] == "invalid_input"
+
+
+def test_run_agent_excludes_client_failure_from_provider_latency(monkeypatch):
+    replies = iter([
+        {
+            "action": "tool",
+            "tool": "web_search",
+            "input": {"query": "query"},
+        },
+        {"action": "final", "response": "fallback"},
+    ])
+
+    monkeypatch.setattr(
+        agent_loop,
+        "_chat_completion",
+        lambda settings, messages: (json.dumps(next(replies)), {}),
+    )
+    def invalid_config(*_args, **_kwargs):
+        raise agent_loop.SearchFailure("invalid_config", "missing endpoint")
+
+    monkeypatch.setattr(agent_loop, "_search_web", invalid_config)
+
+    result = asyncio.run(agent_loop.run_agent(
+        "search",
+        settings={"model": "fake", "search": True},
+        schema=None,
+        system=None,
+        resume=None,
+        role="citation",
+        container_id=None,
+        search_config={"provider": "searxng"},
+    ))
+
+    assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_attempts"] == 1
+    assert result.metadata["web_search_provider_requests"] == 0
+    assert result.metadata["web_search_client_failures"] == 1
+    assert result.metadata["web_search_provider_failures"] == 0
+    assert result.metadata["web_search_total_latency_ms"] == 0
+    assert result.metadata["web_search_mean_latency_ms"] is None
+    tool = result.metadata["tool_calls"][0]["metadata"]
+    assert tool["provider_request"] is False
+    assert tool["latency_ms"] == 0
+
+
+def test_run_agent_counts_unavailable_search_as_attempt_not_provider_request(
+    monkeypatch,
+):
+    replies = iter([
+        {
+            "action": "tool",
+            "tool": "web_search",
+            "input": {"query": "query"},
+        },
+        {"action": "final", "response": "fallback"},
+    ])
+    monkeypatch.setattr(
+        agent_loop,
+        "_chat_completion",
+        lambda settings, messages: (json.dumps(next(replies)), {}),
+    )
+
+    result = asyncio.run(agent_loop.run_agent(
+        "search",
+        settings={"model": "fake", "search": True},
+        schema=None,
+        system=None,
+        resume=None,
+        role="citation",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_attempts"] == 1
+    assert result.metadata["web_search_provider_requests"] == 0
+    assert result.metadata["web_search_failures"] == 1
+    assert result.metadata["web_search_client_failures"] == 1
+    assert result.metadata["web_search_error_categories"] == {"unavailable": 1}
 
 
 def test_search_web_classifies_urlerror_timeout(monkeypatch):

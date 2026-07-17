@@ -26,6 +26,7 @@ def load_hle(
     skip_images: bool = True,
     ids: list[str] | None = None,
     subset: str = "Gold subset",
+    revision: str | None = None,
 ) -> list[dict]:
     """Load HLE-Verified (https://arxiv.org/abs/2602.13964).
 
@@ -43,7 +44,9 @@ def load_hle(
     from datasets import load_dataset  # imported lazily so other CLI
                                        # commands don't need `datasets`
 
-    ds = load_dataset("skylenage/HLE-Verified", split="train")
+    dataset_name = "skylenage/HLE-Verified"
+    ds = load_dataset(dataset_name, split="train", revision=revision)
+    dataset_fingerprint = getattr(ds, "_fingerprint", None)
     problems = []
     id_set = set(ids) if ids else None
     skipped = 0
@@ -75,6 +78,10 @@ def load_hle(
             "answer_type": meta.get("answer_type", ""),
             "category": ex["category"],
             "verified_class": ex["Verified_Classes"],
+            "dataset_name": dataset_name,
+            "dataset_split": "train",
+            "dataset_revision": revision,
+            "dataset_fingerprint": dataset_fingerprint,
         })
 
         if max_questions and len(problems) >= max_questions:

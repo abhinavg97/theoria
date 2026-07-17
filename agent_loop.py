@@ -452,6 +452,7 @@ async def run_agent(
     search_failures = 0
     search_client_failures = 0
     search_provider_failures = 0
+    search_provider_requests = 0
     search_result_count = 0
     search_latency_ms = 0
 
@@ -575,6 +576,7 @@ async def run_agent(
                     "provider": search_provider,
                     "query": query,
                     "ok": False,
+                    "provider_request": False,
                     "result_count": 0,
                     "latency_ms": 0,
                 }
@@ -620,12 +622,14 @@ async def run_agent(
                         provider = search_provider
                         endpoint = None
                     search_successes += 1
+                    search_provider_requests += 1
                     search_result_count += result_count
                     search_latency_ms += latency
                     tool_metadata.update({
                         "provider": provider,
                         "endpoint": endpoint,
                         "ok": True,
+                        "provider_request": True,
                         "result_count": result_count,
                         "latency_ms": latency,
                     })
@@ -636,15 +640,18 @@ async def run_agent(
                 latency = int(round((time.perf_counter() - search_started) * 1000))
                 category = _search_failure_category(exc)
                 search_failures += 1
-                if _is_client_search_failure(category):
+                client_failure = _is_client_search_failure(category)
+                if client_failure:
                     search_client_failures += 1
                 else:
                     search_provider_failures += 1
-                search_latency_ms += latency
+                    search_provider_requests += 1
+                    search_latency_ms += latency
                 _increment_error_category(search_error_categories, category)
                 tool_metadata.update({
                     "ok": False,
-                    "latency_ms": latency,
+                    "provider_request": not client_failure,
+                    "latency_ms": 0 if client_failure else latency,
                     "error_category": category,
                     "status_code": getattr(exc, "status_code", None),
                 })
@@ -681,7 +688,13 @@ async def run_agent(
         "wire_api": "chat-completions",
         "search_enabled": search_enabled,
         "web_search_provider": search_provider,
+        # Backward-compatible: every model-issued web_search action, including
+        # malformed, empty, and unavailable-tool attempts.
         "web_search_requests": search_requests,
+        "web_search_attempts": search_requests,
+        # Requests that passed client-side validation and reached the search
+        # provider path. This is the denominator for provider reliability.
+        "web_search_provider_requests": search_provider_requests,
         "web_search_successes": search_successes,
         "web_search_failures": search_failures,
         "web_search_client_failures": search_client_failures,
@@ -692,8 +705,8 @@ async def run_agent(
         "web_search_latency_ms": search_latency_ms,
         "web_search_total_latency_ms": search_latency_ms,
         "web_search_mean_latency_ms": (
-            search_latency_ms / (search_successes + search_provider_failures)
-            if search_successes + search_provider_failures else None
+            search_latency_ms / search_provider_requests
+            if search_provider_requests else None
         ),
         "web_search_error_categories": search_error_categories,
         "shell_enabled": shell_enabled,
