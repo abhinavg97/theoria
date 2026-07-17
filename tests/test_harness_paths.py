@@ -489,9 +489,12 @@ def test_resume_identity_binds_python_dependencies_and_cli_versions():
     changed_packages["host_runtime"]["installed_packages_sha256"] = "packages-b"
     changed_cli = copy.deepcopy(base)
     changed_cli["cli_versions"]["docker"] = "Docker 2"
+    changed_pricing = copy.deepcopy(base)
+    changed_pricing["pricing"] = {"sha256": "pricing-b"}
 
     assert harness._resume_identity(base) != harness._resume_identity(changed_packages)
     assert harness._resume_identity(base) != harness._resume_identity(changed_cli)
+    assert harness._resume_identity(base) != harness._resume_identity(changed_pricing)
 
 
 def test_resume_rejects_incomplete_local_model_identity(tmp_path, monkeypatch):
@@ -644,6 +647,7 @@ def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
                 "retry_count": 1,
                 "failed": False,
                 "total_cost_usd": None,
+                "cost": {"amount_usd": 0.01, "complete": True},
                 "tool_calls": [{
                     "tool_name": "shell",
                     "metadata": {"ok": True, "exit_code": 0},
@@ -673,6 +677,8 @@ def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
     assert metrics["num_calls"] == 2
     assert metrics["failed_calls"] == 1
     assert metrics["total_retries"] == 3
+    assert metrics["partial_cost_usd"] == pytest.approx(0.01)
+    assert metrics["priced_calls"] == 1
     assert metrics["tool_status_counts"] == {
         "success": 1, "failure": 1, "unknown": 0,
     }

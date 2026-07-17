@@ -96,6 +96,10 @@ def test_llm_theoria_agent_writes_standard_artifacts(tmp_path, monkeypatch):
     assert log[0]["model"] == "fake-model"
     assert log[0]["returncode"] == 0
     assert log[0]["usage_complete"] is True
+    assert log[0]["telemetry_schema_version"] == "1.0"
+    assert log[0]["usage"]["total_tokens"] == 2
+    assert log[0]["usage"]["complete"] is True
+    assert log[0]["cost"]["amount_usd"] is None
     assert log[0]["wire_api"] == "chat-completions"
     assert log[0]["tool_calls"][0]["tool_name"] == "shell"
 
@@ -166,6 +170,8 @@ def test_llm_theoria_agent_records_failed_call_and_partial_artifacts(
     assert log[0]["input_tokens"] == 3
     assert log[0]["usage_observed"] is True
     assert log[0]["usage_complete"] is False
+    assert log[0]["usage"]["total_tokens"] == 5
+    assert log[0]["usage"]["complete"] is False
     assert log[0]["retry_count"] == 1
     call_dir = tmp_path / "call_000_solver"
     assert json.loads((call_dir / "meta.json").read_text())["failed"] is True
@@ -315,6 +321,7 @@ def test_cached_theoria_agent_call_restores_transcript(tmp_path, monkeypatch):
     assert session_id == "persisted-session"
     assert agent_loop._SESSIONS[session_id] == messages
     assert log[0]["resumed_from_cache"] is True
+    assert log[0]["telemetry_schema_version"] == "1.0"
 
 
 def test_failed_cached_call_rejects_prompt_drift(tmp_path, monkeypatch):

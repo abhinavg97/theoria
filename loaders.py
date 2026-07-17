@@ -85,6 +85,7 @@ def load_hle(
             "question": ex["question"],
             "answer": ex["answer"],
             "dataset": "HLE-Verified",
+            "dataset_name": HLE_DATASET_NAME,
             "dataset_source": HLE_DATASET_NAME,
             "dataset_split": HLE_DATASET_SPLIT,
             "dataset_subset": subset if subset and id_set is None else "ids",
@@ -111,4 +112,5 @@ def build_question(question: str, problem_id: str = "question") -> list[dict]:
         "question": question,
         "answer": "",
         "dataset": "custom",
+        "dataset_name": "custom",
     }]

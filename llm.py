@@ -17,6 +17,7 @@ import contextvars
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -28,6 +29,11 @@ import uuid
 from datetime import datetime, timezone
 
 import agent_loop
+from observability import event, get_logger, redact_text
+from telemetry import enrich_call
+
+
+logger = get_logger("llm")
 
 
 SUBPROCESS_STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
@@ -46,6 +52,11 @@ TOOL_CALL_OUTPUT_LIMIT = 2000  # chars per tool output (can be a web search resu
 
 call_log: contextvars.ContextVar[list | None] = contextvars.ContextVar(
     "llm_call_log", default=None,
+)
+
+# Correlation identifiers set by the harness and copied into every call.
+telemetry_context: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "llm_telemetry_context", default={},
 )
 
 
@@ -517,6 +528,7 @@ def _extract_claude_metadata(result_event: dict) -> dict:
         "output_tokens": usage.get("output_tokens", 0),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+        "reasoning_output_tokens": usage.get("reasoning_output_tokens", 0),
         "total_cost_usd": result_event.get("total_cost_usd"),
         "num_turns": result_event.get("num_turns"),
         "duration_api_ms": result_event.get("duration_api_ms"),
@@ -524,6 +536,7 @@ def _extract_claude_metadata(result_event: dict) -> dict:
         "is_error": result_event.get("is_error", False),
         "web_search_requests": server_tools.get("web_search_requests", 0),
         "web_fetch_requests": server_tools.get("web_fetch_requests", 0),
+        "provider_usage": usage,
     }
 
 
@@ -536,12 +549,16 @@ def _extract_codex_metadata(events: list) -> dict:
     input_tokens = 0
     output_tokens = 0
     cache_read_input_tokens = 0
+    reasoning_output_tokens = 0
     usage_reported = False
+    provider_usage: list[dict] = []
     for event in events:
         if event.get("type") != "turn.completed":
             continue
         usage = event.get("usage") or {}
         usage_reported = usage_reported or bool(usage)
+        if usage:
+            provider_usage.append(usage)
         input_tokens += usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("output_tokens", 0) or 0
         cache_read_input_tokens += (
@@ -549,12 +566,21 @@ def _extract_codex_metadata(events: list) -> dict:
             or usage.get("cached_input_tokens", 0)
             or 0
         )
+        output_details = usage.get("output_tokens_details") or {}
+        reasoning_output_tokens += (
+            usage.get("reasoning_output_tokens", 0)
+            or output_details.get("reasoning_tokens", 0)
+            or 0
+        )
     return {
         "usage_reported": usage_reported,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": 0,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "total_cost_usd": None,  # codex doesn't expose cost
+        "provider_usage": provider_usage,
     }
 
 
@@ -581,6 +607,29 @@ def _maybe_truncate(s, limit: int, *, truncate: bool):
             return json.dumps(s)
         return str(s)
     return _truncate(s, limit)
+
+
+def _redact_tool_call_previews(tool_calls: list[dict]) -> list[dict]:
+    """Redact call-log previews while retaining full artifact payloads."""
+    return [
+        {
+            key: redact_text(value) if isinstance(value, str) else value
+            for key, value in tool.items()
+        }
+        for tool in tool_calls
+    ]
+
+
+def _redact_attempt_previews(attempts: list[dict]) -> list[dict]:
+    """Copy attempt records while redacting their embedded tool previews."""
+    redacted = []
+    for attempt in attempts:
+        item = dict(attempt)
+        item["tool_calls"] = _redact_tool_call_previews(
+            item.get("tool_calls") or []
+        )
+        redacted.append(item)
+    return redacted
 
 
 def _extract_claude_tool_calls(events: list, *, truncate: bool = True) -> list:
@@ -794,9 +843,13 @@ def _print_claude_event(event):
         content = event.get("message", {}).get("content", [])
         for block in content:
             if block.get("type") == "tool_use":
-                print(f"      [tool] {block['name']}({json.dumps(block.get('input', {}))[:100]})", file=sys.stderr)
+                preview = redact_text(json.dumps(block.get("input", {}))[:100])
+                print(
+                    f"      [tool] {block['name']}({preview})",
+                    file=sys.stderr,
+                )
             elif block.get("type") == "text":
-                text = block["text"][:200]
+                text = redact_text(block["text"][:200])
                 if text.strip():
                     print(f"      [text] {text}", file=sys.stderr)
 
@@ -1050,12 +1103,16 @@ def _print_codex_event(event):
         item_type = item.get("type", "")
 
         if item_type == "function_call":
-            print(f"      [tool] {item.get('name', '?')}({item.get('arguments', '')[:100]})", file=sys.stderr)
+            preview = redact_text(item.get("arguments", "")[:100])
+            print(
+                f"      [tool] {item.get('name', '?')}({preview})",
+                file=sys.stderr,
+            )
         elif item_type == "function_call_output":
-            output = item.get("output", "")[:200]
+            output = redact_text(item.get("output", "")[:200])
             print(f"      [result] {output}", file=sys.stderr)
         elif item_type == "agent_message":
-            text = item.get("text", "")[:200]
+            text = redact_text(item.get("text", "")[:200])
             if text.strip():
                 print(f"      [text] {text}", file=sys.stderr)
 
@@ -1233,6 +1290,13 @@ async def llm(
         web_search_config=config.get("_web_search"),
     )
     backend = settings.get("backend", "claude")
+    trace = dict(telemetry_context.get())
+    call_started_at = _utc_now_iso()
+    call_started_perf = time.perf_counter()
+    pricing_path = (
+        (config.get("_telemetry") or {}).get("pricing_file")
+        or os.getenv("THEORIA_PRICING_FILE")
+    )
 
     # ── Reserve a slot in the call log ───────────────────────────
     #
@@ -1248,6 +1312,24 @@ async def llm(
     else:
         call_index = len(log)
         log.append(None)  # reserve slot; replaced with call_meta below
+    call_id = (
+        f"{trace.get('run_id')}:{trace.get('problem_id')}:{call_index}"
+        if trace.get("run_id")
+        and trace.get("problem_id")
+        and call_index is not None
+        else str(uuid.uuid4())
+    )
+    event(
+        logger,
+        logging.INFO,
+        "llm.call.started",
+        "LLM call started",
+        call_id=call_id,
+        role=role,
+        backend=backend,
+        run_id=trace.get("run_id"),
+        problem_id=trace.get("problem_id"),
+    )
 
     # ── Set up the per-call artifact directory ───────────────────
     base_artifact_dir = artifact_dir.get()
@@ -1276,12 +1358,30 @@ async def llm(
                 cached_result = candidate
         if cached_result is not None:
             response, session_id, cache_meta = cached_result
+            cache_meta.update({
+                "call_id": call_id,
+                **trace,
+                "resumed_from_cache": True,
+            })
+            enrich_call(cache_meta, pricing_path=pricing_path)
             print(
                 f"[resume] cache hit on call_{call_index:03d}_{role}",
                 file=sys.stderr,
             )
             if log is not None and call_index is not None:
                 log[call_index] = cache_meta
+            event(
+                logger,
+                logging.INFO,
+                "llm.call.cache_hit",
+                "LLM call reused cached result",
+                call_id=call_id,
+                role=role,
+                backend=backend,
+                cache_lookup_duration_ms=int(round(
+                    (time.perf_counter() - call_started_perf) * 1000
+                )),
+            )
             return response, session_id
         prior_invocations = _prior_invocation_summaries(invocation_dirs)
         if invocation_dirs:
@@ -1324,8 +1424,6 @@ async def llm(
     attempt_records: list[dict] = []
     retry_count = 0
     agent_messages: list[dict] | None = None
-    call_started_at = _utc_now_iso()
-    call_started_perf = time.perf_counter()
     try:
         # Build command
         if backend == "theoria_agent":
@@ -1453,6 +1551,7 @@ async def llm(
                             "input_tokens", "output_tokens",
                             "cache_read_input_tokens",
                             "cache_creation_input_tokens",
+                            "reasoning_output_tokens",
                         )
                         if provider_meta.get(key) is not None
                     },
@@ -1490,6 +1589,7 @@ async def llm(
                         "input_tokens", "output_tokens",
                         "cache_read_input_tokens",
                         "cache_creation_input_tokens",
+                        "reasoning_output_tokens",
                     )
                     if provider_meta.get(key) is not None
                 },
@@ -1597,6 +1697,8 @@ async def llm(
                         else:
                             response, session_id, provider_meta, events = \
                                 _parse_codex_output(output, schema)
+                    if watch:
+                        raw_stderr = await proc.stderr.read()
                     returncode = proc.returncode
                     # Success — exit retry loop.
                     break
@@ -1659,6 +1761,7 @@ async def llm(
                                 "input_tokens", "output_tokens",
                                 "cache_read_input_tokens",
                                 "cache_creation_input_tokens",
+                                "reasoning_output_tokens",
                             )
                             if attempt_metadata.get(key) is not None
                         },
@@ -1697,7 +1800,7 @@ async def llm(
 
             usage_fields = (
                 "input_tokens", "output_tokens", "cache_read_input_tokens",
-                "cache_creation_input_tokens",
+                "cache_creation_input_tokens", "reasoning_output_tokens",
             )
             for field in usage_fields:
                 observed = [
@@ -1784,6 +1887,8 @@ async def llm(
         if log is not None:
             response_text = response if isinstance(response, str) else json.dumps(response)
             call_meta = {
+                "call_id": call_id,
+                **trace,
                 "role": role,
                 "backend": backend,
                 # Record the effective model actually sent to the CLI,
@@ -1802,8 +1907,8 @@ async def llm(
                 "ended_at": _utc_now_iso(),
                 "duration_ms": duration_ms,
                 "retry_count": retry_count + len(prior_invocations),
-                "attempts": attempt_records,
-                "all_tool_calls": all_tool_calls,
+                "attempts": _redact_attempt_previews(attempt_records),
+                "all_tool_calls": _redact_tool_call_previews(all_tool_calls),
                 "session_id": session_id,
                 "resumed": bool(resume),
                 "has_schema": schema is not None,
@@ -1822,15 +1927,19 @@ async def llm(
                 "container_id": container_id,
                 "container_cwd": container_call_cwd,
                 "image_id": image_id,
-                "prompt": _truncate(prompt, 8000),
-                "system": _truncate(system or "", 8000),
-                "response": _truncate(response_text, 8000),
+                "prompt": redact_text(_truncate(prompt, 8000)),
+                "system": redact_text(_truncate(system or "", 8000)),
+                "response": redact_text(_truncate(response_text, 8000)),
                 **_invocation_audit_fields(
                     prior_invocations, current_failed=False,
                 ),
                 **artifact_paths,
                 **provider_meta,
             }
+            call_meta["tool_calls"] = _redact_tool_call_previews(
+                call_meta.get("tool_calls") or []
+            )
+            enrich_call(call_meta, pricing_path=pricing_path)
             # Fill the slot we reserved at the top.
             log[call_index] = call_meta
 
@@ -1841,6 +1950,23 @@ async def llm(
                 os.path.join(call_dir, "meta.json"),
                 json.dumps(call_meta, indent=2, default=str),
             )
+
+        event(
+            logger,
+            logging.INFO,
+            "llm.call.completed",
+            "LLM call completed",
+            call_id=call_id,
+            role=role,
+            backend=backend,
+            model=(
+                call_meta.get("model")
+                if call_meta is not None
+                else settings.get("model")
+            ),
+            duration_ms=duration_ms,
+            retry_count=retry_count + len(prior_invocations),
+        )
 
         return response, session_id
 
@@ -1885,6 +2011,8 @@ async def llm(
             })
         duration_ms = int(round((time.perf_counter() - call_started_perf) * 1000))
         failure_meta = {
+            "call_id": call_id,
+            **trace,
             "role": role,
             "backend": backend,
             "model": _effective_model(cmd) or settings.get("model"),
@@ -1900,12 +2028,12 @@ async def llm(
             "ended_at": _utc_now_iso(),
             "duration_ms": duration_ms,
             "retry_count": retry_count + len(prior_invocations),
-            "attempts": attempt_records,
-            "all_tool_calls": [
+            "attempts": _redact_attempt_previews(attempt_records),
+            "all_tool_calls": _redact_tool_call_previews([
                 tool_call
                 for attempt in attempt_records
                 for tool_call in (attempt.get("tool_calls") or [])
-            ],
+            ]),
             "resumed": bool(resume),
             "has_schema": schema is not None,
             "schema_sha256": (
@@ -1920,8 +2048,8 @@ async def llm(
             "container_id": container_id,
             "container_cwd": container_call_cwd,
             "image_id": image_id,
-            "prompt": _truncate(prompt, 8000),
-            "system": _truncate(system or "", 8000),
+            "prompt": redact_text(_truncate(prompt, 8000)),
+            "system": redact_text(_truncate(system or "", 8000)),
             "response": "",
             "error_type": type(e).__name__,
             "error": str(e),
@@ -1942,6 +2070,19 @@ async def llm(
         )
         failure_meta["error_type"] = type(e).__name__
         failure_meta["error"] = str(e)
+        failure_meta["tool_calls"] = _redact_tool_call_previews(
+            failure_meta.get("tool_calls") or []
+        )
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_output_tokens",
+        ):
+            failure_meta.setdefault(field, 0)
+        failure_meta.setdefault("total_cost_usd", None)
+        enrich_call(failure_meta, pricing_path=pricing_path)
 
         if call_dir:
             try:
@@ -2014,6 +2155,18 @@ async def llm(
                 pass
         if log is not None and call_index is not None:
             log[call_index] = failure_meta
+        event(
+            logger,
+            logging.ERROR,
+            "llm.call.failed",
+            "LLM call failed",
+            call_id=call_id,
+            role=role,
+            backend=backend,
+            error_type=type(e).__name__,
+            duration_ms=duration_ms,
+            retry_count=retry_count + len(prior_invocations),
+        )
         raise
 
     finally:

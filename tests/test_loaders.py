@@ -2,7 +2,19 @@ import json
 import sys
 import types
 
-from loaders import HLE_DATASET_REVISION, build_question, load_hle
+from loaders import (
+    HLE_DATASET_NAME,
+    HLE_DATASET_REVISION,
+    build_question,
+    load_hle,
+)
+
+
+def test_hle_cli_defaults_to_pinned_dataset_revision():
+    from cli import build_parser
+
+    args = build_parser().parse_args(["hle", "1"])
+    assert args.dataset_revision == HLE_DATASET_REVISION
 
 
 def test_build_question_default_id():
@@ -12,6 +24,7 @@ def test_build_question_default_id():
         "question": "What is 2 + 2?",
         "answer": "",
         "dataset": "custom",
+        "dataset_name": "custom",
     }]
 
 
@@ -21,6 +34,7 @@ def test_build_question_custom_id():
     assert problems[0]["id"] == "primes"
     assert problems[0]["answer"] == ""
     assert problems[0]["dataset"] == "custom"
+    assert problems[0]["dataset_name"] == "custom"
 
 
 def test_hle_loader_pins_revision_and_records_fingerprint(monkeypatch):
@@ -54,5 +68,6 @@ def test_hle_loader_pins_revision_and_records_fingerprint(monkeypatch):
 
     assert seen["revision"] == HLE_DATASET_REVISION
     assert problems[0]["dataset_revision"] == HLE_DATASET_REVISION
+    assert problems[0]["dataset_name"] == HLE_DATASET_NAME
     assert problems[0]["dataset_fingerprint"] == "resolved-fingerprint"
     assert problems[0]["dataset_config"] == "default"

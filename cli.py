@@ -37,6 +37,7 @@ from pathlib import Path
 import harness
 import loaders
 import sandbox
+from observability import configure_logging
 
 STD_IMAGE = "theoria-sandbox:latest"
 SAGE_IMAGE = "theoria-sandbox-sage:latest"
@@ -117,6 +118,20 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
         "--resume", default=None, metavar="RUN_ID",
         help="Resume an existing run by id (reuses cached per-call results).",
     )
+    g.add_argument(
+        "--pricing", default=None, metavar="PATH",
+        help="Versioned JSON/YAML model pricing catalog for cost estimates. "
+             "Without one, unavailable provider costs remain null.",
+    )
+    g.add_argument(
+        "--log-level", default=None,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Operational log level (or THEORIA_LOG_LEVEL).",
+    )
+    g.add_argument(
+        "--log-format", default=None, choices=("text", "json"),
+        help="Operational log format (or THEORIA_LOG_FORMAT).",
+    )
 
 
 def _resolve(args) -> None:
@@ -196,18 +211,21 @@ def cmd_hle(args) -> None:
         for n in args.problems:
             if n < 1:
                 sys.exit("HLE problem numbers are 1-based — use 1 or higher.")
-            sel = loaders.load_hle(skip=n - 1, max_questions=1)
+            sel = loaders.load_hle(
+                skip=n - 1, max_questions=1, revision=args.dataset_revision,
+            )
             if not sel:
                 sys.exit(f"No HLE problem at position {n}.")
             problems.extend(sel)
     elif args.ids:
         ids = [s.strip() for s in args.ids.split(",")]
-        problems = loaders.load_hle(ids=ids)
+        problems = loaders.load_hle(ids=ids, revision=args.dataset_revision)
     elif args.max is not None:
         if args.max <= 0:
             sys.exit("--max must be a positive integer.")
         problems = loaders.load_hle(
             category=args.category, max_questions=args.max, skip=args.skip,
+            revision=args.dataset_revision,
         )
     else:
         sys.exit(
@@ -253,7 +271,13 @@ def cmd_show(args) -> None:
 
 def cmd_grade(args) -> None:
     import grade
-    asyncio.run(grade.grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade.grade_run(
+        args.run_file,
+        args.config,
+        args.out,
+        watch=args.watch,
+        pricing_path=args.pricing,
+    ))
 
 
 def cmd_doctor(args) -> None:
@@ -396,6 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--skip", type=int, default=0, help="With --max: skip the first N.")
     h.add_argument("--ids", default=None, help="Comma-separated specific dataset ids.")
     h.add_argument("--category", default=None, help="Filter (e.g. Math, Physics).")
+    h.add_argument(
+        "--dataset-revision", default=loaders.HLE_DATASET_REVISION,
+        help="Hugging Face revision (commit/tag) to pin HLE-Verified. The "
+             "resolved dataset fingerprint is always recorded.",
+    )
     add_run_options(h)
     h.set_defaults(func=cmd_hle)
 
@@ -412,6 +441,21 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--config", action="append", default=None,
                    help="Grader config YAML (default: configs/audit_grader.yaml).")
     g.add_argument("--out", default=None, help="Output grades JSON path.")
+    g.add_argument(
+        "--watch", action=argparse.BooleanOptionalAction, default=True,
+        help="Stream grader LLM events (default: on).",
+    )
+    g.add_argument("--pricing", default=None, metavar="PATH",
+                   help="Versioned pricing catalog for grader cost estimates.")
+    g.add_argument(
+        "--log-level", default=None,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Operational log level (or THEORIA_LOG_LEVEL).",
+    )
+    g.add_argument(
+        "--log-format", default=None, choices=("text", "json"),
+        help="Operational log format (or THEORIA_LOG_FORMAT).",
+    )
     g.set_defaults(func=cmd_grade)
 
     d = sub.add_parser("doctor", help="Check your setup.")
@@ -427,6 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
+    configure_logging(
+        level=getattr(args, "log_level", None),
+        log_format=getattr(args, "log_format", None),
+    )
     args.func(args)
 
 

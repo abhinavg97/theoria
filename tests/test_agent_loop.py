@@ -436,7 +436,11 @@ def test_run_agent_normalizes_provider_cached_token_usage(monkeypatch):
         return json.dumps({"action": "final", "response": "ok"}), {
             "prompt_tokens": 12,
             "completion_tokens": 2,
-            "prompt_tokens_details": {"cached_tokens": 7},
+            "prompt_tokens_details": {
+                "cached_tokens": 7,
+                "cache_creation_tokens": 3,
+            },
+            "completion_tokens_details": {"reasoning_tokens": 1},
         }, {"usage_reported": True}
 
     monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
@@ -452,7 +456,19 @@ def test_run_agent_normalizes_provider_cached_token_usage(monkeypatch):
     ))
 
     assert result.metadata["cache_read_input_tokens"] == 7
+    assert result.metadata["cache_creation_input_tokens"] == 3
+    assert result.metadata["reasoning_output_tokens"] == 1
+    assert result.metadata["provider_usage"] == [{
+        "prompt_tokens": 12,
+        "completion_tokens": 2,
+        "prompt_tokens_details": {
+            "cached_tokens": 7,
+            "cache_creation_tokens": 3,
+        },
+        "completion_tokens_details": {"reasoning_tokens": 1},
+    }]
     assert result.events[1]["usage"]["cache_read_input_tokens"] == 7
+    assert result.events[1]["usage"]["reasoning_output_tokens"] == 1
 
 
 def test_run_agent_failure_keeps_partial_transcript(monkeypatch):

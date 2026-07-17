@@ -531,6 +531,7 @@ async def run_agent(
     events: list[dict] = [{"type": "thread.started", "thread_id": session_id}]
     stderr_lines: list[str] = []
     input_tokens = output_tokens = cache_read_input_tokens = 0
+    cache_creation_input_tokens = reasoning_output_tokens = 0
     final_response: str | dict | None = None
     provider_responses: list[dict] = []
 
@@ -546,6 +547,8 @@ async def run_agent(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
             "total_cost_usd": None,
             "tool_calls": _tool_call_previews(events),
             "num_turns": completed_turns,
@@ -566,6 +569,11 @@ async def run_agent(
             "shell_enabled": shell_enabled,
             "role": role,
             "provider_responses": provider_responses,
+            "provider_usage": [
+                item["usage"]
+                for item in provider_responses
+                if isinstance(item.get("usage"), dict)
+            ],
             "provider_response_ids": [
                 item["response_id"] for item in provider_responses
                 if item.get("response_id")
@@ -606,7 +614,10 @@ async def run_agent(
             provider_metadata = {}
         else:
             content, usage, provider_metadata = chat_result
-        provider_responses.append(provider_metadata)
+        provider_responses.append({
+            **provider_metadata,
+            "usage": usage,
+        })
         input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
         token_details = (
@@ -621,6 +632,23 @@ async def run_agent(
             or 0
         )
         cache_read_input_tokens += int(turn_cache_read)
+        turn_cache_creation = (
+            usage.get("cache_creation_input_tokens", 0)
+            or token_details.get("cache_creation_tokens", 0)
+            or 0
+        )
+        cache_creation_input_tokens += int(turn_cache_creation)
+        output_details = (
+            usage.get("completion_tokens_details")
+            or usage.get("output_tokens_details")
+            or {}
+        )
+        turn_reasoning = (
+            usage.get("reasoning_output_tokens", 0)
+            or output_details.get("reasoning_tokens", 0)
+            or 0
+        )
+        reasoning_output_tokens += int(turn_reasoning)
         events.append({
             "type": "turn.completed",
             "turn": turn + 1,
@@ -628,6 +656,8 @@ async def run_agent(
                 "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0,
                 "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
                 "cache_read_input_tokens": int(turn_cache_read),
+                "cache_creation_input_tokens": int(turn_cache_creation),
+                "reasoning_output_tokens": int(turn_reasoning),
                 "duration_ms": int(round((time.monotonic() - started) * 1000)),
             },
             "provider": provider_metadata,

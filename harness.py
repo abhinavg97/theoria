@@ -16,12 +16,14 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 import platform
 import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -36,8 +38,14 @@ from llm import (
     effective_settings,
     sandbox_container,
     sandbox_image_id,
+    telemetry_context,
 )
+from observability import event, get_logger
 from pipeline import run, CONFIG, load_config
+from telemetry import aggregate_calls, config_for_hash, load_pricing
+
+
+logger = get_logger("harness")
 
 
 # ── Run-level metadata capture ───────────────────────────────────
@@ -52,6 +60,26 @@ def _canonical_json(value) -> str:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _pricing_provenance(config: dict | None = None) -> dict | None:
+    resolved_config = CONFIG if config is None else config
+    path = (resolved_config.get("_telemetry") or {}).get("pricing_file")
+    if not path:
+        path = os.getenv("THEORIA_PRICING_FILE")
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    try:
+        with open(expanded, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {"path": path, "sha256": None, "available": False}
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "available": True,
+    }
 
 
 def _sha256_json(value) -> str:
@@ -424,6 +452,7 @@ def _run_args_manifest(args_ref: dict) -> dict:
         "experiment_id": args_ref.get("experiment_id"),
         "experiment_phase": args_ref.get("experiment_phase"),
         "trial": args_ref.get("trial"),
+        "pricing": args_ref.get("pricing"),
         "config_paths": list(args_ref.get("config_paths") or []),
         "cli_args": _redact_config_value(None, cli_args),
     }
@@ -452,7 +481,7 @@ def _sandbox_request_identity(args_ref: dict) -> dict:
 
 def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
     redacted_config = _redact_config(config)
-    config_identity = _config_identity_value(None, config)
+    config_identity = _config_identity_value(None, config_for_hash(config))
     config_sources = [str(pipeline.DEFAULTS_PATH)] + [
         str(p) for p in args_ref.get("config_paths", [])
     ]
@@ -842,6 +871,7 @@ def _resume_identity(meta: dict) -> dict:
     return {
         "audit_schema_version": meta.get("audit_schema_version"),
         "config_sha256": meta.get("config_sha256") or audit.get("config_sha256"),
+        "pricing_sha256": (meta.get("pricing") or {}).get("sha256"),
         "run_args_identity": audit.get("run_args_identity"),
         "sandbox_request_identity": audit.get("sandbox_request_identity"),
         "concurrency": audit.get("concurrency"),
@@ -906,6 +936,7 @@ def make_artifact_root(
         "save_path": save_path,
         "config": _redact_config(CONFIG),
         "config_sha256": research_audit["config_sha256"],
+        "pricing": _pricing_provenance(),
         "cli_versions": {
             "claude": _safe_version("claude"),
             "codex": _safe_version("codex"),
@@ -1176,6 +1207,12 @@ def apply_args(args) -> None:
                 continue
             if settings.get("backend") == "codex":
                 settings["model"] = args.codex_model
+    pricing_path = (
+        getattr(args, "pricing", None) or os.getenv("THEORIA_PRICING_FILE")
+    )
+    if pricing_path:
+        load_pricing(pricing_path)
+        CONFIG.setdefault("_telemetry", {})["pricing_file"] = pricing_path
     pipeline.WATCH = args.watch
     # Pulled in run_problems; expose here so runners don't need to thread it.
     _args_ref["docker"] = bool(getattr(args, "docker", False))
@@ -1190,6 +1227,7 @@ def apply_args(args) -> None:
     _args_ref["experiment_id"] = getattr(args, "experiment_id", None)
     _args_ref["experiment_phase"] = getattr(args, "experiment_phase", None)
     _args_ref["trial"] = getattr(args, "trial", None)
+    _args_ref["pricing"] = pricing_path
     _args_ref["cli_args"] = {
         key: value
         for key, value in vars(args).items()
@@ -1340,6 +1378,15 @@ async def run_one(
     artifact dir for post-mortem.
     """
     pid = problem.get("id", "?")
+    event(
+        logger,
+        logging.INFO,
+        "problem.started",
+        "Problem run started",
+        run_id=run_id,
+        problem_id=pid,
+        sandboxed=use_docker,
+    )
     print(f"\n{'#'*60}")
     print(f"# {pid}")
     print(f"{'#'*60}")
@@ -1352,6 +1399,10 @@ async def run_one(
     # all append to this same list.
     calls: list[dict] = []
     token = call_log.set(calls)
+    trace_token = telemetry_context.set({
+        "run_id": run_id,
+        "problem_id": str(pid),
+    })
 
     # Per-problem artifact directory. Every LLM call under this problem
     # writes its raw inputs/outputs into call_NNN_<role>/ here.
@@ -1438,13 +1489,32 @@ async def run_one(
         )
     except Exception as e:
         print(f"[{pid}]   ERROR: {e}")
+        traceback_path = None
+        if prob_art_dir:
+            traceback_path = os.path.join(prob_art_dir, "traceback.txt")
+            try:
+                with open(traceback_path, "w") as f:
+                    f.write(traceback.format_exc())
+            except OSError:
+                traceback_path = None
+        event(
+            logger,
+            logging.ERROR,
+            "problem.failed",
+            "Problem run failed",
+            run_id=run_id,
+            problem_id=pid,
+            error_type=type(e).__name__,
+        )
         result = {
             "answer": None,
             "verified": False,
             "error": str(e),
+            "traceback_path": traceback_path,
         }
     finally:
         call_log.reset(token)
+        telemetry_context.reset(trace_token)
         if art_token is not None:
             artifact_dir.reset(art_token)
         if sandbox_token is not None:
@@ -1579,10 +1649,17 @@ async def run_one(
         out_tokens = c.get("output_tokens", 0) or 0
         usage_observed = c.get("usage_observed")
         if usage_observed is None:
-            usage_observed = "input_tokens" in c or "output_tokens" in c
+            usage = c.get("usage") or {}
+            usage_observed = (
+                usage.get("source") != "unavailable"
+                if usage else "input_tokens" in c or "output_tokens" in c
+            )
         if usage_observed:
             usage_available_calls += 1
-        usage_complete_calls += int(bool(c.get("usage_complete")))
+        usage_complete = c.get("usage_complete")
+        if usage_complete is None:
+            usage_complete = bool((c.get("usage") or {}).get("complete"))
+        usage_complete_calls += int(bool(usage_complete))
         tokens_by_role[r] = tokens_by_role.get(r, 0) + in_tokens + out_tokens
         dur = c.get("duration_ms", 0) or 0
         duration_by_role[r] = duration_by_role.get(r, 0) + dur
@@ -1590,9 +1667,11 @@ async def run_one(
         total_output += out_tokens
         total_cache_read += c.get("cache_read_input_tokens", 0) or 0
         total_llm_duration_ms += dur
-        cost = c.get("total_cost_usd")
+        cost = (c.get("cost") or {}).get("amount_usd")
+        if cost is None:
+            cost = c.get("total_cost_usd")
         if cost is not None:
-            total_cost += cost
+            total_cost += float(cost)
             priced_calls += 1
         evidence = mechanistic_evidence.setdefault(r, {
             "calls": 0,
@@ -1650,12 +1729,15 @@ async def run_one(
             )
 
     result["calls"] = calls
-    # TODO: cost/token accounting needs an end-to-end audit before these are trusted.
-    #   - total_cost_usd is only self-reported by the formalizer (Claude Code) backend;
-    #     the codex solver/judges report no cost, so the total undercounts badly.
-    #   - deriving cost from tokens would need cache-tier pricing, which isn't modeled.
-    # The paper does not report cost/token figures for these reasons.
-    result["metrics"] = {
+    normalized_metrics = aggregate_calls(
+        calls,
+        problem_started_at=started_iso,
+        problem_ended_at=finished_iso,
+        problem_duration_ms=problem_duration_ms,
+    )
+    # Retain the richer audit fields alongside the normalized telemetry schema.
+    # Complete cost remains null unless every call has auditable pricing.
+    normalized_metrics.update({
         "problem_started_at": started_iso,
         "problem_ended_at": finished_iso,
         "problem_duration_ms": problem_duration_ms,
@@ -1705,7 +1787,8 @@ async def run_one(
         "web_search_result_count": web_search_result_count,
         "web_search_latency_ms": web_search_latency_ms,
         "web_search_error_categories": web_search_error_categories,
-    }
+    })
+    result["metrics"] = normalized_metrics
 
     # Carry over all problem metadata (id, category, expected, etc.)
     for k, v in problem.items():
@@ -1733,6 +1816,18 @@ async def run_one(
         )
         correct = bool(re.search(pattern, given_norm))
     result["correct"] = correct
+    event(
+        logger,
+        logging.INFO,
+        "problem.completed",
+        "Problem run completed",
+        run_id=run_id,
+        problem_id=pid,
+        verified=result.get("verified"),
+        duration_ms=problem_duration_ms,
+        num_calls=result["metrics"]["num_calls"],
+        failed_calls=result["metrics"]["failed_calls"],
+    )
     return result
 
 
@@ -1883,11 +1978,46 @@ async def run_problems(
       - looks up the local sandbox image digest for call metadata;
       - tells each run_one to spin up its own per-problem container.
     """
+    run_started_at = datetime.now(timezone.utc).isoformat()
     run_started_perf = time.perf_counter()
     problem_manifest = _problem_set_manifest(problems)
     artifact_root = make_artifact_root(
         save_path,
         problem_manifest=problem_manifest,
+    )
+    dataset_provenance = {
+        (
+            problem.get("dataset_name") or problem.get("dataset_source"),
+            problem.get("dataset_split"),
+            problem.get("dataset_revision"),
+            problem.get("dataset_fingerprint"),
+        )
+        for problem in problems
+        if problem.get("dataset_name") or problem.get("dataset_source")
+    }
+    if dataset_provenance:
+        update_artifact_root_meta(artifact_root, {
+            "datasets": [
+                {
+                    "name": name,
+                    "split": split,
+                    "requested_revision": revision,
+                    "fingerprint": fingerprint,
+                }
+                for name, split, revision, fingerprint in sorted(
+                    dataset_provenance, key=lambda item: str(item),
+                )
+            ],
+        }, strict=True)
+    event(
+        logger,
+        logging.INFO,
+        "run.started",
+        "Run started",
+        run_id=os.path.splitext(os.path.basename(save_path))[0],
+        save_path=save_path,
+        requested_problems=len(problems),
+        parallel=parallel,
     )
     print(f"Artifact root: {artifact_root}")
 
@@ -1961,15 +2091,41 @@ async def run_problems(
             status = "interrupted"
         else:
             status = "failed"
-        run_metrics = _aggregate_run_metrics(
+        run_duration_ms = int(round(
+            (time.perf_counter() - run_started_perf) * 1000
+        ))
+        run_ended_at = datetime.now(timezone.utc).isoformat()
+        all_calls = [
+            call
+            for result in results
+            for call in (result.get("calls") or [])
+            if call is not None
+        ]
+        run_metrics = aggregate_calls(
+            all_calls,
+            problem_started_at=run_started_at,
+            problem_ended_at=run_ended_at,
+            problem_duration_ms=run_duration_ms,
+            scope="run",
+        )
+        run_metrics.update(_aggregate_run_metrics(
             results,
             requested=len(problems),
-            duration_ms=int(round(
-                (time.perf_counter() - run_started_perf) * 1000
-            )),
-        )
+            duration_ms=run_duration_ms,
+        ))
+        run_metrics["scope"] = "run"
+        telemetry_path = os.path.join(artifact_root, "telemetry.json")
+        telemetry_tmp = telemetry_path + ".tmp"
+        with open(telemetry_tmp, "w") as f:
+            json.dump(run_metrics, f, indent=2, default=str)
+        os.replace(telemetry_tmp, telemetry_path)
         update_artifact_root_meta(
-            artifact_root, {"metrics": run_metrics}, strict=True,
+            artifact_root,
+            {
+                "metrics": run_metrics,
+                "telemetry_path": telemetry_path,
+            },
+            strict=True,
         )
         finalize_artifact_root(
             artifact_root,
@@ -1983,8 +2139,28 @@ async def run_problems(
             artifact_root,
             external_paths=[save_path],
         )
+        event(
+            logger,
+            logging.INFO,
+            "run.completed",
+            "Run completed",
+            run_id=run_id,
+            status=status,
+            completed_problems=len(results),
+            requested_problems=len(problems),
+            duration_ms=run_duration_ms,
+            failed_calls=run_metrics["failed_calls"],
+        )
     except BaseException as exc:
         finalization_error = exc
+        event(
+            logger,
+            logging.ERROR,
+            "run.finalization_failed",
+            "Run finalization failed",
+            run_id=run_id,
+            error_type=type(exc).__name__,
+        )
         try:
             finalize_artifact_root(
                 artifact_root,

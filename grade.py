@@ -32,9 +32,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import harness
-from llm import artifact_dir, call_log, effective_settings, llm as _llm_call
+from llm import (
+    artifact_dir,
+    call_log,
+    effective_settings,
+    llm as _llm_call,
+    telemetry_context,
+)
 from loaders import HLE_DATASET_NAME, HLE_DATASET_REVISION, HLE_DATASET_SPLIT
 from pipeline import load_config
+from telemetry import aggregate_calls, load_pricing
 
 
 # ── Structured output schema (identical to the internal audit grader) ──
@@ -243,8 +250,18 @@ def _grade_call_metrics(calls: list[dict], duration_ms: int) -> dict:
     input_tokens = sum(int(call.get("input_tokens", 0) or 0) for call in calls)
     output_tokens = sum(int(call.get("output_tokens", 0) or 0) for call in calls)
     failed = sum(bool(call.get("failed")) for call in calls)
-    usage_observed = sum(bool(call.get("usage_observed")) for call in calls)
-    usage_complete = sum(bool(call.get("usage_complete")) for call in calls)
+    usage_observed = sum(
+        bool(call.get("usage_observed"))
+        if "usage_observed" in call
+        else (call.get("usage") or {}).get("source") != "unavailable"
+        for call in calls
+    )
+    usage_complete = sum(
+        bool(call.get("usage_complete"))
+        if "usage_complete" in call
+        else bool((call.get("usage") or {}).get("complete"))
+        for call in calls
+    )
     return {
         "duration_ms": duration_ms,
         "num_calls": len(calls),
@@ -361,6 +378,7 @@ async def grade_run(
     out_path: str | None = None,
     *,
     watch: bool = True,
+    pricing_path: str | None = None,
 ) -> dict:
     """Grade a stable snapshot of every problem in a completed run."""
     source_path = Path(run_file).expanduser().resolve(strict=True)
@@ -379,6 +397,10 @@ async def grade_run(
 
     resolved_config_paths = list(config_paths or [DEFAULT_GRADER_CONFIG])
     config = load_config(resolved_config_paths)
+    resolved_pricing_path = pricing_path or os.getenv("THEORIA_PRICING_FILE")
+    if resolved_pricing_path:
+        load_pricing(resolved_pricing_path)
+        config.setdefault("_telemetry", {})["pricing_file"] = resolved_pricing_path
     if "audit_grader" not in config:
         raise SystemExit(
             "No 'audit_grader' role in the loaded config. Pass "
@@ -451,6 +473,7 @@ async def grade_run(
         "evaluation_policy": evaluation_policy,
         "config": harness._redact_config(config),
         "config_sha256": audit["config_sha256"],
+        "pricing": harness._pricing_provenance(config),
         "research_audit": audit,
         "git": harness._safe_git_state(str(grade_artifact_root), "grading"),
         "host_runtime": harness._host_runtime_metadata(),
@@ -511,6 +534,11 @@ async def grade_run(
             calls: list[dict] = []
             call_token = call_log.set(calls)
             artifact_token = artifact_dir.set(str(problem_artifact_dir))
+            trace_token = telemetry_context.set({
+                "run_id": grade_run_id,
+                "problem_id": str(pid),
+            })
+            problem_started_at = datetime.now(timezone.utc).isoformat()
             problem_started = time.perf_counter()
             verdict = None
             problem_error: Exception | None = None
@@ -531,12 +559,19 @@ async def grade_run(
             finally:
                 call_log.reset(call_token)
                 artifact_dir.reset(artifact_token)
+                telemetry_context.reset(trace_token)
 
             calls = [call for call in calls if call is not None]
             duration_ms = int(round(
                 (time.perf_counter() - problem_started) * 1000
             ))
-            metrics = _grade_call_metrics(calls, duration_ms)
+            metrics = aggregate_calls(
+                calls,
+                problem_started_at=problem_started_at,
+                problem_ended_at=datetime.now(timezone.utc).isoformat(),
+                problem_duration_ms=duration_ms,
+            )
+            metrics.update(_grade_call_metrics(calls, duration_ms))
             all_calls.extend(calls)
             completed += 1
             if problem_error is not None:
@@ -570,16 +605,27 @@ async def grade_run(
                 **verdict,
             })
 
-        run_metrics = _grade_call_metrics(
+        finished_at = datetime.now(timezone.utc).isoformat()
+        run_duration_ms = int(round(
+            (time.perf_counter() - started_perf) * 1000
+        ))
+        run_metrics = aggregate_calls(
             all_calls,
-            int(round((time.perf_counter() - started_perf) * 1000)),
+            problem_started_at=started_at,
+            problem_ended_at=finished_at,
+            problem_duration_ms=run_duration_ms,
+            scope="grading_run",
         )
+        run_metrics.update(_grade_call_metrics(all_calls, run_duration_ms))
         successful_grades = sum(1 for item in graded if "error" not in item)
         run_metrics.update({
+            "scope": "grading_run",
             "requested_grades": len(results),
             "completed_grades": completed,
             "successful_grades": successful_grades,
         })
+        telemetry_path = grade_artifact_root / "telemetry.json"
+        telemetry_path.write_text(json.dumps(run_metrics, indent=2, default=str))
         summary = {
             "run_file": str(source_path),
             "run_file_sha256": source_run_hash,
@@ -602,8 +648,9 @@ async def grade_run(
         final_meta = harness._read_meta(str(grade_artifact_root))
         final_meta.update({
             "status": status,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": finished_at,
             "metrics": run_metrics,
+            "telemetry_path": str(telemetry_path),
             "completed_problem_ids": [str(item.get("id")) for item in graded],
             "output_sha256": harness._file_sha256(str(output_path)),
         })
@@ -652,5 +699,12 @@ if __name__ == "__main__":
                         help="Grader config YAML (repeatable). "
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
+    parser.add_argument(
+        "--watch", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument("--pricing", default=None)
     args = parser.parse_args()
-    asyncio.run(grade_run(args.run_file, args.config, args.out))
+    asyncio.run(grade_run(
+        args.run_file, args.config, args.out,
+        watch=args.watch, pricing_path=args.pricing,
+    ))
