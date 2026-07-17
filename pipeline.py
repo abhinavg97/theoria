@@ -649,7 +649,7 @@ def _build_repair_metrics(
     max_solver: int,
     solver_answers: int,
     solver_solutions: list[str] | None,
-    final_answer: str | None,
+    final_answer: object | None,
     verified: bool,
 ) -> dict:
     verify_attempt_records = [
@@ -671,6 +671,9 @@ def _build_repair_metrics(
     first_attempt_answer = _answer_from_proof_dict(
         first_verify.get("proof") if first_verify else None
     )
+    normalized_final_answer = (
+        None if final_answer is None else str(final_answer)
+    )
     first_attempt_verified = bool(first_verify and first_verify.get("all_ok"))
     verify_attempts = len(verify_attempt_records)
     solver_retries = max(0, solver_answers - 1)
@@ -678,14 +681,17 @@ def _build_repair_metrics(
     repair_attempted = bool(judge_repair_rounds or solver_retries)
     answer_change_observable = bool(
         not repair_attempted
-        or (first_attempt_answer is not None and final_answer is not None)
+        or (
+            first_attempt_answer is not None
+            and normalized_final_answer is not None
+        )
     )
     answer_changed = None
     if not repair_attempted:
         answer_changed = False
     elif answer_change_observable:
         answer_changed = (
-            first_attempt_answer.strip() != str(final_answer).strip()
+            first_attempt_answer.strip() != normalized_final_answer.strip()
         )
     solver_solutions = list(solver_solutions or [])
     solver_solution_text_changed = bool(
@@ -718,7 +724,7 @@ def _build_repair_metrics(
         ),
         "first_attempt_answer": first_attempt_answer,
         "answer_before_repair": first_attempt_answer if repair_attempted else None,
-        "final_answer": final_answer,
+        "final_answer": normalized_final_answer,
         "answer_change_observable": answer_change_observable,
         "answer_changed_during_repair": answer_changed,
         "solver_solution_text_changed_during_repair": solver_solution_text_changed,

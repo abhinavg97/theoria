@@ -218,6 +218,33 @@ def test_repair_metrics_track_solver_retry():
     assert metrics["solver_solution_text_changed_during_repair"] is True
 
 
+def test_repair_metrics_normalize_non_string_final_answer():
+    proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": [42],
+            "justification_type": "computation",
+            "justification": "6 * 7 = 42",
+        }],
+    }
+    metrics = _build_repair_metrics(
+        [
+            {"phase": "verify", "all_ok": False, "proof": proof},
+            {"phase": "verify", "all_ok": True, "proof": proof},
+        ],
+        max_verify=3,
+        max_solver=1,
+        solver_answers=1,
+        solver_solutions=["6 * 7 = 42"],
+        final_answer=42,
+        verified=True,
+    )
+
+    assert metrics["first_attempt_answer"] == "42"
+    assert metrics["final_answer"] == "42"
+    assert metrics["answer_changed_during_repair"] is False
+
+
 def test_formalizer_schema_accepts_proof_without_reject_reason():
     validate({
         "action": "proof",
