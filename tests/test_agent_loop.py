@@ -4,6 +4,47 @@ import json
 import agent_loop
 
 
+def test_run_shell_uses_docker_exec_without_login_shell(monkeypatch):
+    captured = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def fake_create_subprocess_exec(*argv, stdout=None, stderr=None):
+        captured.append(argv)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        agent_loop.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    output, code = asyncio.run(agent_loop._run_shell(
+        "python3 -c 'print(42)'",
+        container_id="sandbox123",
+        allow_host_tools=False,
+        timeout=5,
+        output_limit=1000,
+    ))
+
+    assert code == 0
+    assert "ok" in output
+    assert captured == [(
+        "docker",
+        "exec",
+        "-w",
+        "/workspace",
+        "sandbox123",
+        "bash",
+        "-c",
+        "python3 -c 'print(42)'",
+    )]
+
+
 def test_run_agent_executes_shell_tool_with_explicit_host_opt_in(monkeypatch):
     replies = iter([
         {"action": "tool", "tool": "shell", "input": {"cmd": "printf 42"}},
@@ -50,7 +91,15 @@ def test_run_agent_fails_host_shell_closed_by_default(monkeypatch):
     def fake_chat(settings, messages):
         return json.dumps(next(replies)), {}
 
+    async def fail_if_subprocess_starts(*argv, stdout=None, stderr=None):
+        raise AssertionError(f"unexpected host subprocess: {argv!r}")
+
     monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+    monkeypatch.setattr(
+        agent_loop.asyncio,
+        "create_subprocess_exec",
+        fail_if_subprocess_starts,
+    )
 
     result = asyncio.run(agent_loop.run_agent(
         "compute",

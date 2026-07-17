@@ -29,6 +29,20 @@ def test_theoria_agent_ollama_profile_configures_every_role():
         assert config[role]["allow_host_tools"] is False
 
 
+def test_theoria_agent_azure_profile_configures_every_role():
+    config = load_config("configs/theoria_agent_azure.example.yaml")
+
+    for role in ROLE_NAMES:
+        assert config[role]["backend"] == "theoria_agent"
+        assert config[role]["model"] == "YOUR_AZURE_DEPLOYMENT"
+        assert (
+            config[role]["endpoint"]
+            == "https://YOUR_RESOURCE.openai.azure.com/openai/v1"
+        )
+        assert config[role]["allow_shell"] is True
+        assert config[role]["allow_host_tools"] is False
+
+
 def test_searxng_search_profile_is_keyless():
     config = load_config([
         "configs/theoria_agent_ollama.yaml",
