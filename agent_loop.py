@@ -34,6 +34,22 @@ DEFAULT_SEARCH_RESULTS = 5
 _SESSIONS: dict[str, list[dict[str, str]]] = {}
 
 
+def restore_session(session_id: str, messages: list[dict]) -> None:
+    """Restore a persisted provider-neutral transcript for process resume."""
+    if not session_id or not isinstance(messages, list):
+        raise ValueError("session_id and a message list are required")
+    restored: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("session transcript contains a non-object message")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise ValueError("session transcript messages require string role/content")
+        restored.append({"role": role, "content": content})
+    _SESSIONS[session_id] = restored
+
+
 @dataclass
 class AgentRunResult:
     response: str | dict
@@ -217,6 +233,18 @@ def _chat_completion(
     )
     max_retries = int(settings.get("max_retries", 3))
     attempts: list[dict] = []
+
+    def retry_transient(attempt: int, record: dict) -> bool:
+        if attempt >= max_retries:
+            return False
+        sleep_seconds = min(
+            float(2 ** attempt), float(settings.get("max_retry_sleep", 65)),
+        )
+        record["retry_sleep_seconds"] = sleep_seconds
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        return True
+
     for attempt in range(max_retries + 1):
         attempt_started = time.perf_counter()
         try:
@@ -269,15 +297,34 @@ def _chat_completion(
                 f"chat completion failed with HTTP {exc.code}: {raw[:1500]}",
                 attempts=attempts,
             ) from exc
-        except urllib.error.URLError as exc:
-            attempts.append({
+        except TimeoutError as exc:
+            attempt_record = {
                 "attempt": attempt + 1,
-                "status": "network_error",
+                "status": "timeout",
                 "duration_ms": int(round(
                     (time.perf_counter() - attempt_started) * 1000
                 )),
                 "error": str(exc),
-            })
+            }
+            attempts.append(attempt_record)
+            if retry_transient(attempt, attempt_record):
+                continue
+            raise ChatCompletionError(
+                f"chat completion timed out: {exc}", attempts=attempts,
+            ) from exc
+        except urllib.error.URLError as exc:
+            is_timeout = isinstance(exc.reason, TimeoutError)
+            attempt_record = {
+                "attempt": attempt + 1,
+                "status": "timeout" if is_timeout else "network_error",
+                "duration_ms": int(round(
+                    (time.perf_counter() - attempt_started) * 1000
+                )),
+                "error": str(exc),
+            }
+            attempts.append(attempt_record)
+            if retry_transient(attempt, attempt_record):
+                continue
             raise ChatCompletionError(
                 f"chat completion failed: {exc}", attempts=attempts,
             ) from exc
@@ -483,7 +530,7 @@ async def run_agent(
 
     events: list[dict] = [{"type": "thread.started", "thread_id": session_id}]
     stderr_lines: list[str] = []
-    input_tokens = output_tokens = 0
+    input_tokens = output_tokens = cache_read_input_tokens = 0
     final_response: str | dict | None = None
     provider_responses: list[dict] = []
 
@@ -498,7 +545,7 @@ async def run_agent(
         metadata = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cached_input_tokens": 0,
+            "cache_read_input_tokens": cache_read_input_tokens,
             "total_cost_usd": None,
             "tool_calls": _tool_call_previews(events),
             "num_turns": completed_turns,
@@ -562,12 +609,25 @@ async def run_agent(
         provider_responses.append(provider_metadata)
         input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+        token_details = (
+            usage.get("prompt_tokens_details")
+            or usage.get("input_tokens_details")
+            or {}
+        )
+        turn_cache_read = (
+            usage.get("cache_read_input_tokens", 0)
+            or usage.get("cached_input_tokens", 0)
+            or token_details.get("cached_tokens", 0)
+            or 0
+        )
+        cache_read_input_tokens += int(turn_cache_read)
         events.append({
             "type": "turn.completed",
             "turn": turn + 1,
             "usage": {
                 "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0,
                 "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
+                "cache_read_input_tokens": int(turn_cache_read),
                 "duration_ms": int(round((time.monotonic() - started) * 1000)),
             },
             "provider": provider_metadata,

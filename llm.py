@@ -312,44 +312,76 @@ def _try_resume_from_cache(
     complete and idempotent prior result. Returns None if nothing
     cached. Raises if the cached prompt doesn't match the current
     prompt — that's a state-drift bug, not a fallback case."""
-    response_path = os.path.join(call_dir, "response.txt")
     meta_path = os.path.join(call_dir, "meta.json")
     prompt_path = os.path.join(call_dir, "prompt.txt")
-    if not (os.path.exists(response_path) and os.path.exists(meta_path)):
+
+    def require_text(path: str, expected: str, label: str) -> None:
+        try:
+            with open(path) as f:
+                observed = f.read()
+        except OSError as exc:
+            raise RuntimeError(
+                f"resume idempotency check cannot read {label}: {path}"
+            ) from exc
+        if observed != expected:
+            raise RuntimeError(
+                f"resume idempotency check failed for {call_dir}: saved "
+                f"{label} does not match the current call. Pipeline state "
+                "has drifted; start a new run instead."
+            )
+
+    require_text(prompt_path, prompt, "prompt.txt")
+    system_path = os.path.join(call_dir, "system.txt")
+    if system is None:
+        if os.path.exists(system_path):
+            raise RuntimeError(
+                f"resume idempotency check failed for {call_dir}: the cached "
+                "call has a system prompt but the current call does not"
+            )
+    else:
+        require_text(system_path, system, "system.txt")
+    schema_path = os.path.join(call_dir, "schema.json")
+    if schema is None:
+        if os.path.exists(schema_path):
+            raise RuntimeError(
+                f"resume idempotency check failed for {call_dir}: the cached "
+                "call has a schema but the current call does not"
+            )
+    else:
+        try:
+            with open(schema_path) as f:
+                cached_schema = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"resume idempotency check cannot read schema.json: {schema_path}"
+            ) from exc
+        if cached_schema != schema:
+            raise RuntimeError(
+                f"resume idempotency check failed for {call_dir}: saved "
+                "schema.json does not match the current schema"
+            )
+
+    if not os.path.exists(meta_path):
         return None
     try:
         with open(meta_path) as f:
             meta = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    if meta.get("failed"):
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"cached call metadata is unreadable: {meta_path}") from exc
+
+    response_path = os.path.join(call_dir, "response.txt")
+    if meta.get("failed") or not os.path.exists(response_path):
         return None
     rc = meta.get("returncode")
     if rc not in (0, None):
         return None
-    # Idempotency check: saved prompt must match what we'd send now.
-    if os.path.exists(prompt_path):
-        try:
-            with open(prompt_path) as f:
-                cached_prompt = f.read()
-        except OSError:
-            return None
-        if cached_prompt != prompt:
-            raise RuntimeError(
-                f"resume idempotency check failed for {call_dir}: "
-                f"saved prompt.txt ({len(cached_prompt)} chars) does "
-                f"not match the current prompt ({len(prompt)} chars). "
-                f"Pipeline state has drifted from the original run. "
-                f"Either delete {call_dir} to force a fresh LLM call, "
-                f"or revert the change that caused the drift."
-            )
     # Read response
     try:
         with open(response_path) as f:
             response_text = f.read()
     except OSError:
         return None
-    if schema:
+    if schema is not None:
         try:
             response = json.loads(response_text)
         except json.JSONDecodeError:
@@ -357,9 +389,78 @@ def _try_resume_from_cache(
     else:
         response = response_text
     session_id = meta.get("session_id")
+    if meta.get("backend") == "theoria_agent" and session_id:
+        messages_path = os.path.join(call_dir, "messages.json")
+        try:
+            with open(messages_path) as f:
+                messages = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "cannot restore provider-neutral session because its full "
+                f"transcript is missing or unreadable: {messages_path}"
+            ) from exc
+        agent_loop.restore_session(session_id, messages)
     cache_meta = dict(meta)
     cache_meta["resumed_from_cache"] = True
     return response, session_id, cache_meta
+
+
+def _call_invocation_dirs(base_call_dir: str) -> list[str]:
+    """Return existing immutable execution attempts for one logical call."""
+    if not os.path.isdir(base_call_dir):
+        return []
+    directories = []
+    if any(
+        os.path.isfile(os.path.join(base_call_dir, name))
+        for name in os.listdir(base_call_dir)
+    ):
+        directories.append(base_call_dir)
+    retries = sorted(
+        os.path.join(base_call_dir, name)
+        for name in os.listdir(base_call_dir)
+        if re.fullmatch(r"retry_\d{3}", name)
+        and os.path.isdir(os.path.join(base_call_dir, name))
+    )
+    return directories + retries
+
+
+def _prior_invocation_summaries(invocation_dirs: list[str]) -> list[dict]:
+    summaries = []
+    for path in invocation_dirs:
+        try:
+            with open(os.path.join(path, "meta.json")) as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            summaries.append({
+                "artifact_dir": path,
+                "failed": True,
+                "error_type": "IncompleteInvocation",
+            })
+            continue
+        summaries.append({
+            "artifact_dir": path,
+            "started_at": meta.get("started_at"),
+            "ended_at": meta.get("ended_at"),
+            "duration_ms": meta.get("duration_ms"),
+            "failed": bool(meta.get("failed")),
+            "error_type": meta.get("error_type"),
+            "returncode": meta.get("returncode"),
+            "input_tokens": meta.get("input_tokens"),
+            "output_tokens": meta.get("output_tokens"),
+        })
+    return summaries
+
+
+def _invocation_audit_fields(
+    prior_invocations: list[dict], *, current_failed: bool,
+) -> dict:
+    prior_failed = sum(bool(item.get("failed")) for item in prior_invocations)
+    return {
+        "invocation_count": len(prior_invocations) + 1,
+        "failed_invocations": prior_failed + int(current_failed),
+        "resume_retry_count": len(prior_invocations),
+        "prior_invocations": prior_invocations,
+    }
 
 
 # ── Artifact helpers ────────────────────────────────────────────
@@ -434,7 +535,7 @@ def _extract_codex_metadata(events: list) -> dict:
     """
     input_tokens = 0
     output_tokens = 0
-    cached_input_tokens = 0
+    cache_read_input_tokens = 0
     usage_reported = False
     for event in events:
         if event.get("type") != "turn.completed":
@@ -443,12 +544,16 @@ def _extract_codex_metadata(events: list) -> dict:
         usage_reported = usage_reported or bool(usage)
         input_tokens += usage.get("input_tokens", 0) or 0
         output_tokens += usage.get("output_tokens", 0) or 0
-        cached_input_tokens += usage.get("cached_input_tokens", 0) or 0
+        cache_read_input_tokens += (
+            usage.get("cache_read_input_tokens", 0)
+            or usage.get("cached_input_tokens", 0)
+            or 0
+        )
     return {
         "usage_reported": usage_reported,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "cached_input_tokens": cached_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
         "total_cost_usd": None,  # codex doesn't expose cost
     }
 
@@ -756,19 +861,29 @@ async def _run_claude_streaming(proc, schema, *, last_event_ref=None):
         )
 
     if result_event is None:
-        raise RuntimeError("claude stream ended without result event")
+        stderr = await proc.stderr.read()
+        raise ProviderProcessError(
+            "claude stream ended without result event",
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     metadata = _extract_claude_metadata(result_event)
     metadata["tool_calls"] = _extract_claude_tool_calls(events)
     if schema:
         if "structured_output" not in result_event:
-            raise RuntimeError(
+            stderr = await proc.stderr.read()
+            raise ProviderProcessError(
                 "claude returned a result event without 'structured_output'. "
                 f"is_error={result_event.get('is_error')!r} "
                 f"subtype={result_event.get('subtype')!r} "
                 f"stop_reason={result_event.get('stop_reason')!r} "
                 f"result={(result_event.get('result') or '')[:500]!r} "
-                f"keys={list(result_event.keys())}"
+                f"keys={list(result_event.keys())}",
+                raw_stdout=raw_stdout,
+                raw_stderr=stderr,
+                events=events,
             )
         return _sanitize_llm_output(result_event["structured_output"]), session_id, metadata, events, raw_stdout
     return _sanitize_llm_output(result_event.get("result", "")), session_id, metadata, events, raw_stdout
@@ -994,12 +1109,29 @@ async def _run_codex_streaming(proc, schema, *, last_event_ref=None):
         )
 
     if last_message_text is None:
-        raise RuntimeError("codex stream ended without agent message")
+        stderr = await proc.stderr.read()
+        raise ProviderProcessError(
+            "codex stream ended without agent message",
+            raw_stdout=raw_stdout,
+            raw_stderr=stderr,
+            events=events,
+        )
 
     metadata = _extract_codex_metadata(events)
     metadata["tool_calls"] = _extract_codex_tool_calls(events)
     if schema:
-        return _sanitize_llm_output(json.loads(last_message_text)), session_id, metadata, events, raw_stdout
+        try:
+            structured = json.loads(last_message_text)
+        except json.JSONDecodeError as exc:
+            stderr = await proc.stderr.read()
+            raise ProviderProcessError(
+                "codex returned non-JSON when schema was requested: "
+                f"{last_message_text[:500]!r}",
+                raw_stdout=raw_stdout,
+                raw_stderr=stderr,
+                events=events,
+            ) from exc
+        return _sanitize_llm_output(structured), session_id, metadata, events, raw_stdout
     return _sanitize_llm_output(last_message_text), session_id, metadata, events, raw_stdout
 
 
@@ -1120,11 +1252,12 @@ async def llm(
     # ── Set up the per-call artifact directory ───────────────────
     base_artifact_dir = artifact_dir.get()
     call_dir: str | None = None
+    base_call_dir: str | None = None
+    prior_invocations: list[dict] = []
     if base_artifact_dir is not None and call_index is not None:
-        call_dir = os.path.join(
+        base_call_dir = os.path.join(
             base_artifact_dir, f"call_{call_index:03d}_{role}",
         )
-        os.makedirs(call_dir, exist_ok=True)
 
     # ── Resume from cache (idempotent) ───────────────────────────
     # If we're resuming a prior run, this call_dir may already contain
@@ -1132,10 +1265,17 @@ async def llm(
     # but only after verifying the saved prompt matches what we'd send
     # now. Mismatch raises (state drift) rather than silently using a
     # stale cached response.
-    if call_dir is not None:
-        cached = _try_resume_from_cache(call_dir, prompt, system, schema)
-        if cached is not None:
-            response, session_id, cache_meta = cached
+    if base_call_dir is not None:
+        invocation_dirs = _call_invocation_dirs(base_call_dir)
+        cached_result = None
+        for invocation_dir in invocation_dirs:
+            candidate = _try_resume_from_cache(
+                invocation_dir, prompt, system, schema,
+            )
+            if candidate is not None:
+                cached_result = candidate
+        if cached_result is not None:
+            response, session_id, cache_meta = cached_result
             print(
                 f"[resume] cache hit on call_{call_index:03d}_{role}",
                 file=sys.stderr,
@@ -1143,6 +1283,15 @@ async def llm(
             if log is not None and call_index is not None:
                 log[call_index] = cache_meta
             return response, session_id
+        prior_invocations = _prior_invocation_summaries(invocation_dirs)
+        if invocation_dirs:
+            call_dir = os.path.join(
+                base_call_dir, f"retry_{len(invocation_dirs):03d}",
+            )
+            os.makedirs(call_dir, exist_ok=False)
+        else:
+            call_dir = base_call_dir
+            os.makedirs(call_dir, exist_ok=True)
 
     # ── Docker sandbox wiring ────────────────────────────────────
     # When the harness has started a per-problem container and set the
@@ -1652,7 +1801,7 @@ async def llm(
                 "started_at": call_started_at,
                 "ended_at": _utc_now_iso(),
                 "duration_ms": duration_ms,
-                "retry_count": retry_count,
+                "retry_count": retry_count + len(prior_invocations),
                 "attempts": attempt_records,
                 "all_tool_calls": all_tool_calls,
                 "session_id": session_id,
@@ -1676,6 +1825,9 @@ async def llm(
                 "prompt": _truncate(prompt, 8000),
                 "system": _truncate(system or "", 8000),
                 "response": _truncate(response_text, 8000),
+                **_invocation_audit_fields(
+                    prior_invocations, current_failed=False,
+                ),
                 **artifact_paths,
                 **provider_meta,
             }
@@ -1747,7 +1899,7 @@ async def llm(
             "started_at": call_started_at,
             "ended_at": _utc_now_iso(),
             "duration_ms": duration_ms,
-            "retry_count": retry_count,
+            "retry_count": retry_count + len(prior_invocations),
             "attempts": attempt_records,
             "all_tool_calls": [
                 tool_call
@@ -1774,6 +1926,9 @@ async def llm(
             "error_type": type(e).__name__,
             "error": str(e),
             "failed": True,
+            **_invocation_audit_fields(
+                prior_invocations, current_failed=True,
+            ),
             **provider_meta,
         }
         failure_meta["failed"] = True

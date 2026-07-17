@@ -250,6 +250,18 @@ def _grade_call_metrics(calls: list[dict], duration_ms: int) -> dict:
         "num_calls": len(calls),
         "successful_calls": len(calls) - failed,
         "failed_calls": failed,
+        "total_call_invocations": sum(
+            int(call.get("invocation_count", 1) or 1) for call in calls
+        ),
+        "failed_call_invocations": sum(
+            int(call.get(
+                "failed_invocations", int(bool(call.get("failed"))),
+            ) or 0)
+            for call in calls
+        ),
+        "resume_retry_count": sum(
+            int(call.get("resume_retry_count", 0) or 0) for call in calls
+        ),
         "total_retries": sum(
             int(call.get("retry_count", 0) or 0) for call in calls
         ),
@@ -271,6 +283,78 @@ def _grade_call_metrics(calls: list[dict], duration_ms: int) -> dict:
     }
 
 
+def _read_stable_snapshot(path: Path) -> tuple[bytes, str]:
+    """Read one immutable view of a file and return (bytes, sha256)."""
+    with path.open("rb") as f:
+        before = os.fstat(f.fileno())
+        data = f.read()
+        after = os.fstat(f.fileno())
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after or len(data) != after.st_size:
+        raise RuntimeError(f"source changed while it was being read: {path}")
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _resolve_source_run_meta(source_path: Path, source_sha256: str) -> tuple[
+    Path | None, bytes | None, str | None
+]:
+    """Find and verify metadata belonging to the supplied run, if present."""
+    meta_path = source_path.parent / "artifacts" / source_path.stem / "meta.json"
+    if not meta_path.exists():
+        return None, None, None
+    meta_bytes, meta_sha256 = _read_stable_snapshot(meta_path)
+    try:
+        source_meta = json.loads(meta_bytes)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"source run metadata is invalid JSON: {meta_path}") from exc
+    if source_meta.get("run_id") != source_path.stem:
+        raise RuntimeError(
+            "source metadata run_id does not match the supplied run: "
+            f"{source_meta.get('run_id')!r} != {source_path.stem!r}"
+        )
+    recorded_save_path = source_meta.get("save_path")
+    recorded_cwd = source_meta.get("cwd")
+    if recorded_save_path and recorded_cwd:
+        recorded = Path(recorded_save_path)
+        if not recorded.is_absolute():
+            recorded = Path(recorded_cwd) / recorded
+        if recorded.resolve() != source_path:
+            raise RuntimeError(
+                "source metadata points to a different run file: "
+                f"{recorded.resolve()} != {source_path}"
+            )
+    if source_meta.get("status") not in {"completed", "completed_with_errors"}:
+        raise RuntimeError(
+            "refusing to grade a source run that is not complete: "
+            f"status={source_meta.get('status')!r}"
+        )
+    manifest = harness.verify_artifact_manifest(str(meta_path.parent))
+    matching_entries = [
+        entry for entry in manifest["entries"]
+        if entry.get("external")
+        and Path(entry["path"]).resolve() == source_path
+    ]
+    if len(matching_entries) != 1:
+        raise RuntimeError(
+            "source run manifest does not contain exactly one entry for "
+            f"{source_path}"
+        )
+    if matching_entries[0].get("sha256") != source_sha256:
+        raise RuntimeError(
+            "source run bytes do not match the sealed run manifest: "
+            f"{source_path}"
+        )
+    return meta_path, meta_bytes, meta_sha256
+
+
+def _problem_artifact_name(index: int, problem_id: object) -> str:
+    text = str(problem_id)
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "problem"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"problem_{index:04d}_{slug[:48]}_{digest}"
+
+
 async def grade_run(
     run_file: str,
     config_paths: list[str] | None = None,
@@ -278,12 +362,20 @@ async def grade_run(
     *,
     watch: bool = True,
 ) -> dict:
-    """Grade every problem in a run JSON. Writes a grades JSON and returns a
-    summary dict. Defaults the output to runs/grades/<run-stem>.json."""
-    with open(run_file) as f:
-        results = json.load(f)
+    """Grade a stable snapshot of every problem in a completed run."""
+    source_path = Path(run_file).expanduser().resolve(strict=True)
+    source_bytes, source_run_hash = _read_stable_snapshot(source_path)
+    try:
+        results = json.loads(source_bytes)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"source run is invalid JSON: {source_path}") from exc
     if isinstance(results, dict):
         results = [results]
+    if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
+        raise RuntimeError("source run must contain one result object or a list of objects")
+    source_meta_path, source_meta_bytes, source_meta_sha256 = (
+        _resolve_source_run_meta(source_path, source_run_hash)
+    )
 
     resolved_config_paths = list(config_paths or [DEFAULT_GRADER_CONFIG])
     config = load_config(resolved_config_paths)
@@ -294,27 +386,38 @@ async def grade_run(
         )
     prompt_text, prompt_sha = load_prompt()
     settings = effective_settings(
-        config["audit_grader"],
-        web_search_config=config.get("_web_search"),
+        config["audit_grader"], web_search_config=config.get("_web_search"),
     )
     grader_model = (
         f"{settings.get('backend', 'claude')}:"
         f"{settings.get('model')}:{settings.get('effort')}"
     )
 
-    if out_path is None:
-        Path("runs/grades").mkdir(parents=True, exist_ok=True)
-        out_path = f"runs/grades/{Path(run_file).stem}.json"
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
     started_at = datetime.now(timezone.utc).isoformat()
     started_perf = time.perf_counter()
     grade_run_id = (
-        f"grade_{Path(run_file).stem}_"
+        f"grade_{source_path.stem}_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     )
+    if out_path is None:
+        out_path = str(Path("runs/grades") / f"{grade_run_id}.json")
+    output_path = Path(out_path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() or Path(str(output_path) + ".tmp").exists():
+        raise FileExistsError(
+            f"grading output already exists; choose a new --out path: {output_path}"
+        )
+
     grade_artifact_root = Path("runs/artifacts") / grade_run_id
     grade_artifact_root.mkdir(parents=True, exist_ok=False)
+    (grade_artifact_root / "source_run.json").write_bytes(source_bytes)
+    if source_meta_bytes is not None:
+        (grade_artifact_root / "source_run_meta.json").write_bytes(source_meta_bytes)
+    (grade_artifact_root / "grader_prompt.txt").write_text(prompt_text)
+    (grade_artifact_root / "grader_schema.json").write_text(
+        json.dumps(GRADE_SCHEMA, indent=2)
+    )
+
     audit = harness._research_audit_metadata(config, {
         "config_paths": resolved_config_paths,
         "backend": settings.get("backend"),
@@ -322,224 +425,220 @@ async def grade_run(
         "docker": False,
         "image": None,
     })
-    source_run_hash = harness._file_sha256(run_file)
-    source_meta_path = (
-        Path("runs/artifacts") / Path(run_file).stem / "meta.json"
-    )
+    evaluation_policy = {
+        "automatic_grader": True,
+        "manual_adjudication_included": False,
+        "automatic_grade_is_authoritative": False,
+    }
     meta = {
         "audit_schema_version": harness.AUDIT_SCHEMA_VERSION,
         "run_id": grade_run_id,
         "kind": "audit_grading",
         "status": "running",
         "started_at": started_at,
-        "source_run_file": run_file,
+        "source_run_file": str(source_path),
+        "source_run_snapshot_path": "source_run.json",
         "source_run_sha256": source_run_hash,
-        "source_run_meta_path": (
-            str(source_meta_path) if source_meta_path.exists() else None
+        "source_run_meta_path": str(source_meta_path) if source_meta_path else None,
+        "source_run_meta_snapshot_path": (
+            "source_run_meta.json" if source_meta_bytes is not None else None
         ),
-        "source_run_meta_sha256": (
-            harness._file_sha256(str(source_meta_path))
-            if source_meta_path.exists() else None
-        ),
-        "output_path": out_path,
+        "source_run_meta_sha256": source_meta_sha256,
+        "output_path": str(output_path),
         "grader_model": grader_model,
         "grader_prompt_sha256": prompt_sha,
         "grader_schema_sha256": harness._sha256_json(GRADE_SCHEMA),
-        "evaluation_policy": {
-            "automatic_grader": True,
-            "manual_adjudication_included": False,
-            "automatic_grade_is_authoritative": False,
-        },
+        "evaluation_policy": evaluation_policy,
         "config": harness._redact_config(config),
         "config_sha256": audit["config_sha256"],
         "research_audit": audit,
-        "git": harness._safe_git_state(
-            str(grade_artifact_root), "grading",
-        ),
+        "git": harness._safe_git_state(str(grade_artifact_root), "grading"),
         "host_runtime": harness._host_runtime_metadata(),
         "host_environment": harness._capture_host_environment(
             str(grade_artifact_root), "grading",
         ),
     }
     harness._write_meta(str(grade_artifact_root), meta)
-    (grade_artifact_root / "grader_prompt.txt").write_text(prompt_text)
-    (grade_artifact_root / "grader_schema.json").write_text(
-        json.dumps(GRADE_SCHEMA, indent=2)
-    )
 
-    # Fetch canonical HLE rationales for any benchmark problems in this run
-    # (no-op for custom questions, which aren't in the dataset).
-    dataset_revisions = {
-        result.get("dataset_revision") for result in results
-        if result.get("dataset_revision")
-    }
-    if len(dataset_revisions) > 1:
-        error = RuntimeError(
-            "source run mixes HLE dataset revisions; grade each revision "
-            "separately so rationale provenance remains unambiguous"
-        )
-        meta.update({
-            "status": "failed",
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "run_error": {"type": type(error).__name__, "message": str(error)},
-        })
-        harness._write_meta(str(grade_artifact_root), meta)
-        harness.write_artifact_manifest(
-            str(grade_artifact_root), external_paths=[run_file],
-        )
-        raise error
-    rationale_revision = (
-        next(iter(dataset_revisions))
-        if dataset_revisions else HLE_DATASET_REVISION
-    )
-    fetched = fetch_rationales(
-        {r.get("id") for r in results if r.get("id")},
-        revision=rationale_revision,
-        include_provenance=True,
-    )
-    if isinstance(fetched, tuple):
-        rationales, rationale_provenance = fetched
-    else:
-        rationales, rationale_provenance = fetched, {}
-    rationale_path = grade_artifact_root / "rationales.json"
-    rationale_path.write_text(json.dumps(rationales, indent=2, default=str))
-    rationale_provenance["records_sha256"] = harness._sha256_json(rationales)
-    harness.update_artifact_root_meta(
-        str(grade_artifact_root),
-        {"rationale_dataset": rationale_provenance},
-        strict=True,
-    )
-    if rationales:
-        print(f"Loaded {len(rationales)} HLE rationale(s) for grader context.")
-
-    graded = []
+    graded: list[dict] = []
     all_calls: list[dict] = []
     n_match = 0
-    run_error: BaseException | None = None
     completed = 0
+    rationale_provenance: dict = {}
+    run_metrics: dict = {}
+    summary: dict | None = None
     try:
-      for i, result in enumerate(results, start=1):
-        pid = result.get("id", f"#{i}")
-        print(f"[{i}/{len(results)}] grading {pid}...", flush=True)
-        safe_pid = re.sub(r"[^\w.-]", "_", str(pid))
-        problem_artifact_dir = grade_artifact_root / safe_pid
-        problem_artifact_dir.mkdir(parents=True, exist_ok=True)
-        calls: list[dict] = []
-        call_token = call_log.set(calls)
-        artifact_token = artifact_dir.set(str(problem_artifact_dir))
-        problem_started = time.perf_counter()
-        verdict = None
-        error = None
-        try:
-            verdict = await grade_one(
-                result, config, prompt_text, rationales.get(pid),
-                watch=watch,
+        dataset_revisions = {
+            result.get("dataset_revision") for result in results
+            if result.get("dataset_revision")
+        }
+        if len(dataset_revisions) > 1:
+            raise RuntimeError(
+                "source run mixes HLE dataset revisions; grade each revision "
+                "separately so rationale provenance remains unambiguous"
             )
-        except Exception as e:
-            error = e
-            (problem_artifact_dir / "traceback.txt").write_text(
-                traceback.format_exc()
+        rationale_revision = (
+            next(iter(dataset_revisions))
+            if dataset_revisions else HLE_DATASET_REVISION
+        )
+        fetched = fetch_rationales(
+            {result.get("id") for result in results if result.get("id")},
+            revision=rationale_revision,
+            include_provenance=True,
+        )
+        if isinstance(fetched, tuple):
+            rationales, rationale_provenance = fetched
+        else:
+            rationales, rationale_provenance = fetched, {}
+        (grade_artifact_root / "rationales.json").write_text(
+            json.dumps(rationales, indent=2, default=str)
+        )
+        rationale_provenance["records_sha256"] = harness._sha256_json(rationales)
+        harness.update_artifact_root_meta(
+            str(grade_artifact_root),
+            {"rationale_dataset": rationale_provenance},
+            strict=True,
+        )
+        if rationales:
+            print(f"Loaded {len(rationales)} HLE rationale(s) for grader context.")
+
+        for i, result in enumerate(results, start=1):
+            pid = result.get("id", f"#{i}")
+            print(f"[{i}/{len(results)}] grading {pid}...", flush=True)
+            artifact_name = _problem_artifact_name(i, pid)
+            problem_artifact_dir = grade_artifact_root / artifact_name
+            problem_artifact_dir.mkdir(parents=True, exist_ok=False)
+            calls: list[dict] = []
+            call_token = call_log.set(calls)
+            artifact_token = artifact_dir.set(str(problem_artifact_dir))
+            problem_started = time.perf_counter()
+            verdict = None
+            problem_error: Exception | None = None
+            try:
+                verdict = await grade_one(
+                    result, config, prompt_text, rationales.get(pid), watch=watch,
+                )
+                final = verdict.get("final")
+                if not isinstance(final, dict) or not isinstance(
+                    final.get("key_match"), bool
+                ):
+                    raise RuntimeError("grader verdict is missing a valid final grade")
+            except Exception as exc:
+                problem_error = exc
+                (problem_artifact_dir / "traceback.txt").write_text(
+                    traceback.format_exc()
+                )
+            finally:
+                call_log.reset(call_token)
+                artifact_dir.reset(artifact_token)
+
+            calls = [call for call in calls if call is not None]
+            duration_ms = int(round(
+                (time.perf_counter() - problem_started) * 1000
+            ))
+            metrics = _grade_call_metrics(calls, duration_ms)
+            all_calls.extend(calls)
+            completed += 1
+            if problem_error is not None:
+                print(f"  ! failed: {problem_error}")
+                graded.append({
+                    "id": pid,
+                    "artifact_subdir": artifact_name,
+                    "error_type": type(problem_error).__name__,
+                    "error": str(problem_error),
+                    "calls": calls,
+                    "metrics": metrics,
+                })
+                continue
+            assert verdict is not None
+            final = verdict["final"]
+            n_match += int(final["key_match"])
+            print(
+                f"  key_match={final['key_match']} "
+                f"dispute={final.get('dispute_category')!r}"
             )
-        finally:
-            call_log.reset(call_token)
-            artifact_dir.reset(artifact_token)
-        calls = [call for call in calls if call is not None]
-        duration_ms = int(round(
-            (time.perf_counter() - problem_started) * 1000
-        ))
-        metrics = _grade_call_metrics(calls, duration_ms)
-        all_calls.extend(calls)
-        completed += 1
-        if error is not None:
-            print(f"  ! failed: {error}")
             graded.append({
                 "id": pid,
-                "error_type": type(error).__name__,
-                "error": str(error),
+                "artifact_subdir": artifact_name,
+                "expected": result.get("expected"),
+                "answer": result.get("answer"),
+                "verified": result.get("verified"),
+                "grader_model": grader_model,
+                "grader_prompt_sha": prompt_sha,
                 "calls": calls,
                 "metrics": metrics,
+                **verdict,
             })
-            continue
-        assert verdict is not None
-        final = verdict["final"]
-        n_match += 1 if final["key_match"] else 0
-        print(
-            f"  key_match={final['key_match']} "
-            f"dispute={final.get('dispute_category')!r}"
-        )
-        graded.append({
-            "id": pid,
-            "expected": result.get("expected"),
-            "answer": result.get("answer"),
-            "verified": result.get("verified"),
-            "grader_model": grader_model,
-            "grader_prompt_sha": prompt_sha,
-            "calls": calls,
-            "metrics": metrics,
-            **verdict,
-        })
-    except BaseException as exc:
-        run_error = exc
-        raise
-    finally:
-        finished_at = datetime.now(timezone.utc).isoformat()
+
         run_metrics = _grade_call_metrics(
             all_calls,
             int(round((time.perf_counter() - started_perf) * 1000)),
         )
+        successful_grades = sum(1 for item in graded if "error" not in item)
         run_metrics.update({
             "requested_grades": len(results),
             "completed_grades": completed,
-            "successful_grades": sum(
-                1 for item in graded if "error" not in item
-            ),
+            "successful_grades": successful_grades,
         })
-        status = (
-            "completed" if run_error is None and completed == len(results)
-            else "interrupted" if isinstance(
-                run_error, (asyncio.CancelledError, KeyboardInterrupt)
-            )
-            else "failed"
-        )
+        summary = {
+            "run_file": str(source_path),
+            "run_file_sha256": source_run_hash,
+            "source_snapshot": str(grade_artifact_root / "source_run.json"),
+            "graded": len(results),
+            "key_match": n_match,
+            "grader_model": grader_model,
+            "grader_prompt_sha": prompt_sha,
+            "artifact_root": str(grade_artifact_root),
+            "rationale_dataset": rationale_provenance,
+            "evaluation_policy": evaluation_policy,
+            "metrics": run_metrics,
+            "results": graded,
+        }
+        tmp_out = Path(str(output_path) + ".tmp")
+        tmp_out.write_text(json.dumps(summary, indent=2))
+        os.replace(tmp_out, output_path)
+
+        status = "completed" if successful_grades == len(results) else "completed_with_errors"
         final_meta = harness._read_meta(str(grade_artifact_root))
         final_meta.update({
             "status": status,
-            "finished_at": finished_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
             "metrics": run_metrics,
             "completed_problem_ids": [str(item.get("id")) for item in graded],
+            "output_sha256": harness._file_sha256(str(output_path)),
         })
-        if run_error is not None:
-            final_meta["run_error"] = {
-                "type": type(run_error).__name__,
-                "message": str(run_error),
-            }
         harness._write_meta(str(grade_artifact_root), final_meta)
+        harness.write_artifact_manifest(
+            str(grade_artifact_root), external_paths=[str(output_path)],
+        )
+    except BaseException as exc:
+        status = (
+            "interrupted"
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt))
+            else "failed"
+        )
+        try:
+            failed_meta = harness._read_meta(str(grade_artifact_root))
+            failed_meta.update({
+                "status": status,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "metrics": run_metrics,
+                "completed_problem_ids": [str(item.get("id")) for item in graded],
+                "run_error": {"type": type(exc).__name__, "message": str(exc)},
+            })
+            harness._write_meta(str(grade_artifact_root), failed_meta)
+            harness.write_artifact_manifest(
+                str(grade_artifact_root),
+                external_paths=[str(output_path)] if output_path.exists() else [],
+            )
+        except BaseException:
+            pass
+        raise
 
-    summary = {
-        "run_file": run_file,
-        "run_file_sha256": source_run_hash,
-        "graded": len(results),
-        "key_match": n_match,
-        "grader_model": grader_model,
-        "grader_prompt_sha": prompt_sha,
-        "artifact_root": str(grade_artifact_root),
-        "rationale_dataset": rationale_provenance,
-        "evaluation_policy": meta["evaluation_policy"],
-        "metrics": run_metrics,
-        "results": graded,
-    }
-    tmp_out = out_path + ".tmp"
-    with open(tmp_out, "w") as f:
-        json.dump(summary, f, indent=2)
-    os.replace(tmp_out, out_path)
-    harness.write_artifact_manifest(
-        str(grade_artifact_root),
-        external_paths=[out_path, run_file],
-    )
-
+    assert summary is not None
     print(
         f"\nGraded {len(results)} problems: {n_match} matched the key. "
-        f"Wrote {out_path}"
+        f"Wrote {output_path}"
     )
     return summary
 

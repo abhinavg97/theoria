@@ -313,6 +313,7 @@ def test_rejected_resume_does_not_capture_new_environment(tmp_path, monkeypatch)
             "runs/resume-test.json", problem_manifest=first_manifest,
         )
         record_problem_set_manifest(root, first_manifest)
+        harness.write_artifact_manifest(root)
         assert captures == ["capture"]
 
         harness.CONFIG["solver"]["model"] = "changed"
@@ -414,6 +415,7 @@ def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
             "runs/resume-test.json", problem_manifest=manifest,
         )
         record_problem_set_manifest(root, manifest)
+        harness.write_artifact_manifest(root)
         assert captures == ["capture"]
 
         harness._args_ref["resume"] = "resume-test"
@@ -422,6 +424,12 @@ def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
         assert harness.make_artifact_root(
             "runs/resume-test.json", problem_manifest=manifest,
         ) == root
+        resumed_meta = harness._read_meta(root)
+        prior_manifest = resumed_meta["resumes"][-1]
+        assert prior_manifest["verified_prior_manifest_sha256"]
+        assert (tmp_path / "runs" / "artifacts" / "resume-test" /
+                prior_manifest["prior_manifest_archive"]).exists()
+        harness.write_artifact_manifest(root)
         assert captures == ["capture", "capture"]
 
         harness._args_ref["experiment_id"] = "different-experiment"
@@ -467,6 +475,25 @@ def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
         harness._args_ref.update(original_args)
 
 
+def test_resume_identity_binds_python_dependencies_and_cli_versions():
+    base = {
+        "audit_schema_version": harness.AUDIT_SCHEMA_VERSION,
+        "python_version": "3.12.1",
+        "python_executable": "/venv/bin/python",
+        "host_runtime": {"installed_packages_sha256": "packages-a"},
+        "cli_versions": {"docker": "Docker 1"},
+        "research_audit": {},
+        "git": {},
+    }
+    changed_packages = copy.deepcopy(base)
+    changed_packages["host_runtime"]["installed_packages_sha256"] = "packages-b"
+    changed_cli = copy.deepcopy(base)
+    changed_cli["cli_versions"]["docker"] = "Docker 2"
+
+    assert harness._resume_identity(base) != harness._resume_identity(changed_packages)
+    assert harness._resume_identity(base) != harness._resume_identity(changed_cli)
+
+
 def test_resume_rejects_incomplete_local_model_identity(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [{
@@ -509,6 +536,7 @@ def test_resume_rejects_incomplete_local_model_identity(tmp_path, monkeypatch):
             "runs/unresolved.json", problem_manifest=manifest,
         )
         record_problem_set_manifest(root, manifest)
+        harness.write_artifact_manifest(root)
         harness._args_ref["resume"] = "unresolved"
         harness._args_ref["cli_args"]["resume"] = "unresolved"
 
@@ -528,6 +556,7 @@ def test_resume_rejects_unreadable_metadata(tmp_path, monkeypatch):
     meta_path = tmp_path / "runs" / "artifacts" / "broken" / "meta.json"
     meta_path.parent.mkdir(parents=True)
     meta_path.write_text("{not-json")
+    harness.write_artifact_manifest(str(meta_path.parent))
     monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [])
     monkeypatch.setattr(
         harness, "_probe_openai_compatible_models", lambda _config: [],
@@ -550,7 +579,8 @@ def test_resume_rejects_missing_original_problem_manifest(
     monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
         "sha": "same", "diff_sha256": None, "untracked_sha256": None,
     })
-    harness.make_artifact_root("runs/legacy.json")
+    root = harness.make_artifact_root("runs/legacy.json")
+    harness.write_artifact_manifest(root)
     manifest = _problem_set_manifest([{
         "id": "p1", "question": "Q1", "answer": "A1",
     }])
@@ -652,6 +682,64 @@ def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
     assert metrics["mechanistic_evidence_by_role"]["citation"][
         "failed_tool_calls"
     ] == 1
+
+
+def test_run_one_restores_docker_provider_and_workspace_state(tmp_path, monkeypatch):
+    artifact_root = tmp_path / "artifacts"
+    problem_root = artifact_root / "p1"
+    codex_state = problem_root / "provider_state" / "codex" / "sessions"
+    claude_state = problem_root / "provider_state" / "claude_projects"
+    workspace_state = problem_root / "workspace"
+    codex_state.mkdir(parents=True)
+    claude_state.mkdir(parents=True)
+    workspace_state.mkdir(parents=True)
+    (codex_state / "rollout.jsonl").write_text("session")
+    (claude_state / "conversation.jsonl").write_text("session")
+    (workspace_state / "calculation.py").write_text("print(4)")
+
+    prepared = []
+    restored = []
+    monkeypatch.setattr(
+        harness.sbx,
+        "prepare_codex_state_dir",
+        lambda resume=None: prepared.append(resume) or str(tmp_path / "codex-temp"),
+    )
+    monkeypatch.setattr(harness.sbx, "start_sandbox", lambda **_kwargs: "container123")
+    monkeypatch.setattr(
+        harness.sbx,
+        "copy_to_container",
+        lambda _container, src, dst: restored.append((src, dst)) or True,
+    )
+    monkeypatch.setattr(
+        harness.sbx, "snapshot_container_directory", lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(
+        harness.sbx, "snapshot_codex_resume_state", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(harness.sbx, "pip_freeze_in_container", lambda *_a: None)
+    monkeypatch.setattr(harness.sbx, "dpkg_list_in_container", lambda *_a: None)
+    monkeypatch.setattr(harness.sbx, "inspect_container", lambda *_a: None)
+    monkeypatch.setattr(harness.sbx, "stop_sandbox", lambda *_a: None)
+    monkeypatch.setattr(harness.sbx, "cleanup_codex_state_dir", lambda *_a: None)
+
+    async def fake_run(*_args, **_kwargs):
+        return {"answer": "A", "verified": True}
+
+    monkeypatch.setattr(harness, "run", fake_run)
+    result = asyncio.run(harness.run_one(
+        {"id": "p1", "question": "Q", "answer": "A"},
+        artifact_root=str(artifact_root),
+        run_id="run",
+        use_docker=True,
+        sandbox_image_digest="sha256:image",
+    ))
+
+    assert prepared == [str(problem_root / "provider_state" / "codex")]
+    assert (str(workspace_state), "/workspace") in restored
+    assert (
+        str(claude_state), "/home/node/.claude/projects",
+    ) in restored
+    assert result["verified"] is True
 
 
 def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
@@ -799,6 +887,64 @@ def test_run_problems_marks_setup_failure(tmp_path, monkeypatch):
     assert meta["status"] == "failed"
     assert meta["completed_problems"] == 0
     assert meta["run_error"]["message"] == "sandbox setup failed"
+
+
+def test_verify_artifact_manifest_rejects_tampering(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    retained = root / "evidence.txt"
+    retained.write_text("original")
+    harness.write_artifact_manifest(str(root))
+
+    retained.write_text("modified")
+
+    with pytest.raises(RuntimeError, match="hash mismatch|size mismatch"):
+        harness.verify_artifact_manifest(str(root))
+
+    retained.write_text("original")
+    harness.write_artifact_manifest(str(root))
+    (root / "unsealed.txt").write_text("unexpected")
+    with pytest.raises(RuntimeError, match="file set mismatch"):
+        harness.verify_artifact_manifest(str(root))
+
+
+def test_run_problems_marks_manifest_failure_as_failed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        harness,
+        "_prepare_sandbox_run",
+        lambda *_args, **_kwargs: (None, None, None),
+    )
+
+    async def fake_run_one(problem, **_kwargs):
+        return {
+            "id": problem["id"],
+            "answer": "A",
+            "verified": True,
+            "correct": True,
+            "calls": [],
+            "metrics": {"num_calls": 0},
+        }
+
+    monkeypatch.setattr(harness, "run_one", fake_run_one)
+    monkeypatch.setattr(
+        harness,
+        "write_artifact_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("seal failed")),
+    )
+
+    with pytest.raises(OSError, match="seal failed"):
+        asyncio.run(harness.run_problems(
+            [{"id": "p1", "question": "Q", "answer": "A"}],
+            parallel=1,
+            save_path="runs/seal-failed.json",
+        ))
+
+    meta = json.loads(
+        (tmp_path / "runs" / "artifacts" / "seal-failed" / "meta.json").read_text()
+    )
+    assert meta["status"] == "failed"
+    assert meta["finalization_error"]["message"] == "seal failed"
 
 
 def test_run_problems_rejects_duplicate_ids_before_setup(tmp_path, monkeypatch):

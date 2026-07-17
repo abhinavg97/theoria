@@ -82,6 +82,41 @@ def test_chat_completion_retains_http_attempt_for_malformed_response(
     assert captured.value.attempts[0]["duration_ms"] >= 0
 
 
+def test_chat_completion_retries_read_timeout(monkeypatch):
+    calls = 0
+
+    class TimeoutResponse(_FakeHTTPResponse):
+        def read(self):
+            raise TimeoutError("read timed out")
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TimeoutResponse({})
+        return _FakeHTTPResponse({
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    monkeypatch.setattr(agent_loop.urllib.request, "urlopen", fake_urlopen)
+    content, _usage, metadata = agent_loop._chat_completion({
+        "model": "deployment",
+        "max_retries": 1,
+        "max_retry_sleep": 0,
+    }, [])
+
+    assert content == "ok"
+    assert calls == 2
+    assert [attempt["status"] for attempt in metadata["http_attempts"]] == [
+        "timeout", "success",
+    ]
+    assert metadata["http_retry_count"] == 1
+
+
 def test_run_shell_uses_docker_exec_without_login_shell(monkeypatch):
     captured = []
 
@@ -394,6 +429,30 @@ def test_run_agent_records_provider_response_identity(monkeypatch):
     assert result.metadata["usage_complete"] is True
     assert any(event["type"] == "model.response" for event in result.events)
     assert result.messages[0]["role"] == "system"
+
+
+def test_run_agent_normalizes_provider_cached_token_usage(monkeypatch):
+    def fake_chat(settings, messages):
+        return json.dumps({"action": "final", "response": "ok"}), {
+            "prompt_tokens": 12,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 7},
+        }, {"usage_reported": True}
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+    result = asyncio.run(agent_loop.run_agent(
+        "solve",
+        settings={"model": "fake"},
+        schema=None,
+        system=None,
+        resume=None,
+        role="solver",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.metadata["cache_read_input_tokens"] == 7
+    assert result.events[1]["usage"]["cache_read_input_tokens"] == 7
 
 
 def test_run_agent_failure_keeps_partial_transcript(monkeypatch):

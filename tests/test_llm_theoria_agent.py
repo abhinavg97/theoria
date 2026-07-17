@@ -44,7 +44,7 @@ def test_llm_theoria_agent_writes_standard_artifacts(tmp_path, monkeypatch):
             metadata={
                 "input_tokens": 1,
                 "output_tokens": 1,
-                "cached_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "total_cost_usd": None,
                 "usage_observed": True,
                 "usage_complete": True,
@@ -172,3 +172,237 @@ def test_llm_theoria_agent_records_failed_call_and_partial_artifacts(
     assert (call_dir / "messages.json").exists()
     assert (call_dir / "effective_system.txt").read_text() == "effective system"
     assert (call_dir / "attempt_001_stdout.jsonl.gz").exists()
+
+
+def test_failed_call_retry_preserves_original_evidence(tmp_path, monkeypatch):
+    async def failed_agent(*_args, **_kwargs):
+        raise agent_loop.AgentRunError(
+            "first failure",
+            metadata={
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "tool_calls": [],
+                "usage_observed": True,
+                "usage_complete": False,
+                "failed": True,
+            },
+            events=[{"type": "model.response", "content": "bad"}],
+            raw_stdout=b"bad\n",
+            raw_stderr=b"first failure\n",
+            pseudo_cmd=["theoria-agent", "--model", "fake"],
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "question"},
+            ],
+        )
+
+    monkeypatch.setattr(agent_loop, "run_agent", failed_agent)
+    first_log = []
+    log_token = llm_module.call_log.set(first_log)
+    artifact_token = llm_module.artifact_dir.set(str(tmp_path))
+    try:
+        with pytest.raises(agent_loop.AgentRunError):
+            asyncio.run(llm_module.llm(
+                "question",
+                role="solver",
+                config={"solver": {
+                    "backend": "theoria_agent",
+                    "model": "fake",
+                    "endpoint": "http://endpoint/v1",
+                }},
+            ))
+    finally:
+        llm_module.call_log.reset(log_token)
+        llm_module.artifact_dir.reset(artifact_token)
+
+    base = tmp_path / "call_000_solver"
+    original_meta = (base / "meta.json").read_bytes()
+    original_stdout = (base / "attempt_001_stdout.jsonl.gz").read_bytes()
+
+    async def successful_agent(*_args, **_kwargs):
+        return agent_loop.AgentRunResult(
+            response="ok",
+            session_id="session-2",
+            metadata={
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 0,
+                "tool_calls": [],
+                "usage_observed": True,
+                "usage_complete": True,
+            },
+            events=[{"type": "thread.started", "thread_id": "session-2"}],
+            raw_stdout=b'{"type":"thread.started"}\n',
+            raw_stderr=b"",
+            pseudo_cmd=["theoria-agent", "--model", "fake"],
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "ok"},
+            ],
+        )
+
+    monkeypatch.setattr(agent_loop, "run_agent", successful_agent)
+    second_log = []
+    log_token = llm_module.call_log.set(second_log)
+    artifact_token = llm_module.artifact_dir.set(str(tmp_path))
+    try:
+        response, _ = asyncio.run(llm_module.llm(
+            "question",
+            role="solver",
+            config={"solver": {
+                "backend": "theoria_agent",
+                "model": "fake",
+                "endpoint": "http://endpoint/v1",
+            }},
+        ))
+    finally:
+        llm_module.call_log.reset(log_token)
+        llm_module.artifact_dir.reset(artifact_token)
+
+    assert response == "ok"
+    assert (base / "meta.json").read_bytes() == original_meta
+    assert (base / "attempt_001_stdout.jsonl.gz").read_bytes() == original_stdout
+    retry = base / "retry_001"
+    assert retry.is_dir()
+    retry_meta = json.loads((retry / "meta.json").read_text())
+    assert retry_meta["invocation_count"] == 2
+    assert retry_meta["failed_invocations"] == 1
+    assert retry_meta["resume_retry_count"] == 1
+    assert second_log[0]["retry_count"] == 1
+
+
+def test_cached_theoria_agent_call_restores_transcript(tmp_path, monkeypatch):
+    call_dir = tmp_path / "call_000_solver"
+    call_dir.mkdir()
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    (call_dir / "prompt.txt").write_text("question")
+    (call_dir / "response.txt").write_text("answer")
+    (call_dir / "messages.json").write_text(json.dumps(messages))
+    (call_dir / "meta.json").write_text(json.dumps({
+        "backend": "theoria_agent",
+        "returncode": 0,
+        "failed": False,
+        "session_id": "persisted-session",
+    }))
+    agent_loop._SESSIONS.clear()
+
+    async def should_not_run(*_args, **_kwargs):
+        raise AssertionError("cache miss")
+
+    monkeypatch.setattr(agent_loop, "run_agent", should_not_run)
+    log = []
+    log_token = llm_module.call_log.set(log)
+    artifact_token = llm_module.artifact_dir.set(str(tmp_path))
+    try:
+        response, session_id = asyncio.run(llm_module.llm(
+            "question",
+            role="solver",
+            config={"solver": {
+                "backend": "theoria_agent",
+                "model": "fake",
+            }},
+        ))
+    finally:
+        llm_module.call_log.reset(log_token)
+        llm_module.artifact_dir.reset(artifact_token)
+
+    assert response == "answer"
+    assert session_id == "persisted-session"
+    assert agent_loop._SESSIONS[session_id] == messages
+    assert log[0]["resumed_from_cache"] is True
+
+
+def test_failed_cached_call_rejects_prompt_drift(tmp_path, monkeypatch):
+    call_dir = tmp_path / "call_000_solver"
+    call_dir.mkdir()
+    (call_dir / "prompt.txt").write_text("original")
+    (call_dir / "meta.json").write_text(json.dumps({
+        "backend": "theoria_agent", "failed": True,
+    }))
+
+    async def should_not_run(*_args, **_kwargs):
+        raise AssertionError("drifted call executed")
+
+    monkeypatch.setattr(agent_loop, "run_agent", should_not_run)
+    log_token = llm_module.call_log.set([])
+    artifact_token = llm_module.artifact_dir.set(str(tmp_path))
+    try:
+        with pytest.raises(RuntimeError, match="idempotency check failed"):
+            asyncio.run(llm_module.llm(
+                "changed",
+                role="solver",
+                config={"solver": {"backend": "theoria_agent", "model": "fake"}},
+            ))
+    finally:
+        llm_module.call_log.reset(log_token)
+        llm_module.artifact_dir.reset(artifact_token)
+
+
+class _AsyncByteLines:
+    def __init__(self, lines):
+        self._lines = iter(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._lines)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+class _AsyncBytesReader:
+    def __init__(self, value=b""):
+        self.value = value
+
+    async def read(self):
+        return self.value
+
+
+class _StreamingProcess:
+    def __init__(self, lines, stderr=b""):
+        self.stdout = _AsyncByteLines(lines)
+        self.stderr = _AsyncBytesReader(stderr)
+        self.returncode = 0
+
+    async def wait(self):
+        return self.returncode
+
+
+def test_claude_stream_parse_failure_retains_raw_trace():
+    event = {"type": "result", "session_id": "s", "result": "not structured"}
+    raw = (json.dumps(event) + "\n").encode()
+    process = _StreamingProcess([raw], stderr=b"provider diagnostic")
+
+    with pytest.raises(llm_module.ProviderProcessError) as captured:
+        asyncio.run(llm_module._run_claude_streaming(
+            process, {"type": "object"},
+        ))
+
+    assert captured.value.raw_stdout == raw
+    assert captured.value.raw_stderr == b"provider diagnostic"
+    assert captured.value.events == [event]
+
+
+def test_codex_stream_parse_failure_retains_raw_trace():
+    event = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "not-json"},
+    }
+    raw = (json.dumps(event) + "\n").encode()
+    process = _StreamingProcess([raw], stderr=b"provider diagnostic")
+
+    with pytest.raises(llm_module.ProviderProcessError) as captured:
+        asyncio.run(llm_module._run_codex_streaming(
+            process, {"type": "object"},
+        ))
+
+    assert captured.value.raw_stdout == raw
+    assert captured.value.raw_stderr == b"provider diagnostic"
+    assert captured.value.events == [event]

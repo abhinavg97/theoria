@@ -25,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pipeline
@@ -42,7 +43,7 @@ from pipeline import run, CONFIG, load_config
 # ── Run-level metadata capture ───────────────────────────────────
 
 _REDACTED = "<redacted>"
-AUDIT_SCHEMA_VERSION = "1.1"
+AUDIT_SCHEMA_VERSION = "1.2"
 
 
 def _canonical_json(value) -> str:
@@ -266,8 +267,11 @@ def _probe_openai_compatible_models(config: dict) -> list[dict]:
     """Capture model descriptors from local vLLM/OpenAI-compatible servers."""
     probes = []
     seen: set[tuple[str, str]] = set()
-    for role, settings in _role_items(config):
-        resolved = _effective_role_settings(config, settings)
+    resolved_roles = [
+        (role, _effective_role_settings(config, settings))
+        for role, settings in _role_items(config)
+    ]
+    for role, resolved in resolved_roles:
         if resolved.get("backend") != "theoria_agent":
             continue
         endpoint = str(resolved.get("endpoint") or resolved.get("base_url") or "")
@@ -291,16 +295,12 @@ def _probe_openai_compatible_models(config: dict) -> list[dict]:
             "model": model,
             "roles": sorted(
                 candidate_role
-                for candidate_role, candidate_settings in _role_items(config)
+                for candidate_role, candidate in resolved_roles
                 if (
-                    _effective_role_settings(config, candidate_settings).get("backend")
-                    == "theoria_agent"
-                    and str(_effective_role_settings(
-                        config, candidate_settings,
-                    ).get("endpoint") or "") == endpoint
-                    and str(_effective_role_settings(
-                        config, candidate_settings,
-                    ).get("model")) == model
+                    candidate.get("backend") == "theoria_agent"
+                    and str(candidate.get("endpoint") or candidate.get("base_url") or "")
+                    == endpoint
+                    and str(candidate.get("model")) == model
                 )
             ),
         }
@@ -456,10 +456,18 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
     config_sources = [str(pipeline.DEFAULTS_PATH)] + [
         str(p) for p in args_ref.get("config_paths", [])
     ]
-    model_runtime_probes = (
-        _probe_ollama_models(config)
-        + _probe_openai_compatible_models(config)
-    )
+    probe_started = time.perf_counter()
+    # These are independent network probes. Run them concurrently so an
+    # unavailable local server costs one timeout window rather than two.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ollama_future = executor.submit(_probe_ollama_models, config)
+        compatible_future = executor.submit(
+            _probe_openai_compatible_models, config,
+        )
+        model_runtime_probes = ollama_future.result() + compatible_future.result()
+    model_runtime_probe_duration_ms = int(round(
+        (time.perf_counter() - probe_started) * 1000
+    ))
     model_runtime_identity = _model_runtime_identity(model_runtime_probes)
     run_args = _run_args_manifest(args_ref)
     run_args_identity = _run_args_identity(run_args)
@@ -478,6 +486,7 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
         "config_source_fingerprints": _config_source_fingerprints(config_sources),
         "role_model_manifest": _role_model_manifest(config),
         "model_runtime_probes": model_runtime_probes,
+        "model_runtime_probe_duration_ms": model_runtime_probe_duration_ms,
         "model_runtime_identity": model_runtime_identity,
         "model_runtime_identity_sha256": _sha256_json(model_runtime_identity),
         "model_runtime_identity_complete": all(
@@ -659,12 +668,25 @@ def _host_runtime_metadata() -> dict:
         memory_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, OSError, ValueError):
         pass
+    try:
+        installed_packages = sorted({
+            f"{distribution.metadata.get('Name') or 'unknown'}=="
+            f"{distribution.version}"
+            for distribution in importlib.metadata.distributions()
+        }, key=str.lower)
+        installed_packages_sha256 = _sha256_text("\n".join(installed_packages))
+    except Exception:
+        installed_packages_sha256 = None
     return {
         "platform": platform.platform(),
         "machine": platform.machine(),
         "processor": platform.processor(),
         "cpu_count": os.cpu_count(),
         "memory_bytes": memory_bytes,
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "python_executable": os.path.realpath(sys.executable),
+        "installed_packages_sha256": installed_packages_sha256,
     }
 
 
@@ -731,6 +753,89 @@ def _write_meta(root: str, meta: dict) -> None:
     os.replace(tmp, path)
 
 
+def verify_artifact_manifest(root: str) -> dict:
+    """Verify a sealed artifact tree before any resume-time mutation.
+
+    Both listed hashes and the exact internal file set are checked. A resume
+    must fail closed if files were changed, removed, or added after sealing.
+    External entries (normally the run JSON) are checked as well.
+    """
+    root = os.path.abspath(root)
+    manifest_path = os.path.join(root, "artifact_manifest.json")
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "cannot resume because the artifact manifest is missing or "
+            f"unreadable: {manifest_path}"
+        ) from exc
+    if manifest.get("schema_version") != "1.0" or not isinstance(
+        manifest.get("entries"), list
+    ):
+        raise RuntimeError(f"invalid artifact manifest structure: {manifest_path}")
+
+    expected_internal: set[str] = set()
+    seen: set[tuple[bool, str]] = set()
+    for entry in manifest["entries"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise RuntimeError(f"invalid artifact manifest entry: {entry!r}")
+        external = bool(entry.get("external"))
+        recorded_path = entry["path"]
+        if external:
+            if not os.path.isabs(recorded_path):
+                raise RuntimeError(
+                    f"external manifest path is not absolute: {recorded_path!r}"
+                )
+            path = os.path.abspath(recorded_path)
+            identity = (True, path)
+        else:
+            if os.path.isabs(recorded_path):
+                raise RuntimeError(
+                    f"internal manifest path is absolute: {recorded_path!r}"
+                )
+            normalized = os.path.normpath(recorded_path)
+            path = os.path.abspath(os.path.join(root, normalized))
+            try:
+                inside_root = os.path.commonpath([root, path]) == root
+            except ValueError:
+                inside_root = False
+            if not inside_root or normalized in {".", ".."}:
+                raise RuntimeError(
+                    f"internal manifest path escapes artifact root: {recorded_path!r}"
+                )
+            identity = (False, normalized)
+            expected_internal.add(normalized)
+        if identity in seen:
+            raise RuntimeError(f"duplicate artifact manifest path: {recorded_path!r}")
+        seen.add(identity)
+        if os.path.islink(path):
+            raise RuntimeError(f"sealed artifact path is a symlink: {path}")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"sealed artifact is missing: {path}")
+        if os.path.getsize(path) != entry.get("size_bytes"):
+            raise RuntimeError(f"sealed artifact size mismatch: {path}")
+        digest = _file_sha256(path)
+        if digest != entry.get("sha256"):
+            raise RuntimeError(f"sealed artifact hash mismatch: {path}")
+
+    actual_internal: set[str] = set()
+    for directory, _, filenames in os.walk(root):
+        for filename in filenames:
+            path = os.path.abspath(os.path.join(directory, filename))
+            if path == manifest_path:
+                continue
+            actual_internal.add(os.path.relpath(path, root))
+    if actual_internal != expected_internal:
+        missing = sorted(expected_internal - actual_internal)
+        unexpected = sorted(actual_internal - expected_internal)
+        raise RuntimeError(
+            "sealed artifact file set mismatch: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    return manifest
+
+
 def _resume_identity(meta: dict) -> dict:
     audit = meta.get("research_audit") or {}
     git = meta.get("git") or {}
@@ -744,6 +849,10 @@ def _resume_identity(meta: dict) -> dict:
         "git_sha": git.get("sha"),
         "git_diff_sha256": git.get("diff_sha256"),
         "git_untracked_sha256": git.get("untracked_sha256"),
+        "python_version": meta.get("python_version"),
+        "python_executable": meta.get("python_executable"),
+        "host_runtime": meta.get("host_runtime"),
+        "cli_versions": meta.get("cli_versions"),
     }
 
 
@@ -770,6 +879,13 @@ def make_artifact_root(
 
     meta_path = os.path.join(root, "meta.json")
     is_resume = os.path.exists(meta_path)
+    verified_manifest: dict | None = None
+    prior_manifest_sha256: str | None = None
+    if is_resume:
+        verified_manifest = verify_artifact_manifest(root)
+        prior_manifest_sha256 = _file_sha256(
+            os.path.join(root, "artifact_manifest.json")
+        )
     invocation_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     research_audit = _research_audit_metadata(CONFIG, _args_ref)
     new_meta = {
@@ -852,6 +968,13 @@ def make_artifact_root(
                         f"current={problem_identity}. Start a new run instead."
                     )
             resumes = existing.get("resumes", [])
+            archive_dir = os.path.join(root, "resume_manifests")
+            os.makedirs(archive_dir, exist_ok=True)
+            archive_path = os.path.join(
+                archive_dir, f"artifact_manifest_{invocation_label}.json",
+            )
+            with open(archive_path, "w") as f:
+                json.dump(verified_manifest, f, indent=2)
             new_meta["host_environment"] = _capture_host_environment(
                 root, invocation_label,
             )
@@ -864,6 +987,8 @@ def make_artifact_root(
                 "research_audit": new_meta["research_audit"],
                 "resume_identity": new_identity,
                 "host_environment": new_meta["host_environment"],
+                "verified_prior_manifest_sha256": prior_manifest_sha256,
+                "prior_manifest_archive": os.path.relpath(archive_path, root),
                 "problem_set_identity": (
                     {
                         "ids_sha256": problem_manifest.get("ids_sha256"),
@@ -981,6 +1106,8 @@ def write_artifact_manifest(
             path = os.path.join(directory, filename)
             if os.path.abspath(path) == manifest_path or not os.path.isfile(path):
                 continue
+            if os.path.islink(path):
+                raise OSError(f"refusing to seal symlinked artifact: {path}")
             digest = _file_sha256(path)
             if digest is None:
                 raise OSError(f"could not hash retained artifact: {path}")
@@ -991,6 +1118,8 @@ def write_artifact_manifest(
             })
     for path in external_paths or []:
         if os.path.isfile(path):
+            if os.path.islink(path):
+                raise OSError(f"refusing to seal symlinked external artifact: {path}")
             digest = _file_sha256(path)
             if digest is None:
                 raise OSError(f"could not hash external artifact: {path}")
@@ -1242,6 +1371,20 @@ async def run_one(
     codex_state_dir: str | None = None
     sandbox_token = None
     image_token = None
+    provider_state_dir = (
+        os.path.join(prob_art_dir, "provider_state") if prob_art_dir else None
+    )
+    codex_resume_state = (
+        os.path.join(provider_state_dir, "codex") if provider_state_dir else None
+    )
+    claude_resume_state = (
+        os.path.join(provider_state_dir, "claude_projects")
+        if provider_state_dir else None
+    )
+    workspace_resume_state = (
+        os.path.join(prob_art_dir, "workspace") if prob_art_dir else None
+    )
+    restored_state = {"codex": False, "claude": False, "workspace": False}
 
     # Fallback timing — only used if sandbox startup fails before the run.
     started_iso = datetime.now().astimezone().isoformat()
@@ -1251,7 +1394,15 @@ async def run_one(
     # escaping run_one and aborting the whole batch.
     try:
         if use_docker:
-            codex_state_dir = sbx.prepare_codex_state_dir()
+            has_codex_resume = bool(
+                codex_resume_state and os.path.isdir(codex_resume_state)
+            )
+            codex_state_dir = sbx.prepare_codex_state_dir(
+                codex_resume_state if has_codex_resume else None
+            )
+            if has_codex_resume and codex_state_dir is None:
+                raise RuntimeError("could not restore persisted Codex session state")
+            restored_state["codex"] = has_codex_resume
             container_id = sbx.start_sandbox(
                 pid=pid,
                 run_id=run_id or "run",
@@ -1261,6 +1412,20 @@ async def run_one(
                 codex_state_dir=codex_state_dir,
             )
             print(f"[{pid}] sandbox container: {container_id[:12]}")
+            if workspace_resume_state and os.path.isdir(workspace_resume_state):
+                if not sbx.copy_to_container(
+                    container_id, workspace_resume_state, "/workspace",
+                ):
+                    raise RuntimeError("could not restore persisted sandbox workspace")
+                restored_state["workspace"] = True
+            if claude_resume_state and os.path.isdir(claude_resume_state):
+                if not sbx.copy_to_container(
+                    container_id,
+                    claude_resume_state,
+                    "/home/node/.claude/projects",
+                ):
+                    raise RuntimeError("could not restore persisted Claude session state")
+                restored_state["claude"] = True
             sandbox_token = sandbox_container.set(container_id)
             if sandbox_image_digest:
                 image_token = sandbox_image_id.set(sandbox_image_digest)
@@ -1297,14 +1462,34 @@ async def run_one(
         #   invaluable when diagnosing mysterious call failures
         container_inspect: dict | None = None
         if container_id and prob_art_dir:
-            sbx.copy_from_container(
-                container_id, "/workspace/.",
+            sbx.snapshot_container_directory(
+                container_id, "/workspace",
                 os.path.join(prob_art_dir, "workspace"),
             )
-            sbx.copy_from_container(
-                container_id, "/home/node/.local/.",
+            sbx.snapshot_container_directory(
+                container_id, "/home/node/.local",
                 os.path.join(prob_art_dir, "home_local"),
             )
+            if provider_state_dir:
+                os.makedirs(provider_state_dir, exist_ok=True)
+                sbx.snapshot_container_directory(
+                    container_id,
+                    "/home/node/.claude/projects",
+                    os.path.join(provider_state_dir, "claude_projects"),
+                )
+                if codex_state_dir:
+                    sbx.snapshot_codex_resume_state(
+                        codex_state_dir,
+                        os.path.join(provider_state_dir, "codex"),
+                    )
+                try:
+                    with open(
+                        os.path.join(provider_state_dir, "restore_status.json"),
+                        "w",
+                    ) as f:
+                        json.dump(restored_state, f, indent=2)
+                except OSError:
+                    pass
             freeze = sbx.pip_freeze_in_container(container_id)
             if freeze is not None:
                 try:
@@ -1358,6 +1543,9 @@ async def run_one(
     total_llm_duration_ms = 0
     total_retries = 0
     failed_calls = 0
+    total_call_invocations = 0
+    failed_call_invocations = 0
+    resume_retry_count = 0
     cached_calls = 0
     resumed_session_calls = 0
     total_tool_calls = 0
@@ -1379,6 +1567,11 @@ async def run_one(
         model_key = f"{c.get('backend', '?')}:{c.get('model') or '?'}"
         calls_by_model[model_key] = calls_by_model.get(model_key, 0) + 1
         failed_calls += int(bool(c.get("failed")))
+        total_call_invocations += int(c.get("invocation_count", 1) or 1)
+        failed_call_invocations += int(
+            c.get("failed_invocations", int(bool(c.get("failed")))) or 0
+        )
+        resume_retry_count += int(c.get("resume_retry_count", 0) or 0)
         cached_calls += int(bool(c.get("resumed_from_cache")))
         resumed_session_calls += int(bool(c.get("resumed")))
         total_retries += int(c.get("retry_count", 0) or 0)
@@ -1470,6 +1663,9 @@ async def run_one(
         "num_calls": len(calls),
         "successful_calls": len(calls) - failed_calls,
         "failed_calls": failed_calls,
+        "total_call_invocations": total_call_invocations,
+        "failed_call_invocations": failed_call_invocations,
+        "resume_retry_count": resume_retry_count,
         "unlogged_call_slots": unlogged_call_slots,
         "cached_calls": cached_calls,
         "resumed_session_calls": resumed_session_calls,
@@ -1598,6 +1794,9 @@ def _aggregate_run_metrics(
         "num_calls": num_calls,
         "successful_calls": sum_field("successful_calls"),
         "failed_calls": sum_field("failed_calls"),
+        "total_call_invocations": sum_field("total_call_invocations"),
+        "failed_call_invocations": sum_field("failed_call_invocations"),
+        "resume_retry_count": sum_field("resume_retry_count"),
         "unlogged_call_slots": sum_field("unlogged_call_slots"),
         "cached_calls": sum_field("cached_calls"),
         "resumed_session_calls": sum_field("resumed_session_calls"),
@@ -1691,7 +1890,6 @@ async def run_problems(
         problem_manifest=problem_manifest,
     )
     print(f"Artifact root: {artifact_root}")
-    record_problem_set_manifest(artifact_root, problem_manifest)
 
     use_docker = _args_ref.get("docker", False)
     sandbox_image = _args_ref.get("image") or sbx.DEFAULT_IMAGE
@@ -1728,7 +1926,9 @@ async def run_problems(
         return result
 
     run_error: BaseException | None = None
+    run_error_traceback = None
     try:
+        record_problem_set_manifest(artifact_root, problem_manifest)
         duplicate_ids = problem_manifest.get("duplicate_ids") or []
         if duplicate_ids:
             raise ValueError(
@@ -1747,46 +1947,77 @@ async def run_problems(
         await asyncio.gather(*[run_and_save(p) for p in problems])
     except BaseException as exc:
         run_error = exc
-        raise
-    finally:
+        run_error_traceback = exc.__traceback__
+
+    finalization_error: BaseException | None = None
+    try:
+        if run_error is None and len(results) == len(problems):
+            status = (
+                "completed_with_errors"
+                if any(result.get("error") for result in results)
+                else "completed"
+            )
+        elif isinstance(run_error, (asyncio.CancelledError, KeyboardInterrupt)):
+            status = "interrupted"
+        else:
+            status = "failed"
+        run_metrics = _aggregate_run_metrics(
+            results,
+            requested=len(problems),
+            duration_ms=int(round(
+                (time.perf_counter() - run_started_perf) * 1000
+            )),
+        )
+        update_artifact_root_meta(
+            artifact_root, {"metrics": run_metrics}, strict=True,
+        )
+        finalize_artifact_root(
+            artifact_root,
+            status=status,
+            requested=len(problems),
+            completed=len(results),
+            completed_ids=[str(result.get("id", "?")) for result in results],
+            error=run_error,
+        )
+        write_artifact_manifest(
+            artifact_root,
+            external_paths=[save_path],
+        )
+    except BaseException as exc:
+        finalization_error = exc
         try:
-            if run_error is None and len(results) == len(problems):
-                status = "completed"
-            elif isinstance(
-                run_error, (asyncio.CancelledError, KeyboardInterrupt),
-            ):
-                status = "interrupted"
-            else:
-                status = "failed"
-            run_metrics = _aggregate_run_metrics(
-                results,
-                requested=len(problems),
-                duration_ms=int(round(
-                    (time.perf_counter() - run_started_perf) * 1000
-                )),
-            )
-            update_artifact_root_meta(
-                artifact_root, {"metrics": run_metrics}, strict=True,
-            )
             finalize_artifact_root(
                 artifact_root,
-                status=status,
+                status="failed",
                 requested=len(problems),
                 completed=len(results),
                 completed_ids=[
                     str(result.get("id", "?")) for result in results
                 ],
-                error=run_error,
+                error=exc,
             )
+            update_artifact_root_meta(artifact_root, {
+                "finalization_error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }, strict=True)
             write_artifact_manifest(
                 artifact_root,
                 external_paths=[save_path],
             )
-        finally:
-            if claude_creds_path:
-                sbx.cleanup_credentials(claude_creds_path)
-            if claude_config_path:
-                sbx.cleanup_claude_config(claude_config_path)
+        except BaseException:
+            pass
+    finally:
+        if claude_creds_path:
+            sbx.cleanup_credentials(claude_creds_path)
+        if claude_config_path:
+            sbx.cleanup_claude_config(claude_config_path)
+
+    if run_error is not None:
+        raise run_error.with_traceback(run_error_traceback)
+    if finalization_error is not None:
+        raise finalization_error
     return results
 
 

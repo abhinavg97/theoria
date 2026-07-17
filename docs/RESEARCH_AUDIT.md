@@ -19,17 +19,22 @@ tool action, repair outcome, and grading decision.
   container tool versions;
 - stable runtime model identities, including local Ollama content digests and
   nonvolatile descriptors from local OpenAI-compatible servers;
-- explicit `running`, `completed`, `failed`, or `interrupted` status and counts;
+- explicit `running`, `completed`, `completed_with_errors`, `failed`, or
+  `interrupted` status and counts;
 - aggregate calls by role/model, cache/resume use, failures, retries, tokens,
   mechanistic tool evidence, search, cost coverage, and repair metrics when
   available.
 
-Resume is fail-closed. A changed experiment argument, concurrency setting,
-config, code state, sandbox image digest, runtime model identity, problem ID
-list, problem record hash, missing cohort manifest, or unreadable prior
-metadata must start a new run instead of rewriting the original identity. The
-`--resume` value itself is the only CLI argument excluded from comparison.
-Local runs whose model probe did not resolve cannot be resumed.
+Resume is fail-closed. Before any cached response is reused, Theoria verifies
+the prior manifest, every internal artifact, the exact internal file set, and
+each external result file. The verified seal is archived before a replacement
+seal is written. A changed experiment argument, concurrency setting, config,
+code state, Python executable/version, installed-package fingerprint, CLI
+version, sandbox image digest, runtime model identity, problem ID list, problem
+record hash, missing cohort manifest, or unreadable prior metadata must start a
+new run instead of rewriting the original identity. The `--resume` value itself
+is the only CLI argument excluded from comparison. Local runs whose model probe
+did not resolve cannot be resumed.
 
 ## Model identity
 
@@ -61,8 +66,12 @@ Every successful or failed call has a `call_NNN_<role>/` directory containing
 the exact prompt, system prompt, response schema, command, response, provider
 events, tool inputs/outputs, retry-attempt stdout/stderr, transcript for the
 provider-neutral loop, traceback on failure, and self-describing `meta.json`.
-Failed calls remain in aggregate metrics. Retry usage and tool calls are
-counted across attempts rather than only from the final successful attempt.
+Failed calls remain in aggregate metrics. A later execution retry is written to
+`call_NNN_<role>/retry_NNN/`; it never overwrites the failed invocation. Retry
+usage and tool calls are counted across attempts rather than only from the final
+successful attempt. Provider-neutral transcripts and Docker-side Claude/Codex
+session state are persisted so a new process can continue the same conversation
+instead of silently starting without its earlier context.
 Token accounting distinguishes calls with any observed usage from calls with
 complete usage. A timeout can retain tokens from completed turns while leaving
 the timed-out provider request unreported; in that case `usage_observed` is
@@ -76,12 +85,17 @@ primary source, and analyses must not label it as one.
 
 ## Grading evidence
 
-`theoria grade` creates a separate audit run linked to the source run by
-SHA-256. It retains the exact grader prompt/schema/config, pinned rationale
-dataset and fingerprint, every grader prompt/response, failures/retries, and
-aggregate usage. Automatic grades are explicitly marked non-authoritative;
-manual adjudication remains a separate research artifact and must be joined by
-problem ID for headline paper numbers.
+`theoria grade` creates a separate audit run linked to one stable source-run
+snapshot by SHA-256. The exact bytes that were parsed are copied into the
+grading artifact root; later source-file changes cannot alter the recorded
+identity. If source-run metadata exists, its run identity, completion status,
+and artifact seal must match the supplied path. Each grading invocation gets a
+unique default output rather than overwriting an earlier grade. It retains the
+exact grader prompt/schema/config, pinned rationale dataset and fingerprint,
+every grader prompt/response, failures/retries, and aggregate usage. Automatic
+grades are explicitly marked non-authoritative; manual adjudication remains a
+separate research artifact and must be joined by problem ID for headline paper
+numbers.
 
 ## Integrity and release checklist
 
@@ -91,7 +105,7 @@ the size and SHA-256 of every retained artifact and external result file.
 Before using a run in a paper table:
 
 1. Require `meta.json.status == "completed"` and matching requested/completed
-   counts.
+   counts. Treat `completed_with_errors` as incomplete for headline results.
 2. Prefer a clean Git state; otherwise archive the retained patch and
    untracked files identified by hash.
 3. Verify immutable model provenance, especially for remote deployments.
