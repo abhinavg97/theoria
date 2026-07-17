@@ -648,31 +648,50 @@ def _build_repair_metrics(
     max_verify: int,
     max_solver: int,
     solver_answers: int,
+    solver_solutions: list[str] | None,
     final_answer: str | None,
     verified: bool,
 ) -> dict:
     verify_attempt_records = [
         attempt for attempt in attempts if attempt.get("phase") == "verify"
     ]
-    first_attempt = attempts[0] if attempts else None
-    first_verify = verify_attempt_records[0] if verify_attempt_records else None
+    # Invalid structured output is a protocol retry, not semantic repair.
+    # The first semantic event is either a proof verification or a formalizer
+    # rejection that sends the solver back for a genuinely new answer.
+    first_semantic_attempt = next((
+        attempt for attempt in attempts
+        if attempt.get("phase") in {"formalizer_reject", "verify"}
+    ), None)
+    first_verify = (
+        first_semantic_attempt
+        if first_semantic_attempt
+        and first_semantic_attempt.get("phase") == "verify"
+        else None
+    )
     first_attempt_answer = _answer_from_proof_dict(
         first_verify.get("proof") if first_verify else None
     )
-    first_attempt_verified = bool(
-        first_attempt
-        and first_attempt.get("phase") == "verify"
-        and first_attempt.get("all_ok")
-    )
+    first_attempt_verified = bool(first_verify and first_verify.get("all_ok"))
     verify_attempts = len(verify_attempt_records)
     solver_retries = max(0, solver_answers - 1)
     judge_repair_rounds = max(0, verify_attempts - 1)
     repair_attempted = bool(judge_repair_rounds or solver_retries)
-    answer_changed = (
+    answer_change_observable = bool(
+        not repair_attempted
+        or (first_attempt_answer is not None and final_answer is not None)
+    )
+    answer_changed = None
+    if not repair_attempted:
+        answer_changed = False
+    elif answer_change_observable:
+        answer_changed = (
+            first_attempt_answer.strip() != str(final_answer).strip()
+        )
+    solver_solutions = list(solver_solutions or [])
+    solver_solution_text_changed = bool(
         repair_attempted
-        and first_attempt_answer is not None
-        and final_answer is not None
-        and first_attempt_answer.strip() != str(final_answer).strip()
+        and len(solver_solutions) > 1
+        and solver_solutions[0].strip() != solver_solutions[-1].strip()
     )
 
     return {
@@ -700,7 +719,9 @@ def _build_repair_metrics(
         "first_attempt_answer": first_attempt_answer,
         "answer_before_repair": first_attempt_answer if repair_attempted else None,
         "final_answer": final_answer,
+        "answer_change_observable": answer_change_observable,
         "answer_changed_during_repair": answer_changed,
+        "solver_solution_text_changed_during_repair": solver_solution_text_changed,
     }
 
 
@@ -850,6 +871,8 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
     solution, solver_session = await _solver_call(problem, None)
     log(f"    {solution[:200]}")
     state["solution"] = solution
+    solver_solutions = [solution]
+    state["solver_solutions"] = solver_solutions
     await save_partial("solver_returned")
 
     formalizer_session = None
@@ -919,6 +942,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
             solution, _ = await _solver_call(problem, solver_session, retry_reason=reason)
             log(f"    {solution[:200]}")
             solver_answers += 1
+            solver_solutions.append(solution)
             failed_verdicts_text = None  # reset, this is a fresh formalization
             last_proof = None             # reset, no prior proof for new answer
             state["solution"] = solution
@@ -1163,6 +1187,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         max_verify=max_verify,
         max_solver=max_solver,
         solver_answers=solver_answers,
+        solver_solutions=solver_solutions,
         final_answer=answer,
         verified=verified,
     )
@@ -1184,6 +1209,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         "verified_unconditionally": verified_unconditionally,
         "verified_under_assumptions": verified_under_assumptions,
         "solution": solution,
+        "solver_solutions": solver_solutions,
         "proof": proof_dict,
         "verdicts": verdicts_dict,
         "attempts": attempts,

@@ -656,11 +656,17 @@ def print_summary(results: list[dict], by_category: bool = False) -> None:
         answer_changed = sum(
             1 for r in repair_rows if r.get("answer_changed_during_repair")
         )
+        answer_change_unknown = sum(
+            1 for r in repair_rows
+            if r.get("repair_attempted")
+            and not r.get("answer_change_observable", False)
+        )
         print(
             "  Repair: "
             f"{repair_attempted}/{len(repair_rows)} attempted · "
             f"{certified_by_repair} certified by repair · "
-            f"{answer_changed} answer changed"
+            f"{answer_changed} answer changed · "
+            f"{answer_change_unknown} answer change unknown"
         )
     if have_key:
         correct = sum(1 for r in results if r.get("correct"))

@@ -118,6 +118,7 @@ def test_repair_metrics_mark_no_repair_baseline():
         max_verify=1,
         max_solver=1,
         solver_answers=1,
+        solver_solutions=["6 * 7 = 42"],
         final_answer="42",
         verified=True,
     )
@@ -129,6 +130,7 @@ def test_repair_metrics_mark_no_repair_baseline():
     assert metrics["first_attempt_verified"] is True
     assert metrics["certified_by_repair"] is False
     assert metrics["answer_changed_during_repair"] is False
+    assert metrics["answer_change_observable"] is True
 
 
 def test_repair_metrics_track_certified_answer_flip():
@@ -164,6 +166,7 @@ def test_repair_metrics_track_certified_answer_flip():
         max_verify=3,
         max_solver=1,
         solver_answers=1,
+        solver_solutions=["6 * 7 = 42"],
         final_answer="42",
         verified=True,
     )
@@ -199,6 +202,7 @@ def test_repair_metrics_track_solver_retry():
         max_verify=3,
         max_solver=3,
         solver_answers=2,
+        solver_solutions=["6 * 7 = 41", "6 * 7 = 42"],
         final_answer="42",
         verified=True,
     )
@@ -207,6 +211,11 @@ def test_repair_metrics_track_solver_retry():
     assert metrics["solver_retries"] == 1
     assert metrics["formalizer_reject_count"] == 1
     assert metrics["certified_by_repair"] is True
+    assert metrics["first_attempt_answer"] is None
+    assert metrics["answer_before_repair"] is None
+    assert metrics["answer_change_observable"] is False
+    assert metrics["answer_changed_during_repair"] is None
+    assert metrics["solver_solution_text_changed_during_repair"] is True
 
 
 def test_formalizer_schema_accepts_proof_without_reject_reason():
@@ -259,12 +268,14 @@ def test_formalizer_missing_proof_is_reprompted(monkeypatch):
 
     assert result["verified"] is True
     assert result["answer"] == "42"
+    assert result["solver_solutions"] == ["6 * 7 = 42"]
     assert result["attempts"][0]["phase"] == "formalizer_invalid"
     assert result["attempts"][0]["decision"] == {"action": "proof"}
     assert result["attempts"][1]["phase"] == "verify"
     assert [c["role"] for c in calls].count("formalizer") == 2
     assert result["repair_metrics"]["formalizer_invalid_count"] == 1
     assert result["repair_metrics"]["repair_attempted"] is False
+    assert result["repair_metrics"]["first_attempt_verified"] is True
 
 
 def test_run_records_repair_metrics_after_judge_repair(monkeypatch):
