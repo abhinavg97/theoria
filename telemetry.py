@@ -40,7 +40,7 @@ def normalize_usage(metadata: dict[str, Any]) -> dict[str, Any]:
         usage[field] = max(0, int(raw or 0))
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
     reported = (
-        "provider_usage" in metadata
+        bool(metadata.get("provider_usage"))
         or (
             not metadata.get("failed")
             and (
@@ -49,13 +49,19 @@ def normalize_usage(metadata: dict[str, Any]) -> dict[str, Any]:
             )
         )
     )
-    retried = int(metadata.get("retry_count", 0) or 0) > 0
+    explicit_complete = metadata.get("usage_complete")
+    if isinstance(explicit_complete, bool):
+        complete = bool(reported and explicit_complete)
+    else:
+        complete = bool(
+            reported and int(metadata.get("retry_count", 0) or 0) == 0
+        )
     usage["source"] = (
-        "provider_reported_partial" if reported and retried
+        "provider_reported_partial" if reported and not complete
         else "provider_reported" if reported
         else "unavailable"
     )
-    usage["complete"] = bool(reported and not retried)
+    usage["complete"] = complete
     return usage
 
 

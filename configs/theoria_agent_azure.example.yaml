@@ -2,6 +2,13 @@ _theoria_agent: &theoria_agent
   backend: theoria_agent
   # Azure deployment name, not the catalog model name.
   model: YOUR_AZURE_DEPLOYMENT
+  # Fill these for paper runs when Azure does not return them in responses.
+  # model_source: azure-foundry
+  # model_revision: EXACT_CATALOG_MODEL_VERSION
+  # deployment_version: IMMUTABLE_DEPLOYMENT_VERSION
+  # dtype: bfloat16
+  # quantization: none
+  # server_hardware: PROVIDER_SKU_OR_GPU_CONFIGURATION
   # Examples:
   #   https://YOUR_RESOURCE.openai.azure.com/openai/v1
   #   https://YOUR_RESOURCE.services.ai.azure.com/openai/v1

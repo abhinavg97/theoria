@@ -116,7 +116,7 @@ versions, model names, pricing ID, cost source, and cost coverage. Distinguish:
 Also retain rejected/failed calls and retries. Excluding them understates both
 compute and cost.
 
-For HLE runs, pin the source when possible:
+HLE uses a pinned source revision by default. To override it explicitly:
 
 ```bash
 theoria hle 1 --dataset-revision <hugging-face-commit>

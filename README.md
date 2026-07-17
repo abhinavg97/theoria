@@ -76,11 +76,11 @@ theoria hle 1               # reproduce HLE problem 1 (streams live by default)
 `theoria doctor` tells you exactly what's missing and how to fix it. `theoria build` builds both sandbox images (`theoria-sandbox` and the Sage math/science variant `theoria-sandbox-sage`); the Sage image installs SageMath via conda, so its first build takes several minutes.
 
 Results land in `runs/<command>_<tag>_<timestamp>.json`; full per-call artifacts
-(every prompt, response, tool call, event stream, normalized usage, and cost
-provenance) live under `runs/artifacts/`. Run-level research telemetry is in
-`runs/artifacts/<run_id>/telemetry.json`. All are gitignored. See
-[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the schema and paper
-reporting guidance.
+(every prompt, response, retry, failure, tool call, event stream, normalized
+usage, and cost provenance) live under `runs/artifacts/`. Run-level telemetry
+is in `runs/artifacts/<run_id>/telemetry.json`. All are gitignored. See
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the telemetry schema and
+[`docs/RESEARCH_AUDIT.md`](docs/RESEARCH_AUDIT.md) for the paper audit contract.
 
 ### Reproducing the HLE results
 
@@ -138,7 +138,7 @@ runs.
 | `--log-format text\|json` | text | Operational logs; JSON is suitable for log ingestion. |
 | `--log-level LEVEL` | INFO | Operational log threshold (also `THEORIA_LOG_LEVEL`). |
 | `--pricing PATH` | none | Versioned pricing catalog for labeled cost estimates. |
-| `--dataset-revision REV` | live default | Pin HLE-Verified to a Hugging Face commit/tag; the resolved fingerprint is recorded. |
+| `--dataset-revision REV` | pinned commit | Override the pinned HLE-Verified revision; the requested revision and resolved fingerprint are recorded. |
 
 Stackable config presets in `configs/`: `defaults.yaml` (base — every role's prompt), `sage.yaml`, `restricted.yaml` (tool allowlists), `tuned.yaml`, `audit_grader.yaml` (the grader role).
 

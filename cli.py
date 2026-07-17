@@ -94,9 +94,24 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--parallel", type=int, default=1,
         help="How many problems to run concurrently (default: 1). Each "
-             "problem is isolated, so this changes speed, not results.",
+             "problem is isolated, but concurrency can affect provider "
+             "timing and rate limits; the value is recorded in run metadata.",
     )
     g.add_argument("--tag", default=None, help="Label for the results file.")
+    g.add_argument(
+        "--experiment-id", default=None,
+        help="Stable experiment/condition identifier recorded in audit metadata.",
+    )
+    g.add_argument(
+        "--experiment-phase",
+        choices=["smoke", "dev", "evaluation", "ablation"],
+        default=None,
+        help="Structured run purpose for separating prompt tuning from evaluation.",
+    )
+    g.add_argument(
+        "--trial", type=int, default=None,
+        help="One-based replicate number recorded in audit metadata.",
+    )
     g.add_argument(
         "--watch", action=argparse.BooleanOptionalAction, default=True,
         help="Stream live LLM events (tool calls, thinking) to stderr. On by "
@@ -167,6 +182,8 @@ def _run(problems, prefix, args, *, by_category=False):
         sys.exit("No problems to run.")
     if args.parallel < 1:
         sys.exit("--parallel must be a positive integer.")
+    if args.trial is not None and args.trial < 1:
+        sys.exit("--trial must be a positive integer.")
     _resolve(args)
     save_path = harness.make_save_path(prefix, args.tag, resume=args.resume)
     print(f"Loaded {len(problems)} problem(s); "
@@ -566,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--ids", default=None, help="Comma-separated specific dataset ids.")
     h.add_argument("--category", default=None, help="Filter (e.g. Math, Physics).")
     h.add_argument(
-        "--dataset-revision", default=None,
+        "--dataset-revision", default=loaders.HLE_DATASET_REVISION,
         help="Hugging Face revision (commit/tag) to pin HLE-Verified. The "
              "resolved dataset fingerprint is always recorded.",
     )

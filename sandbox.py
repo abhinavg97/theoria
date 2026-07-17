@@ -45,6 +45,7 @@ _CODEX_STATE_FILES = (
     "internal_storage.json",
     ".codex-global-state.json",
 )
+_CODEX_RESUME_DIRS = ("sessions", "archived_sessions")
 
 
 def refresh_claude_credentials() -> str | None:
@@ -132,7 +133,7 @@ def cleanup_claude_config(path: str | None) -> None:
         pass
 
 
-def prepare_codex_state_dir() -> str | None:
+def prepare_codex_state_dir(resume_state_dir: str | None = None) -> str | None:
     """Copy the minimum set of codex subscription state files into a
     fresh tempdir so the container can bind-mount it writable without
     risking host state pollution.
@@ -153,13 +154,19 @@ def prepare_codex_state_dir() -> str | None:
         f = src / name
         if f.exists():
             shutil.copy2(f, Path(dst) / name)
+    if resume_state_dir:
+        resume_root = Path(resume_state_dir)
+        for name in _CODEX_RESUME_DIRS:
+            source_dir = resume_root / name
+            if source_dir.is_dir():
+                shutil.copytree(source_dir, Path(dst) / name)
     # Container user (UID 1000) needs to read these; files inherit the
     # host user's UID under macOS Docker Desktop. 0644 is safe.
     try:
         os.chmod(dst, 0o755)
-        for f in Path(dst).iterdir():
+        for f in Path(dst).rglob("*"):
             try:
-                os.chmod(f, 0o644)
+                os.chmod(f, 0o755 if f.is_dir() else 0o644)
             except OSError:
                 pass
     except OSError:
@@ -185,6 +192,21 @@ def cleanup_codex_state_dir(path: str | None) -> None:
         shutil.rmtree(path, ignore_errors=True)
     except OSError:
         pass
+
+
+def snapshot_codex_resume_state(state_dir: str, destination: str) -> None:
+    """Persist only non-secret Codex rollout directories for later resume."""
+    source_root = Path(state_dir)
+    destination_root = Path(destination)
+    temporary = destination_root.with_name(destination_root.name + ".tmp")
+    shutil.rmtree(temporary, ignore_errors=True)
+    temporary.mkdir(parents=True, exist_ok=True)
+    for name in _CODEX_RESUME_DIRS:
+        source_dir = source_root / name
+        if source_dir.is_dir():
+            shutil.copytree(source_dir, temporary / name)
+    shutil.rmtree(destination_root, ignore_errors=True)
+    os.replace(temporary, destination_root)
 
 
 def image_digest(image: str = DEFAULT_IMAGE) -> str | None:
@@ -385,6 +407,64 @@ def copy_from_container(container_id: str, src: str, dst: str) -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
     return r.returncode == 0
+
+
+def copy_to_container(container_id: str, src: str, dst: str) -> bool:
+    """Restore a host directory as UID 1000 inside a hardened container."""
+    source = Path(src)
+    if not source.is_dir():
+        return False
+    try:
+        mkdir = subprocess.run(
+            [
+                "docker", "exec", "-u", "1000:1000", container_id,
+                "mkdir", "-p", dst,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if mkdir.returncode != 0:
+            return False
+        # `docker cp` creates root-owned files. A container started with
+        # --cap-drop=ALL cannot chown them afterward, even via `docker exec -u
+        # 0`. Stream a tar archive into a process running as the runtime user
+        # instead, so restored files are writable without adding CAP_CHOWN.
+        with tempfile.TemporaryFile() as archive:
+            packed = subprocess.run(
+                ["tar", "-C", str(source), "-cf", "-", "."],
+                stdout=archive,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            if packed.returncode != 0:
+                return False
+            archive.seek(0)
+            restored = subprocess.run(
+                [
+                    "docker", "exec", "-i", "-u", "1000:1000",
+                    container_id, "tar", "-C", dst, "-xf", "-",
+                ],
+                stdin=archive,
+                capture_output=True,
+                timeout=60,
+            )
+        return restored.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def snapshot_container_directory(container_id: str, src: str, dst: str) -> bool:
+    """Atomically replace a host snapshot with one container directory."""
+    destination = Path(dst)
+    temporary = destination.with_name(destination.name + ".tmp")
+    shutil.rmtree(temporary, ignore_errors=True)
+    temporary.mkdir(parents=True, exist_ok=True)
+    if not copy_from_container(container_id, src.rstrip("/") + "/.", str(temporary)):
+        shutil.rmtree(temporary, ignore_errors=True)
+        return False
+    shutil.rmtree(destination, ignore_errors=True)
+    os.replace(temporary, destination)
+    return True
 
 
 def inspect_container(container_id: str) -> dict | None:
