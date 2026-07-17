@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
+import agent_loop
 import harness
 import loaders
 import sandbox
@@ -280,6 +283,88 @@ def cmd_grade(args) -> None:
     ))
 
 
+def _doctor_effective_config(args):
+    backend = args.backend or "codex"
+    docker = True if args.docker is None else args.docker
+    image = args.image or SAGE_IMAGE
+
+    user_cfgs = list(args.config or [])
+    if docker and not args.no_pair_preamble:
+        paired = IMAGE_PREAMBLE.get(image, "__unknown__")
+        if paired and paired != "__unknown__":
+            paired_path = str(Path(__file__).parent / paired)
+            user_cfgs = [paired_path] + user_cfgs
+
+    config = harness.load_config(user_cfgs)
+    if backend:
+        pin_formalizer_to_claude = backend == "codex"
+        for role, settings in config.items():
+            if role.startswith("_") or not isinstance(settings, dict):
+                continue
+            if role == "formalizer" and pin_formalizer_to_claude:
+                continue
+            settings["backend"] = backend
+    return config, backend, docker, image
+
+
+def _config_uses_backend(config: dict, backend: str) -> bool:
+    for role, settings in config.items():
+        if role.startswith("_") or not isinstance(settings, dict):
+            continue
+        if settings.get("backend", "claude") == backend:
+            return True
+    return False
+
+
+def _valid_http_endpoint(endpoint: str) -> tuple[bool, str]:
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+    except ValueError as exc:
+        return False, str(exc)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False, "use an absolute http(s) URL"
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return False, str(exc)
+    if not parsed.hostname:
+        return False, "endpoint must include a hostname"
+    if port == 0:
+        return False, "port must be between 1 and 65535"
+    if parsed.username or parsed.password:
+        return False, "do not put credentials in endpoint URLs"
+    if parsed.query or parsed.fragment:
+        return False, "omit query strings and fragments"
+    return True, ""
+
+
+def _theoria_agent_plans(config: dict) -> list[tuple[str, dict]]:
+    plans: dict[tuple[str, str, str | None, str | None], tuple[str, dict]] = {}
+    for role, settings in config.items():
+        if role.startswith("_") or not isinstance(settings, dict):
+            continue
+        if settings.get("backend", "claude") != "theoria_agent":
+            continue
+        endpoint = settings.get("endpoint") or settings.get("base_url") or agent_loop.DEFAULT_ENDPOINT
+        model = settings.get("model", "qwen3:4b")
+        api_key_env = settings.get("api_key_env")
+        auth_header = settings.get("auth_header")
+        key = (str(endpoint), str(model), api_key_env, auth_header)
+        plans.setdefault(key, (role, settings))
+    return list(plans.values())
+
+
+def _config_uses_web_search(config: dict) -> bool:
+    if not isinstance(config.get("_web_search"), dict):
+        return False
+    return any(
+        settings.get("backend", "claude") == "theoria_agent"
+        and bool(settings.get("search", True))
+        for role, settings in config.items()
+        if not role.startswith("_") and isinstance(settings, dict)
+    )
+
+
 def cmd_doctor(args) -> None:
     """Check that everything needed to run is present."""
     ok = True
@@ -303,7 +388,15 @@ def cmd_doctor(args) -> None:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    config, backend, docker, image = _doctor_effective_config(args)
+    uses_claude = _config_uses_backend(config, "claude")
+    uses_codex = _config_uses_backend(config, "codex")
+    uses_theoria_agent = _config_uses_backend(config, "theoria_agent")
+    uses_web_search = _config_uses_web_search(config)
+
     print("Theoria setup check\n")
+    print(f"Selected backend={backend} docker={docker} "
+          f"image={image if docker else '(none)'}\n")
 
     check(f"Python {sys.version_info.major}.{sys.version_info.minor} (need ≥ 3.12)",
           sys.version_info >= (3, 12))
@@ -315,17 +408,23 @@ def cmd_doctor(args) -> None:
         check("datasets package (for HLE)", False,
               "pip install -e .  (installs datasets)")
 
-    cv = cli_version("claude")
-    check(f"claude CLI {('(' + cv + ')') if cv else ''}", cv is not None,
-          "install Claude Code and run `claude` to log in")
+    if uses_claude:
+        cv = cli_version("claude")
+        check(f"claude CLI {('(' + cv + ')') if cv else ''}", cv is not None,
+              "install Claude Code and run `claude` to log in")
+    else:
+        check("claude CLI not required by selected config", True)
 
-    cv = cli_version("codex")
-    check(f"codex CLI {('(' + cv + ')') if cv else ''}", cv is not None,
-          "install Codex and run `codex` to log in (runs the solver + judges)")
+    if uses_codex:
+        cv = cli_version("codex")
+        check(f"codex CLI {('(' + cv + ')') if cv else ''}", cv is not None,
+              "install Codex and run `codex` to log in (runs the solver + judges)")
+    else:
+        check("codex CLI not required by selected config", True)
 
     # Login state — this is the actual credential setup. Both are populated
     # by logging into the CLIs once; sandbox.py mounts them into the container.
-    if sys.platform == "darwin":
+    if uses_claude and sys.platform == "darwin":
         logged_in = subprocess.run(
             ["security", "find-generic-password",
              "-s", "Claude Code-credentials", "-w"],
@@ -335,14 +434,16 @@ def cmd_doctor(args) -> None:
               "run `claude` and sign in with your Claude subscription")
     # Docker mode snapshots ~/.claude.json into the container and run_problems
     # hard-fails if it's missing — surface it here instead of mid-run.
-    claude_config = (Path.home() / ".claude.json").exists()
-    check("Claude config (~/.claude.json — required for Docker runs)",
-          claude_config,
-          "run `claude` once to generate it (and pause other Claude Code "
-          "instances during a run to avoid a mid-snapshot race)")
-    codex_auth = (Path.home() / ".codex" / "auth.json").exists()
-    check("Codex logged in (~/.codex/auth.json)", codex_auth,
-          "run `codex` and sign in with your ChatGPT subscription")
+    if uses_claude and docker:
+        claude_config = (Path.home() / ".claude.json").exists()
+        check("Claude config (~/.claude.json — required for Docker runs)",
+              claude_config,
+              "run `claude` once to generate it (and pause other Claude Code "
+              "instances during a run to avoid a mid-snapshot race)")
+    if uses_codex:
+        codex_auth = (Path.home() / ".codex" / "auth.json").exists()
+        check("Codex logged in (~/.codex/auth.json)", codex_auth,
+              "run `codex` and sign in with your ChatGPT subscription")
 
     docker_ok = shutil.which("docker") is not None
     daemon_ok = False
@@ -353,17 +454,78 @@ def cmd_doctor(args) -> None:
             ).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             daemon_ok = False
-    check("Docker installed", docker_ok, "install Docker Desktop")
-    check("Docker daemon running", daemon_ok, "start Docker")
+    if docker:
+        check("Docker installed", docker_ok, "install Docker Desktop")
+        check("Docker daemon running", daemon_ok, "start Docker")
+    else:
+        check("Docker not required by selected flags", True)
 
     # Use the SAME detection the run path uses (docker images -q), which
     # works on containerd-backed daemons where `docker image inspect` fails
     # for locally-built tags.
-    for img in (SAGE_IMAGE, STD_IMAGE):
-        present = bool(daemon_ok and sandbox.image_digest(img))
-        check(f"image {img}", present, f"theoria build  (builds {img})")
+    if docker:
+        present = bool(daemon_ok and sandbox.image_digest(image))
+        check(f"image {image}", present, f"theoria build  (builds {image})")
 
-    if sys.platform != "darwin":
+    if uses_theoria_agent:
+        try:
+            import jsonschema  # noqa: F401
+            check("jsonschema package (for theoria_agent schemas)", True)
+        except ImportError:
+            check("jsonschema package (for theoria_agent schemas)", False,
+                  "pip install -e '.[test]' or pip install jsonschema")
+
+        for role, settings in _theoria_agent_plans(config):
+            endpoint = str(settings.get("endpoint") or settings.get("base_url")
+                           or agent_loop.DEFAULT_ENDPOINT)
+            model = str(settings.get("model", "qwen3:4b"))
+            valid, hint = _valid_http_endpoint(endpoint)
+            label = f"theoria_agent endpoint for {model}"
+            check(label, valid, hint)
+            api_key_env = settings.get("api_key_env")
+            if api_key_env:
+                check(f"{api_key_env} set for {model}",
+                      bool(os.environ.get(api_key_env)),
+                      f"export {api_key_env}=<key>")
+            if args.check_endpoint and valid:
+                probe_settings = dict(settings)
+                probe_settings["endpoint"] = endpoint
+                probe_settings["model"] = model
+                probe_settings.setdefault("max_tokens", 8)
+                probe_settings.setdefault("temperature", 0)
+                probe_settings.setdefault("request_timeout", 30)
+                try:
+                    agent_loop._chat_completion(probe_settings, [
+                        {"role": "user", "content": "Reply with OK only."},
+                    ])
+                    check(f"{model} chat completion reachable", True)
+                except Exception as exc:
+                    check(f"{model} chat completion reachable", False, str(exc)[:300])
+
+    search_config = config.get("_web_search")
+    if uses_web_search:
+        provider = search_config.get("provider", "searxng")
+        check(f"web search provider {provider}", provider == "searxng",
+              "PR #9 supports _web_search.provider: searxng")
+        endpoint = str(search_config.get("endpoint", ""))
+        valid, hint = _valid_http_endpoint(endpoint)
+        check("web search endpoint", valid, hint or "set _web_search.endpoint")
+        if args.check_endpoint and provider == "searxng" and valid:
+            try:
+                result = agent_loop._search_web(
+                    search_config, "RFC 9110", max_results=1,
+                )
+                check(
+                    "SearXNG search reachable",
+                    True,
+                    f"{result.result_count} result(s)",
+                )
+            except Exception as exc:
+                check("SearXNG search reachable", False, str(exc)[:300])
+    else:
+        check("web search not required by selected config", True)
+
+    if uses_claude and sys.platform != "darwin":
         print("\n  ! Note: the subscription auth path extracts Claude "
               "credentials from the macOS Keychain, so it currently "
               "requires macOS.")
@@ -459,6 +621,30 @@ def build_parser() -> argparse.ArgumentParser:
     g.set_defaults(func=cmd_grade)
 
     d = sub.add_parser("doctor", help="Check your setup.")
+    d.add_argument(
+        "--config", action="append", default=None,
+        help="Config YAML to check (repeatable; later wins).",
+    )
+    d.add_argument(
+        "--backend", choices=["codex", "claude", "theoria_agent"], default=None,
+        help="Backend preset to check. Default: codex audited preset.",
+    )
+    d.add_argument(
+        "--docker", action=argparse.BooleanOptionalAction, default=None,
+        help="Check Docker requirements. Default: on.",
+    )
+    d.add_argument(
+        "--image", default=None,
+        help=f"Docker image to check when --docker is on. Default: {SAGE_IMAGE}.",
+    )
+    d.add_argument(
+        "--no-pair-preamble", action="store_true",
+        help="Don't auto-stack the preamble paired to the selected image.",
+    )
+    d.add_argument(
+        "--check-endpoint", action="store_true",
+        help="Run live endpoint probes for the selected model/search config.",
+    )
     d.set_defaults(func=cmd_doctor)
 
     bl = sub.add_parser("build", help="Build the Docker sandbox images.")

@@ -91,6 +91,29 @@ class AgentRunError(RuntimeError):
         self.messages = messages
 
 
+@dataclass
+class SearchResult:
+    text: str
+    provider: str
+    query: str
+    result_count: int
+    latency_ms: int
+    endpoint: str
+
+
+class SearchFailure(RuntimeError):
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+
+
 def pseudo_command(settings: dict) -> list[str]:
     endpoint = settings.get("endpoint") or settings.get("base_url") or DEFAULT_ENDPOINT
     return [
@@ -436,13 +459,25 @@ async def _run_shell(
     return combined, int(proc.returncode or 0)
 
 
-def _search_web(search_config: dict, query: str, *, max_results: int) -> str:
+def _search_web(
+    search_config: dict,
+    query: str,
+    *,
+    max_results: int,
+) -> SearchResult:
+    started = time.perf_counter()
     provider = search_config.get("provider", "searxng")
     if provider != "searxng":
-        raise ValueError("only _web_search.provider: searxng is supported")
+        raise SearchFailure(
+            "invalid_config",
+            "only _web_search.provider: searxng is supported",
+        )
     endpoint = search_config.get("endpoint")
     if not endpoint:
-        raise ValueError("_web_search.endpoint is required for searxng")
+        raise SearchFailure(
+            "invalid_config",
+            "_web_search.endpoint is required for searxng",
+        )
     params = urllib.parse.urlencode({"q": query, "format": "json"})
     url = endpoint.rstrip("/") + "/search?" + params
     request = urllib.request.Request(url, headers={"User-Agent": "theoria-agent/0.1"})
@@ -451,18 +486,41 @@ def _search_web(search_config: dict, query: str, *, max_results: int) -> str:
             body = json.loads(response.read())
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode(errors="replace")
-        raise RuntimeError(f"web search failed with HTTP {exc.code}: {raw[:500]}") from exc
+        raise SearchFailure(
+            f"http_{exc.code}",
+            f"web search failed with HTTP {exc.code}: {raw[:500]}",
+            status_code=exc.code,
+        ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"web search failed: {exc}") from exc
+        category = (
+            "timeout" if isinstance(exc.reason, TimeoutError)
+            else "network_error"
+        )
+        message = (
+            "web search timed out" if category == "timeout"
+            else f"web search failed: {exc}"
+        )
+        raise SearchFailure(category, message) from exc
+    except TimeoutError as exc:
+        raise SearchFailure("timeout", "web search timed out") from exc
 
     results = body.get("results") or []
     lines = []
-    for idx, result in enumerate(results[:max_results], 1):
+    limited = results[:max_results]
+    for idx, result in enumerate(limited, 1):
         title = result.get("title") or "(untitled)"
         url = result.get("url") or ""
         content = result.get("content") or result.get("snippet") or ""
         lines.append(f"{idx}. {title}\nURL: {url}\nSnippet: {content}")
-    return "\n\n".join(lines) if lines else "(no search results)"
+    latency_ms = int(round((time.perf_counter() - started) * 1000))
+    return SearchResult(
+        text="\n\n".join(lines) if lines else "(no search results)",
+        provider=provider,
+        query=query,
+        result_count=len(limited),
+        latency_ms=latency_ms,
+        endpoint=_redact_endpoint(str(endpoint)),
+    )
 
 
 def _tool_call_previews(events: list[dict], *, limit: int = 2000) -> list[dict]:
@@ -492,6 +550,35 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n...[TRUNCATED: {len(text) - limit} chars]"
+
+
+def _search_failure_category(exc: Exception) -> str:
+    category = getattr(exc, "category", None)
+    if category:
+        return str(category)
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, urllib.error.URLError):
+        return (
+            "timeout" if isinstance(exc.reason, TimeoutError)
+            else "network_error"
+        )
+    if isinstance(exc, (JSONDecodeError, UnicodeDecodeError)):
+        return "invalid_response"
+    return type(exc).__name__
+
+
+def _is_client_search_failure(category: str) -> bool:
+    return category in {
+        "invalid_config",
+        "invalid_input",
+        "missing_query",
+        "unavailable",
+    }
+
+
+def _increment_error_category(categories: dict[str, int], category: str) -> None:
+    categories[category] = categories.get(category, 0) + 1
 
 
 async def run_agent(
@@ -534,6 +621,19 @@ async def run_agent(
     cache_creation_input_tokens = reasoning_output_tokens = 0
     final_response: str | dict | None = None
     provider_responses: list[dict] = []
+    search_provider = (
+        (search_config or {}).get("provider", "searxng")
+        if search_config else None
+    )
+    search_error_categories: dict[str, int] = {}
+    search_requests = 0
+    search_successes = 0
+    search_failures = 0
+    search_client_failures = 0
+    search_provider_failures = 0
+    search_provider_requests = 0
+    search_result_count = 0
+    search_latency_ms = 0
 
     def build_metadata(*, failed: bool = False, error: Exception | None = None) -> dict:
         completed_turns = len([
@@ -566,6 +666,26 @@ async def run_agent(
             )),
             "wire_api": "chat-completions",
             "search_enabled": search_enabled,
+            "web_search_provider": search_provider,
+            # Every model-issued action, including malformed, empty, and
+            # unavailable-tool attempts.
+            "web_search_requests": search_requests,
+            "web_search_attempts": search_requests,
+            # Denominator for provider reliability: only requests that passed
+            # client validation and reached the provider path.
+            "web_search_provider_requests": search_provider_requests,
+            "web_search_successes": search_successes,
+            "web_search_failures": search_failures,
+            "web_search_client_failures": search_client_failures,
+            "web_search_provider_failures": search_provider_failures,
+            "web_search_result_count": search_result_count,
+            "web_search_latency_ms": search_latency_ms,
+            "web_search_total_latency_ms": search_latency_ms,
+            "web_search_mean_latency_ms": (
+                search_latency_ms / search_provider_requests
+                if search_provider_requests else None
+            ),
+            "web_search_error_categories": search_error_categories,
             "shell_enabled": shell_enabled,
             "role": role,
             "provider_responses": provider_responses,
@@ -727,7 +847,14 @@ async def run_agent(
                 continue
 
             tool = action.get("tool")
-            tool_input = action.get("input") or {}
+            raw_tool_input = action.get("input")
+            invalid_tool_input = (
+                raw_tool_input is not None
+                and not isinstance(raw_tool_input, dict)
+            )
+            tool_input = (
+                raw_tool_input if isinstance(raw_tool_input, dict) else {}
+            )
             call_id = f"call_{uuid.uuid4().hex[:12]}"
             events.append({
                 "type": "item.completed",
@@ -735,7 +862,10 @@ async def run_agent(
                     "type": "function_call",
                     "call_id": call_id,
                     "name": tool,
-                    "arguments": json.dumps(tool_input, ensure_ascii=False),
+                    "arguments": json.dumps(
+                        raw_tool_input if raw_tool_input is not None else {},
+                        ensure_ascii=False,
+                    ),
                 },
             })
             if watch:
@@ -765,32 +895,113 @@ async def run_agent(
                             "exit_code": exit_code,
                             "sandboxed": container_id is not None,
                         }
-                elif tool == "web_search" and search_enabled:
+                elif tool == "web_search":
+                    search_requests += 1
+                    search_started = time.perf_counter()
                     query = str(tool_input.get("query", ""))
-                    if not query.strip():
+                    tool_metadata = {
+                        "provider": search_provider,
+                        "query": query,
+                        "ok": False,
+                        "provider_request": False,
+                        "result_count": 0,
+                        "latency_ms": 0,
+                    }
+                    if invalid_tool_input:
+                        category = "invalid_input"
+                        search_failures += 1
+                        search_client_failures += 1
+                        _increment_error_category(
+                            search_error_categories, category,
+                        )
+                        tool_metadata["error_category"] = category
+                        result = "web_search input must be a JSON object"
+                    elif not search_enabled:
+                        category = "unavailable"
+                        search_failures += 1
+                        search_client_failures += 1
+                        _increment_error_category(
+                            search_error_categories, category,
+                        )
+                        tool_metadata["error_category"] = category
+                        result = f"tool {tool!r} is not available"
+                    elif not query.strip():
+                        category = "missing_query"
+                        search_failures += 1
+                        search_client_failures += 1
+                        _increment_error_category(
+                            search_error_categories, category,
+                        )
+                        tool_metadata["error_category"] = category
                         result = "missing web_search input field: query"
-                        tool_metadata = {"ok": False, "error_category": "missing_query"}
                     else:
-                        result = await asyncio.to_thread(
+                        search_result = await asyncio.to_thread(
                             _search_web,
                             search_config or {},
                             query,
                             max_results=max_search_results,
                         )
-                        tool_metadata = {
+                        if isinstance(search_result, SearchResult):
+                            result = search_result.text
+                            result_count = search_result.result_count
+                            latency = search_result.latency_ms
+                            provider = search_result.provider
+                            endpoint = search_result.endpoint
+                        else:
+                            # Keep compatibility with tests and integrations
+                            # that monkeypatch the helper to return text.
+                            result = str(search_result)
+                            result_count = 0
+                            latency = int(round(
+                                (time.perf_counter() - search_started) * 1000
+                            ))
+                            provider = search_provider
+                            endpoint = None
+                        search_successes += 1
+                        search_provider_requests += 1
+                        search_result_count += result_count
+                        search_latency_ms += latency
+                        tool_metadata.update({
+                            "provider": provider,
+                            "endpoint": endpoint,
                             "ok": True,
-                            "provider": (search_config or {}).get("provider", "searxng"),
-                            "query": query,
-                        }
+                            "provider_request": True,
+                            "result_count": result_count,
+                            "latency_ms": latency,
+                        })
                 else:
                     result = f"tool {tool!r} is not available"
                     tool_metadata = {"ok": False, "error_category": "unavailable"}
             except Exception as exc:
+                if tool == "web_search":
+                    latency = int(round(
+                        (time.perf_counter() - search_started) * 1000
+                    ))
+                    category = _search_failure_category(exc)
+                    search_failures += 1
+                    client_failure = _is_client_search_failure(category)
+                    if client_failure:
+                        search_client_failures += 1
+                    else:
+                        search_provider_failures += 1
+                        search_provider_requests += 1
+                        search_latency_ms += latency
+                    _increment_error_category(
+                        search_error_categories, category,
+                    )
+                    tool_metadata.update({
+                        "ok": False,
+                        "provider_request": not client_failure,
+                        "latency_ms": 0 if client_failure else latency,
+                        "error_category": category,
+                        "status_code": getattr(exc, "status_code", None),
+                    })
+                else:
+                    tool_metadata = {
+                        "ok": False,
+                        "error_category": type(exc).__name__,
+                    }
                 result = f"tool {tool!r} failed: {type(exc).__name__}: {exc}"
-                tool_metadata = {
-                    "ok": False,
-                    "error_category": type(exc).__name__,
-                }
             tool_metadata["duration_ms"] = int(round(
                 (time.perf_counter() - tool_started) * 1000
             ))

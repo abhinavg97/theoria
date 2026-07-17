@@ -46,6 +46,27 @@ written to `runs/artifacts/<run_id>/telemetry.json` with `run_started_at`,
 `run_ended_at`, and `run_duration_ms`. `theoria grade` uses the same call
 schema and writes a separate `grade_<source-run>_<timestamp>` artifact root.
 
+### Web-search metric semantics
+
+`web_search_requests` is retained for compatibility and means model-issued
+search attempts. It is identical to `web_search_attempts`, so it includes
+malformed input, missing queries, and calls made while search is unavailable.
+Use `web_search_provider_requests` for requests that passed client-side checks
+and reached the provider path. `web_search_failures` includes every failed
+attempt; split it into `web_search_client_failures` and
+`web_search_provider_failures` before computing provider reliability.
+
+`web_search_total_latency_ms` (and its compatibility alias
+`web_search_latency_ms`) sums only provider-request latency. Client failures do
+not contribute. `web_search_mean_latency_ms` divides that total by
+`web_search_provider_requests`; it is not an average over all model attempts.
+Error categories retain the detailed reason for every failure.
+
+`theoria doctor` validates SearXNG only when the effective configuration has a
+`theoria_agent` role with search enabled. An unused `_web_search` block under a
+Claude/Codex-only configuration is intentionally ignored because those
+backends do not consume the provider-neutral search tool.
+
 ## Cost semantics
 
 Cost is not inferred by default. Claude may report a call cost; Codex

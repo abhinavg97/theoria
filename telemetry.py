@@ -276,6 +276,16 @@ def aggregate_calls(
     complete_cost_calls = 0
     cost_sources: dict[str, int] = {}
     usage_complete_calls = 0
+    web_search_providers: set[str] = set()
+    web_search_attempts = 0
+    web_search_provider_requests = 0
+    web_search_successes = 0
+    web_search_failures = 0
+    web_search_client_failures = 0
+    web_search_provider_failures = 0
+    web_search_result_count = 0
+    web_search_total_latency_ms = 0
+    web_search_error_categories: dict[str, int] = {}
 
     for call in calls:
         role = str(call.get("role", "unknown"))
@@ -309,6 +319,46 @@ def aggregate_calls(
             cost_total += float(cost["amount_usd"])
             priced_calls += 1
         complete_cost_calls += int(bool(cost.get("complete")))
+
+        call_attempts = int(
+            call.get("web_search_attempts", call.get("web_search_requests", 0))
+            or 0
+        )
+        call_successes = int(call.get("web_search_successes", 0) or 0)
+        call_provider_failures = int(
+            call.get("web_search_provider_failures", 0) or 0
+        )
+        call_provider_requests = call.get("web_search_provider_requests")
+        if call_provider_requests is None:
+            call_provider_requests = call_successes + call_provider_failures
+        web_search_attempts += call_attempts
+        web_search_provider_requests += int(call_provider_requests or 0)
+        web_search_successes += call_successes
+        web_search_failures += int(call.get("web_search_failures", 0) or 0)
+        web_search_client_failures += int(
+            call.get("web_search_client_failures", 0) or 0
+        )
+        web_search_provider_failures += call_provider_failures
+        web_search_result_count += int(
+            call.get("web_search_result_count", 0) or 0
+        )
+        web_search_total_latency_ms += int(
+            call.get(
+                "web_search_total_latency_ms",
+                call.get("web_search_latency_ms", 0),
+            )
+            or 0
+        )
+        provider = call.get("web_search_provider")
+        if provider and call_attempts:
+            web_search_providers.add(str(provider))
+        for category, count in (
+            call.get("web_search_error_categories") or {}
+        ).items():
+            web_search_error_categories[str(category)] = (
+                web_search_error_categories.get(str(category), 0)
+                + int(count or 0)
+            )
 
     total_tokens = totals["input_tokens"] + totals["output_tokens"]
     tokens_by_role = {
@@ -344,6 +394,24 @@ def aggregate_calls(
         "total_cache_creation_input_tokens": totals["cache_creation_input_tokens"],
         "total_reasoning_output_tokens": totals["reasoning_output_tokens"],
         "total_tokens": total_tokens,
+        "web_search_providers": sorted(web_search_providers),
+        # Backward-compatible alias: both fields count model-issued attempts,
+        # including client-side misuse and unavailable-tool calls.
+        "web_search_requests": web_search_attempts,
+        "web_search_attempts": web_search_attempts,
+        "web_search_provider_requests": web_search_provider_requests,
+        "web_search_successes": web_search_successes,
+        "web_search_failures": web_search_failures,
+        "web_search_client_failures": web_search_client_failures,
+        "web_search_provider_failures": web_search_provider_failures,
+        "web_search_result_count": web_search_result_count,
+        "web_search_latency_ms": web_search_total_latency_ms,
+        "web_search_total_latency_ms": web_search_total_latency_ms,
+        "web_search_mean_latency_ms": (
+            web_search_total_latency_ms / web_search_provider_requests
+            if web_search_provider_requests else None
+        ),
+        "web_search_error_categories": web_search_error_categories,
         "cost": {
             "amount_usd": round(cost_total, 12) if priced_calls else None,
             "currency": "USD",
