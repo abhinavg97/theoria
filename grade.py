@@ -327,7 +327,7 @@ async def grade_run(
         Path("runs/artifacts") / Path(run_file).stem / "meta.json"
     )
     meta = {
-        "audit_schema_version": "1.0",
+        "audit_schema_version": harness.AUDIT_SCHEMA_VERSION,
         "run_id": grade_run_id,
         "kind": "audit_grading",
         "status": "running",

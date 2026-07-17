@@ -67,6 +67,7 @@ def test_grade_run_captures_calls_and_reproducibility_artifacts(
 
     root = Path(summary["artifact_root"])
     meta = json.loads((root / "meta.json").read_text())
+    assert meta["audit_schema_version"] == grade.harness.AUDIT_SCHEMA_VERSION
     assert meta["status"] == "completed"
     assert meta["source_run_sha256"] == summary["run_file_sha256"]
     assert meta["grader_prompt_sha256"] == summary["grader_prompt_sha"]

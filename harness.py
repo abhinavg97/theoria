@@ -42,6 +42,7 @@ from pipeline import run, CONFIG, load_config
 # ── Run-level metadata capture ───────────────────────────────────
 
 _REDACTED = "<redacted>"
+AUDIT_SCHEMA_VERSION = "1.1"
 
 
 def _canonical_json(value) -> str:
@@ -356,12 +357,119 @@ def _config_source_fingerprints(paths: list[str]) -> list[dict]:
     ]
 
 
+def _stable_model_descriptor(value):
+    """Remove server-lifecycle fields that do not identify model weights."""
+    volatile_keys = {
+        "created",
+        "created_at",
+        "updated_at",
+        "permission",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _stable_model_descriptor(item)
+            for key, item in sorted(value.items())
+            if key not in volatile_keys
+        }
+    if isinstance(value, list):
+        return [_stable_model_descriptor(item) for item in value]
+    return value
+
+
+def _model_runtime_identity(probes: list[dict]) -> list[dict]:
+    """Return stable, secret-safe identities from runtime model probes."""
+    identities = []
+    for probe in probes:
+        identity = {
+            "backend": probe.get("backend"),
+            "endpoint": probe.get("endpoint"),
+            "model": probe.get("model"),
+            "roles": sorted(probe.get("roles") or []),
+            "resolved": bool(probe.get("resolved")),
+        }
+        if probe.get("backend") == "ollama":
+            identity.update({
+                "resolved_name": probe.get("resolved_name"),
+                "digest": probe.get("digest"),
+                "size_bytes": probe.get("size_bytes"),
+                "details": _stable_model_descriptor(
+                    probe.get("details") or {}
+                ),
+            })
+        elif probe.get("backend") == "openai-compatible":
+            identity["descriptor"] = _stable_model_descriptor(
+                probe.get("descriptor")
+            )
+        if not identity["resolved"]:
+            identity["error_type"] = probe.get("error_type")
+        identities.append(identity)
+    return sorted(identities, key=_canonical_json)
+
+
+def _run_args_manifest(args_ref: dict) -> dict:
+    cli_args = {
+        key: value
+        for key, value in (args_ref.get("cli_args") or {}).items()
+        if not callable(value)
+    }
+    return {
+        "backend": args_ref.get("backend"),
+        "codex_model": args_ref.get("codex_model"),
+        "watch": args_ref.get("watch"),
+        "docker": args_ref.get("docker"),
+        "image": args_ref.get("image"),
+        "parallel": args_ref.get("parallel"),
+        "resume": args_ref.get("resume"),
+        "tag": args_ref.get("tag"),
+        "experiment_id": args_ref.get("experiment_id"),
+        "experiment_phase": args_ref.get("experiment_phase"),
+        "trial": args_ref.get("trial"),
+        "config_paths": list(args_ref.get("config_paths") or []),
+        "cli_args": _redact_config_value(None, cli_args),
+    }
+
+
+def _run_args_identity(run_args: dict) -> dict:
+    """Bind every condition argument except the act of resuming itself."""
+    identity = json.loads(json.dumps(run_args, default=str))
+    identity.pop("resume", None)
+    if isinstance(identity.get("cli_args"), dict):
+        identity["cli_args"].pop("resume", None)
+    return identity
+
+
+def _sandbox_request_identity(args_ref: dict) -> dict:
+    enabled = bool(args_ref.get("docker", False))
+    if not enabled:
+        return {"enabled": False, "image": None, "image_digest": None}
+    image = args_ref.get("image") or sbx.DEFAULT_IMAGE
+    return {
+        "enabled": True,
+        "image": image,
+        "image_digest": sbx.image_digest(image),
+    }
+
+
 def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
     redacted_config = _redact_config(config)
     config_identity = _config_identity_value(None, config)
     config_sources = [str(pipeline.DEFAULTS_PATH)] + [
         str(p) for p in args_ref.get("config_paths", [])
     ]
+    model_runtime_probes = (
+        _probe_ollama_models(config)
+        + _probe_openai_compatible_models(config)
+    )
+    model_runtime_identity = _model_runtime_identity(model_runtime_probes)
+    run_args = _run_args_manifest(args_ref)
+    run_args_identity = _run_args_identity(run_args)
+    sandbox_identity = _sandbox_request_identity(args_ref)
+    concurrency = {
+        "problem_parallelism": args_ref.get("parallel"),
+        "provider_concurrency": (
+            (config.get("_limits") or {}).get("max_provider_concurrency")
+        ),
+    }
     return {
         "config": redacted_config,
         "config_sha256": _sha256_json(config_identity),
@@ -369,25 +477,26 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
         "config_sources": config_sources,
         "config_source_fingerprints": _config_source_fingerprints(config_sources),
         "role_model_manifest": _role_model_manifest(config),
-        "model_runtime_probes": (
-            _probe_ollama_models(config)
-            + _probe_openai_compatible_models(config)
+        "model_runtime_probes": model_runtime_probes,
+        "model_runtime_identity": model_runtime_identity,
+        "model_runtime_identity_sha256": _sha256_json(model_runtime_identity),
+        "model_runtime_identity_complete": all(
+            identity.get("resolved")
+            and (
+                identity.get("backend") != "ollama"
+                or bool(identity.get("digest"))
+            )
+            for identity in model_runtime_identity
         ),
         "prompt_fingerprints": _prompt_fingerprints(config),
         "limits": dict(config.get("_limits") or {}),
-        "run_args": {
-            "backend": args_ref.get("backend"),
-            "codex_model": args_ref.get("codex_model"),
-            "watch": args_ref.get("watch"),
-            "docker": args_ref.get("docker"),
-            "image": args_ref.get("image"),
-            "parallel": args_ref.get("parallel"),
-            "resume": args_ref.get("resume"),
-            "tag": args_ref.get("tag"),
-            "experiment_id": args_ref.get("experiment_id"),
-            "experiment_phase": args_ref.get("experiment_phase"),
-            "trial": args_ref.get("trial"),
-        },
+        "run_args": run_args,
+        "run_args_identity": run_args_identity,
+        "run_args_identity_sha256": _sha256_json(run_args_identity),
+        "sandbox_request_identity": sandbox_identity,
+        "sandbox_request_identity_sha256": _sha256_json(sandbox_identity),
+        "concurrency": concurrency,
+        "concurrency_sha256": _sha256_json(concurrency),
     }
 
 
@@ -626,7 +735,12 @@ def _resume_identity(meta: dict) -> dict:
     audit = meta.get("research_audit") or {}
     git = meta.get("git") or {}
     return {
+        "audit_schema_version": meta.get("audit_schema_version"),
         "config_sha256": meta.get("config_sha256") or audit.get("config_sha256"),
+        "run_args_identity": audit.get("run_args_identity"),
+        "sandbox_request_identity": audit.get("sandbox_request_identity"),
+        "concurrency": audit.get("concurrency"),
+        "model_runtime_identity": audit.get("model_runtime_identity"),
         "git_sha": git.get("sha"),
         "git_diff_sha256": git.get("diff_sha256"),
         "git_untracked_sha256": git.get("untracked_sha256"),
@@ -659,7 +773,7 @@ def make_artifact_root(
     invocation_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     research_audit = _research_audit_metadata(CONFIG, _args_ref)
     new_meta = {
-        "audit_schema_version": "1.0",
+        "audit_schema_version": AUDIT_SCHEMA_VERSION,
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running",
@@ -689,6 +803,7 @@ def make_artifact_root(
         ),
         "research_audit": research_audit,
     }
+    new_meta["resume_identity"] = _resume_identity(new_meta)
     # If we're resuming an existing run, preserve the original metadata
     # and append resume info as a list of resume events. This keeps a
     # full audit trail of every (re-)invocation against this run dir.
@@ -696,6 +811,17 @@ def make_artifact_root(
         try:
             with open(meta_path) as f:
                 existing = json.load(f)
+            existing_audit = existing.get("research_audit") or {}
+            if existing_audit.get("model_runtime_identity_complete") is False:
+                raise RuntimeError(
+                    "resume model provenance is incomplete in the original "
+                    "run. Start a new run after resolving every local model."
+                )
+            if research_audit.get("model_runtime_identity_complete") is False:
+                raise RuntimeError(
+                    "resume model provenance is incomplete for the current "
+                    "invocation. Resolve every local model before resuming."
+                )
             prior_identity = _resume_identity(existing)
             new_identity = _resume_identity(new_meta)
             if prior_identity != new_identity:
@@ -736,6 +862,7 @@ def make_artifact_root(
                 "git": new_meta["git"],
                 "config_sha256": new_meta["config_sha256"],
                 "research_audit": new_meta["research_audit"],
+                "resume_identity": new_identity,
                 "host_environment": new_meta["host_environment"],
                 "problem_set_identity": (
                     {
@@ -934,6 +1061,11 @@ def apply_args(args) -> None:
     _args_ref["experiment_id"] = getattr(args, "experiment_id", None)
     _args_ref["experiment_phase"] = getattr(args, "experiment_phase", None)
     _args_ref["trial"] = getattr(args, "trial", None)
+    _args_ref["cli_args"] = {
+        key: value
+        for key, value in vars(args).items()
+        if not callable(value)
+    }
 
 
 def config_uses_backend(backend: str) -> bool:
@@ -966,6 +1098,19 @@ def _prepare_sandbox_run(
             claude_creds_path = sbx.refresh_claude_credentials()
             claude_config_path = sbx.prepare_claude_config()
         image_digest = sbx.image_digest(sandbox_image)
+        requested_sandbox = (
+            (_read_meta(artifact_root).get("research_audit") or {}).get(
+                "sandbox_request_identity"
+            )
+            or {}
+        )
+        requested_digest = requested_sandbox.get("image_digest")
+        if requested_digest and image_digest != requested_digest:
+            raise RuntimeError(
+                "sandbox image identity changed between run initialization "
+                f"and container setup: expected={requested_digest} "
+                f"current={image_digest}. Start a new run instead."
+            )
         print(f"Docker mode: image={sandbox_image} "
               f"image_digest={image_digest} "
               f"creds={'present' if claude_creds_path else 'MISSING'} "

@@ -68,6 +68,7 @@ def test_harness_non_codex_backend_applies_to_formalizer(monkeypatch):
             watch=False,
             docker=False,
             image=None,
+            category="Math",
         )
 
         harness.apply_args(args)
@@ -76,6 +77,7 @@ def test_harness_non_codex_backend_applies_to_formalizer(monkeypatch):
             assert pipeline.CONFIG[role]["backend"] == "theoria_agent"
         assert harness.config_uses_backend("theoria_agent") is True
         assert harness.config_uses_backend("claude") is False
+        assert harness._args_ref["cli_args"]["category"] == "Math"
     finally:
         pipeline.CONFIG.clear()
         pipeline.CONFIG.update(original_config)

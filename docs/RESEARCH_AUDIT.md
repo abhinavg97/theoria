@@ -12,17 +12,24 @@ tool action, repair outcome, and grading decision.
 - the pinned HLE repository revision and resolved `datasets` fingerprint;
 - the effective merged config, config sources, and full SHA-256 hashes;
 - effective per-role backend, model, sampling, context, tool, and turn limits;
+- every resolved CLI condition argument plus problem/provider concurrency;
 - prompt, schema, endpoint, and config fingerprints;
 - Git commit, dirty diff hash/patch, and untracked-file hashes;
-- host runtime, CLI versions, Docker image digest, and container tool versions;
+- host runtime, CLI versions, requested and actual Docker image digests, and
+  container tool versions;
+- stable runtime model identities, including local Ollama content digests and
+  nonvolatile descriptors from local OpenAI-compatible servers;
 - explicit `running`, `completed`, `failed`, or `interrupted` status and counts;
 - aggregate calls by role/model, cache/resume use, failures, retries, tokens,
   mechanistic tool evidence, search, cost coverage, and repair metrics when
   available.
 
-Resume is fail-closed. A changed config, code state, problem ID list, problem
-record hash, missing cohort manifest, or unreadable prior metadata must start a
-new run instead of rewriting the original identity.
+Resume is fail-closed. A changed experiment argument, concurrency setting,
+config, code state, sandbox image digest, runtime model identity, problem ID
+list, problem record hash, missing cohort manifest, or unreadable prior
+metadata must start a new run instead of rewriting the original identity. The
+`--resume` value itself is the only CLI argument excluded from comparison.
+Local runs whose model probe did not resolve cannot be resumed.
 
 ## Model identity
 

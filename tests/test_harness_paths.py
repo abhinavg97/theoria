@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 
@@ -48,7 +49,12 @@ def test_safe_version_known_binary_returns_text():
     assert _safe_version("python3") is not None
 
 
-def test_research_audit_metadata_redacts_and_fingerprints_config(tmp_path):
+def test_research_audit_metadata_redacts_and_fingerprints_config(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        harness.sbx, "image_digest", lambda _image: "sha256:sandbox",
+    )
     cfg = tmp_path / "config.yaml"
     cfg.write_text("solver:\n  model: test\n")
     config = {
@@ -75,6 +81,16 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(tmp_path):
         "backend": "theoria_agent",
         "docker": True,
         "image": "theoria-sandbox:latest",
+        "parallel": 3,
+        "experiment_id": "qwen-scale",
+        "experiment_phase": "evaluation",
+        "trial": 2,
+        "resume": "prior-run",
+        "cli_args": {
+            "category": "Math",
+            "resume": "prior-run",
+            "api_key": "cli-secret",
+        },
     })
 
     solver = audit["config"]["solver"]
@@ -94,6 +110,18 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(tmp_path):
         "sandbox has python\n\nSolve carefully."
     )
     assert audit["run_args"]["backend"] == "theoria_agent"
+    assert audit["run_args"]["cli_args"]["api_key"] == "<redacted>"
+    assert "resume" not in audit["run_args_identity"]
+    assert "resume" not in audit["run_args_identity"]["cli_args"]
+    assert audit["sandbox_request_identity"] == {
+        "enabled": True,
+        "image": "theoria-sandbox:latest",
+        "image_digest": "sha256:sandbox",
+    }
+    assert audit["concurrency"] == {
+        "problem_parallelism": 3,
+        "provider_concurrency": None,
+    }
     assert audit["limits"] == {"max_verify_attempts": 1, "max_solver_answers": 1}
 
 
@@ -172,6 +200,71 @@ def test_config_identity_distinguishes_redacted_endpoint_queries(monkeypatch):
     assert first["config_sha256"] != second["config_sha256"]
 
 
+def test_model_runtime_identity_uses_digest_and_ignores_volatile_fields():
+    first = harness._model_runtime_identity([
+        {
+            "backend": "ollama",
+            "endpoint": "http://localhost:11434",
+            "model": "qwen3:8b",
+            "roles": ["solver"],
+            "resolved": True,
+            "resolved_name": "qwen3:8b",
+            "digest": "sha256:model-a",
+            "size_bytes": 10,
+            "modified_at": "yesterday",
+            "details": {"quantization_level": "Q4_K_M"},
+        },
+        {
+            "backend": "openai-compatible",
+            "endpoint": "http://localhost:8000/v1",
+            "model": "served-model",
+            "roles": ["judge"],
+            "resolved": True,
+            "descriptor": {
+                "id": "served-model",
+                "created": 1,
+                "root": "weights@revision",
+                "max_model_len": 32768,
+            },
+        },
+    ])
+    same = harness._model_runtime_identity([
+        {
+            "backend": "ollama",
+            "endpoint": "http://localhost:11434",
+            "model": "qwen3:8b",
+            "roles": ["solver"],
+            "resolved": True,
+            "resolved_name": "qwen3:8b",
+            "digest": "sha256:model-a",
+            "size_bytes": 10,
+            "modified_at": "today",
+            "details": {"quantization_level": "Q4_K_M"},
+        },
+        {
+            "backend": "openai-compatible",
+            "endpoint": "http://localhost:8000/v1",
+            "model": "served-model",
+            "roles": ["judge"],
+            "resolved": True,
+            "descriptor": {
+                "id": "served-model",
+                "created": 2,
+                "root": "weights@revision",
+                "max_model_len": 32768,
+            },
+        },
+    ])
+    changed = json.loads(json.dumps(same))
+    next(
+        identity for identity in changed
+        if identity["backend"] == "ollama"
+    )["digest"] = "sha256:model-b"
+
+    assert first == same
+    assert first != changed
+
+
 def test_problem_set_manifest_is_immutable_on_resume(tmp_path):
     root = tmp_path / "artifacts"
     root.mkdir()
@@ -238,6 +331,198 @@ def test_rejected_resume_does_not_capture_new_environment(tmp_path, monkeypatch)
         harness.CONFIG.update(original)
 
 
+def test_resume_binds_experiment_sandbox_concurrency_and_model_identity(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    model_state = {
+        "digest": "sha256:model-a",
+        "modified_at": "first",
+    }
+    sandbox_state = {"digest": "sha256:sandbox-a"}
+
+    def ollama_probe(_config):
+        return [{
+            "backend": "ollama",
+            "endpoint": "http://localhost:11434",
+            "model": "qwen3:8b",
+            "roles": ["solver"],
+            "resolved": True,
+            "resolved_name": "qwen3:8b",
+            "digest": model_state["digest"],
+            "size_bytes": 10,
+            "modified_at": model_state["modified_at"],
+            "details": {"quantization_level": "Q4_K_M"},
+        }]
+
+    monkeypatch.setattr(harness, "_probe_ollama_models", ollama_probe)
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+    monkeypatch.setattr(
+        harness.sbx, "image_digest", lambda _image: sandbox_state["digest"],
+    )
+    monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
+        "sha": "same", "diff_sha256": None, "untracked_sha256": None,
+    })
+    monkeypatch.setattr(harness, "_safe_version", lambda _binary: None)
+    captures = []
+    monkeypatch.setattr(
+        harness,
+        "_capture_host_environment",
+        lambda *_args, **_kwargs: captures.append("capture") or {
+            "available": True,
+        },
+    )
+
+    original_config = copy.deepcopy(harness.CONFIG)
+    original_args = copy.deepcopy(harness._args_ref)
+    manifest = _problem_set_manifest([{
+        "id": "p1", "question": "Q1", "answer": "A1",
+    }])
+    base_args = {
+        "docker": True,
+        "image": "theoria-sandbox:latest",
+        "config_paths": [],
+        "backend": "theoria_agent",
+        "codex_model": None,
+        "watch": False,
+        "parallel": 2,
+        "resume": None,
+        "tag": "paper",
+        "experiment_id": "qwen-scale",
+        "experiment_phase": "evaluation",
+        "trial": 1,
+        "cli_args": {
+            "category": "Math",
+            "parallel": 2,
+            "resume": None,
+        },
+    }
+    try:
+        harness.CONFIG.clear()
+        harness.CONFIG.update({
+            "solver": {
+                "backend": "theoria_agent",
+                "model": "qwen3:8b",
+                "endpoint": "http://localhost:11434/v1",
+            },
+        })
+        harness._args_ref.clear()
+        harness._args_ref.update(copy.deepcopy(base_args))
+        root = harness.make_artifact_root(
+            "runs/resume-test.json", problem_manifest=manifest,
+        )
+        record_problem_set_manifest(root, manifest)
+        assert captures == ["capture"]
+
+        harness._args_ref["resume"] = "resume-test"
+        harness._args_ref["cli_args"]["resume"] = "resume-test"
+        model_state["modified_at"] = "second"
+        assert harness.make_artifact_root(
+            "runs/resume-test.json", problem_manifest=manifest,
+        ) == root
+        assert captures == ["capture", "capture"]
+
+        harness._args_ref["experiment_id"] = "different-experiment"
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=manifest,
+            )
+        harness._args_ref["experiment_id"] = "qwen-scale"
+
+        harness._args_ref["cli_args"]["category"] = "Physics"
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=manifest,
+            )
+        harness._args_ref["cli_args"]["category"] = "Math"
+
+        harness._args_ref["parallel"] = 4
+        harness._args_ref["cli_args"]["parallel"] = 4
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=manifest,
+            )
+        harness._args_ref["parallel"] = 2
+        harness._args_ref["cli_args"]["parallel"] = 2
+
+        sandbox_state["digest"] = "sha256:sandbox-b"
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=manifest,
+            )
+        sandbox_state["digest"] = "sha256:sandbox-a"
+
+        model_state["digest"] = "sha256:model-b"
+        with pytest.raises(RuntimeError, match="resume provenance mismatch"):
+            harness.make_artifact_root(
+                "runs/resume-test.json", problem_manifest=manifest,
+            )
+        assert captures == ["capture", "capture"]
+    finally:
+        harness.CONFIG.clear()
+        harness.CONFIG.update(original_config)
+        harness._args_ref.clear()
+        harness._args_ref.update(original_args)
+
+
+def test_resume_rejects_incomplete_local_model_identity(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(harness, "_probe_ollama_models", lambda _config: [{
+        "backend": "ollama",
+        "endpoint": "http://localhost:11434",
+        "model": "missing-model",
+        "roles": ["solver"],
+        "resolved": False,
+        "error_type": "ConnectionError",
+    }])
+    monkeypatch.setattr(
+        harness, "_probe_openai_compatible_models", lambda _config: [],
+    )
+    monkeypatch.setattr(harness, "_safe_git_state", lambda *_args, **_kwargs: {
+        "sha": "same", "diff_sha256": None, "untracked_sha256": None,
+    })
+    monkeypatch.setattr(harness, "_safe_version", lambda _binary: None)
+    monkeypatch.setattr(
+        harness,
+        "_capture_host_environment",
+        lambda *_args, **_kwargs: {"available": True},
+    )
+
+    original_config = copy.deepcopy(harness.CONFIG)
+    original_args = copy.deepcopy(harness._args_ref)
+    manifest = _problem_set_manifest([{
+        "id": "p1", "question": "Q1", "answer": "A1",
+    }])
+    try:
+        harness.CONFIG.clear()
+        harness.CONFIG.update({"solver": {"model": "missing-model"}})
+        harness._args_ref.clear()
+        harness._args_ref.update({
+            "docker": False,
+            "parallel": 1,
+            "resume": None,
+            "cli_args": {"resume": None},
+        })
+        root = harness.make_artifact_root(
+            "runs/unresolved.json", problem_manifest=manifest,
+        )
+        record_problem_set_manifest(root, manifest)
+        harness._args_ref["resume"] = "unresolved"
+        harness._args_ref["cli_args"]["resume"] = "unresolved"
+
+        with pytest.raises(RuntimeError, match="model provenance is incomplete"):
+            harness.make_artifact_root(
+                "runs/unresolved.json", problem_manifest=manifest,
+            )
+    finally:
+        harness.CONFIG.clear()
+        harness.CONFIG.update(original_config)
+        harness._args_ref.clear()
+        harness._args_ref.update(original_args)
+
+
 def test_resume_rejects_unreadable_metadata(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     meta_path = tmp_path / "runs" / "artifacts" / "broken" / "meta.json"
@@ -291,6 +576,29 @@ def test_host_environment_falls_back_when_pip_is_unavailable(
     assert record["source"] == "importlib.metadata"
     assert record["sha256"]
     assert (tmp_path / "host_packages_test.txt").exists()
+
+
+def test_sandbox_setup_rejects_image_digest_race(tmp_path, monkeypatch):
+    harness._write_meta(str(tmp_path), {
+        "research_audit": {
+            "sandbox_request_identity": {
+                "enabled": True,
+                "image": "theoria-sandbox:latest",
+                "image_digest": "sha256:before",
+            },
+        },
+    })
+    monkeypatch.setattr(harness, "config_uses_backend", lambda _backend: False)
+    monkeypatch.setattr(
+        harness.sbx, "image_digest", lambda _image: "sha256:after",
+    )
+
+    with pytest.raises(RuntimeError, match="image identity changed"):
+        harness._prepare_sandbox_run(
+            str(tmp_path),
+            use_docker=True,
+            sandbox_image="theoria-sandbox:latest",
+        )
 
 
 def test_run_one_aggregates_failed_calls_and_tool_status(monkeypatch):
@@ -464,6 +772,7 @@ def test_run_problems_records_completion_status_and_integrity_manifest(
     assert len(results) == 1
     root = tmp_path / "runs" / "artifacts" / "test"
     meta = json.loads((root / "meta.json").read_text())
+    assert meta["audit_schema_version"] == harness.AUDIT_SCHEMA_VERSION
     assert meta["status"] == "completed"
     assert meta["requested_problems"] == 1
     assert meta["completed_problems"] == 1
