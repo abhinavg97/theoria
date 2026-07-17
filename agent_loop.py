@@ -88,7 +88,11 @@ def _redact_endpoint(endpoint: str) -> str:
     host = parsed.hostname or ""
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    port = f":{parsed.port}" if parsed.port is not None else ""
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return "<invalid endpoint>"
+    port = f":{parsed_port}" if parsed_port is not None else ""
     return urllib.parse.urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
 
 
@@ -320,7 +324,9 @@ def _search_web(search_config: dict, query: str, *, max_results: int) -> SearchR
             status_code=exc.code,
         ) from exc
     except urllib.error.URLError as exc:
-        raise SearchFailure("network_error", f"web search failed: {exc}") from exc
+        category = "timeout" if isinstance(exc.reason, TimeoutError) else "network_error"
+        message = "web search timed out" if category == "timeout" else f"web search failed: {exc}"
+        raise SearchFailure(category, message) from exc
     except TimeoutError as exc:
         raise SearchFailure("timeout", "web search timed out") from exc
 
@@ -379,8 +385,19 @@ def _search_failure_category(exc: Exception) -> str:
     if isinstance(exc, TimeoutError):
         return "timeout"
     if isinstance(exc, urllib.error.URLError):
-        return "network_error"
+        return "timeout" if isinstance(exc.reason, TimeoutError) else "network_error"
+    if isinstance(exc, (JSONDecodeError, UnicodeDecodeError)):
+        return "invalid_response"
     return type(exc).__name__
+
+
+def _is_client_search_failure(category: str) -> bool:
+    return category in {
+        "invalid_config",
+        "invalid_input",
+        "missing_query",
+        "unavailable",
+    }
 
 
 def _increment_error_category(categories: dict[str, int], category: str) -> None:
@@ -433,6 +450,8 @@ async def run_agent(
     search_requests = 0
     search_successes = 0
     search_failures = 0
+    search_client_failures = 0
+    search_provider_failures = 0
     search_result_count = 0
     search_latency_ms = 0
 
@@ -508,7 +527,11 @@ async def run_agent(
             continue
 
         tool = action.get("tool")
-        tool_input = action.get("input") or {}
+        raw_tool_input = action.get("input")
+        invalid_tool_input = raw_tool_input is not None and not isinstance(
+            raw_tool_input, dict
+        )
+        tool_input = raw_tool_input if isinstance(raw_tool_input, dict) else {}
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         events.append({
             "type": "item.completed",
@@ -516,7 +539,10 @@ async def run_agent(
                 "type": "function_call",
                 "call_id": call_id,
                 "name": tool,
-                "arguments": json.dumps(tool_input, ensure_ascii=False),
+                "arguments": json.dumps(
+                    raw_tool_input if raw_tool_input is not None else {},
+                    ensure_ascii=False,
+                ),
             },
         })
         if watch:
@@ -543,6 +569,7 @@ async def run_agent(
                     tool_metadata = {"exit_code": exit_code}
             elif tool == "web_search":
                 search_requests += 1
+                search_started = time.perf_counter()
                 query = str(tool_input.get("query", ""))
                 tool_metadata = {
                     "provider": search_provider,
@@ -551,16 +578,24 @@ async def run_agent(
                     "result_count": 0,
                     "latency_ms": 0,
                 }
-                search_started = time.perf_counter()
-                if not search_enabled:
+                if invalid_tool_input:
+                    category = "invalid_input"
+                    search_failures += 1
+                    search_client_failures += 1
+                    _increment_error_category(search_error_categories, category)
+                    tool_metadata["error_category"] = category
+                    result = "web_search input must be a JSON object"
+                elif not search_enabled:
                     category = "unavailable"
                     search_failures += 1
+                    search_client_failures += 1
                     _increment_error_category(search_error_categories, category)
                     tool_metadata["error_category"] = category
                     result = f"tool {tool!r} is not available"
                 elif not query.strip():
                     category = "missing_query"
                     search_failures += 1
+                    search_client_failures += 1
                     _increment_error_category(search_error_categories, category)
                     tool_metadata["error_category"] = category
                     result = "missing web_search input field: query"
@@ -601,6 +636,10 @@ async def run_agent(
                 latency = int(round((time.perf_counter() - search_started) * 1000))
                 category = _search_failure_category(exc)
                 search_failures += 1
+                if _is_client_search_failure(category):
+                    search_client_failures += 1
+                else:
+                    search_provider_failures += 1
                 search_latency_ms += latency
                 _increment_error_category(search_error_categories, category)
                 tool_metadata.update({
@@ -645,8 +684,17 @@ async def run_agent(
         "web_search_requests": search_requests,
         "web_search_successes": search_successes,
         "web_search_failures": search_failures,
+        "web_search_client_failures": search_client_failures,
+        "web_search_provider_failures": search_provider_failures,
         "web_search_result_count": search_result_count,
+        # Cumulative latency for requests that reached the provider. Keep the
+        # original field for compatibility and expose the semantics directly.
         "web_search_latency_ms": search_latency_ms,
+        "web_search_total_latency_ms": search_latency_ms,
+        "web_search_mean_latency_ms": (
+            search_latency_ms / (search_successes + search_provider_failures)
+            if search_successes + search_provider_failures else None
+        ),
         "web_search_error_categories": search_error_categories,
         "shell_enabled": shell_enabled,
         "role": role,

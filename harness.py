@@ -411,6 +411,8 @@ async def run_one(
     web_search_requests = 0
     web_search_successes = 0
     web_search_failures = 0
+    web_search_client_failures = 0
+    web_search_provider_failures = 0
     web_search_result_count = 0
     web_search_latency_ms = 0
     web_search_error_categories: dict[str, int] = {}
@@ -435,6 +437,8 @@ async def run_one(
         web_search_requests += c.get("web_search_requests", 0) or 0
         web_search_successes += c.get("web_search_successes", 0) or 0
         web_search_failures += c.get("web_search_failures", 0) or 0
+        web_search_client_failures += c.get("web_search_client_failures", 0) or 0
+        web_search_provider_failures += c.get("web_search_provider_failures", 0) or 0
         web_search_result_count += c.get("web_search_result_count", 0) or 0
         web_search_latency_ms += c.get("web_search_latency_ms", 0) or 0
         for category, count in (c.get("web_search_error_categories") or {}).items():
@@ -466,8 +470,16 @@ async def run_one(
         "web_search_requests": web_search_requests,
         "web_search_successes": web_search_successes,
         "web_search_failures": web_search_failures,
+        "web_search_client_failures": web_search_client_failures,
+        "web_search_provider_failures": web_search_provider_failures,
         "web_search_result_count": web_search_result_count,
+        # This is the cumulative provider latency, not per-request latency.
         "web_search_latency_ms": web_search_latency_ms,
+        "web_search_total_latency_ms": web_search_latency_ms,
+        "web_search_mean_latency_ms": (
+            web_search_latency_ms / (web_search_successes + web_search_provider_failures)
+            if web_search_successes + web_search_provider_failures else None
+        ),
         "web_search_error_categories": web_search_error_categories,
     }
 

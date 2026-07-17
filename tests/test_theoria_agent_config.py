@@ -149,3 +149,25 @@ def test_doctor_endpoint_validation_rejects_credentials():
 
     assert ok is False
     assert "credentials" in hint
+
+
+def test_doctor_endpoint_validation_rejects_invalid_port():
+    ok, hint = cli._valid_http_endpoint("http://localhost:notaport/v1")
+
+    assert ok is False
+    assert "Port could not be cast" in hint
+
+
+def test_doctor_ignores_search_config_when_selected_roles_do_not_use_it():
+    config = load_config("configs/searxng_search.yaml")
+
+    assert cli._config_uses_web_search(config) is False
+
+
+def test_doctor_detects_search_used_by_theoria_agent():
+    config = load_config([
+        "configs/theoria_agent_ollama.yaml",
+        "configs/searxng_search.yaml",
+    ])
+
+    assert cli._config_uses_web_search(config) is True

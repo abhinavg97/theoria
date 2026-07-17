@@ -282,6 +282,14 @@ def _valid_http_endpoint(endpoint: str) -> tuple[bool, str]:
         return False, str(exc)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return False, "use an absolute http(s) URL"
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return False, str(exc)
+    if not parsed.hostname:
+        return False, "endpoint must include a hostname"
+    if port == 0:
+        return False, "port must be between 1 and 65535"
     if parsed.username or parsed.password:
         return False, "do not put credentials in endpoint URLs"
     if parsed.query or parsed.fragment:
@@ -303,6 +311,17 @@ def _theoria_agent_plans(config: dict) -> list[tuple[str, dict]]:
         key = (str(endpoint), str(model), api_key_env, auth_header)
         plans.setdefault(key, (role, settings))
     return list(plans.values())
+
+
+def _config_uses_web_search(config: dict) -> bool:
+    if not isinstance(config.get("_web_search"), dict):
+        return False
+    return any(
+        settings.get("backend", "claude") == "theoria_agent"
+        and bool(settings.get("search", True))
+        for role, settings in config.items()
+        if not role.startswith("_") and isinstance(settings, dict)
+    )
 
 
 def cmd_doctor(args) -> None:
@@ -332,6 +351,7 @@ def cmd_doctor(args) -> None:
     uses_claude = _config_uses_backend(config, "claude")
     uses_codex = _config_uses_backend(config, "codex")
     uses_theoria_agent = _config_uses_backend(config, "theoria_agent")
+    uses_web_search = _config_uses_web_search(config)
 
     print("Theoria setup check\n")
     print(f"Selected backend={backend} docker={docker} "
@@ -442,7 +462,7 @@ def cmd_doctor(args) -> None:
                     check(f"{model} chat completion reachable", False, str(exc)[:300])
 
     search_config = config.get("_web_search")
-    if isinstance(search_config, dict):
+    if uses_web_search:
         provider = search_config.get("provider", "searxng")
         check(f"web search provider {provider}", provider == "searxng",
               "PR #9 supports _web_search.provider: searxng")
@@ -461,6 +481,8 @@ def cmd_doctor(args) -> None:
                 )
             except Exception as exc:
                 check("SearXNG search reachable", False, str(exc)[:300])
+    else:
+        check("web search not required by selected config", True)
 
     if uses_claude and sys.platform != "darwin":
         print("\n  ! Note: the subscription auth path extracts Claude "

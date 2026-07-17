@@ -166,8 +166,12 @@ def test_run_agent_exposes_web_search_tool(monkeypatch):
     assert result.metadata["web_search_requests"] == 1
     assert result.metadata["web_search_successes"] == 1
     assert result.metadata["web_search_failures"] == 0
+    assert result.metadata["web_search_client_failures"] == 0
+    assert result.metadata["web_search_provider_failures"] == 0
     assert result.metadata["web_search_result_count"] == 1
     assert result.metadata["web_search_latency_ms"] == 17
+    assert result.metadata["web_search_total_latency_ms"] == 17
+    assert result.metadata["web_search_mean_latency_ms"] == 17
     assert result.metadata["web_search_error_categories"] == {}
     assert result.metadata["tool_calls"][0]["tool_name"] == "web_search"
     assert result.metadata["tool_calls"][0]["metadata"]["result_count"] == 1
@@ -212,9 +216,60 @@ def test_run_agent_records_web_search_failure_category(monkeypatch):
     assert result.metadata["web_search_requests"] == 1
     assert result.metadata["web_search_successes"] == 0
     assert result.metadata["web_search_failures"] == 1
+    assert result.metadata["web_search_client_failures"] == 0
+    assert result.metadata["web_search_provider_failures"] == 1
     assert result.metadata["web_search_error_categories"] == {"http_503": 1}
     assert result.metadata["tool_calls"][0]["metadata"]["error_category"] == "http_503"
     assert result.metadata["tool_calls"][0]["metadata"]["status_code"] == 503
+
+
+def test_run_agent_records_malformed_search_input_as_client_failure(monkeypatch):
+    replies = iter([
+        {"action": "tool", "tool": "web_search", "input": "not-an-object"},
+        {"action": "final", "response": "fallback"},
+    ])
+
+    monkeypatch.setattr(
+        agent_loop,
+        "_chat_completion",
+        lambda settings, messages: (json.dumps(next(replies)), {}),
+    )
+
+    result = asyncio.run(agent_loop.run_agent(
+        "search",
+        settings={"model": "fake", "search": True},
+        schema=None,
+        system=None,
+        resume=None,
+        role="citation",
+        container_id=None,
+        search_config={"provider": "searxng", "endpoint": "http://search"},
+    ))
+
+    assert result.response == "fallback"
+    assert result.metadata["web_search_requests"] == 1
+    assert result.metadata["web_search_client_failures"] == 1
+    assert result.metadata["web_search_provider_failures"] == 0
+    assert result.metadata["web_search_error_categories"] == {"invalid_input": 1}
+    assert result.metadata["tool_calls"][0]["metadata"]["error_category"] == "invalid_input"
+
+
+def test_search_web_classifies_urlerror_timeout(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise agent_loop.urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(agent_loop.urllib.request, "urlopen", timeout)
+
+    try:
+        agent_loop._search_web(
+            {"provider": "searxng", "endpoint": "http://search"},
+            "query",
+            max_results=1,
+        )
+    except agent_loop.SearchFailure as exc:
+        assert exc.category == "timeout"
+    else:
+        raise AssertionError("expected SearchFailure")
 
 
 def test_run_agent_retries_schema_invalid_final(monkeypatch):
