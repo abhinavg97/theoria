@@ -44,7 +44,11 @@ def test_chat_completion_sends_declared_sampling_controls(monkeypatch):
         "max_completion_tokens": 768,
         "temperature": 0.2,
         "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.05,
         "seed": 7,
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"enable_thinking": True},
         "frequency_penalty": 0.1,
         "presence_penalty": 0.3,
         "stop": ["END"],
@@ -55,7 +59,11 @@ def test_chat_completion_sends_declared_sampling_controls(monkeypatch):
     assert payload["max_completion_tokens"] == 768
     assert payload["temperature"] == 0.2
     assert payload["top_p"] == 0.8
+    assert payload["top_k"] == 20
+    assert payload["min_p"] == 0.05
     assert payload["seed"] == 7
+    assert payload["reasoning_effort"] == "high"
+    assert payload["chat_template_kwargs"] == {"enable_thinking": True}
     assert payload["frequency_penalty"] == 0.1
     assert payload["presence_penalty"] == 0.3
     assert payload["stop"] == ["END"]
@@ -197,6 +205,54 @@ def test_run_agent_executes_shell_tool_with_explicit_host_opt_in(monkeypatch):
     assert "42" in result.metadata["tool_calls"][0]["output"]
 
 
+def test_run_agent_can_fold_system_instructions_into_user_message(monkeypatch):
+    seen_messages = []
+
+    def fake_chat(settings, messages):
+        seen_messages.append(list(messages))
+        return json.dumps({"action": "final", "response": "done"}), {}
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+
+    result = asyncio.run(agent_loop.run_agent(
+        "solve this",
+        settings={"model": "fake", "system_role": "user"},
+        schema=None,
+        system="role instructions",
+        resume=None,
+        role="solver",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.response == "done"
+    assert [message["role"] for message in seen_messages[0]] == ["user"]
+    assert "role instructions" in seen_messages[0][0]["content"]
+    assert "Task:\nsolve this" in seen_messages[0][0]["content"]
+
+
+def test_run_agent_rejects_unknown_system_role_before_provider_call(monkeypatch):
+    monkeypatch.setattr(
+        agent_loop,
+        "_chat_completion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider must not be called")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="system_role"):
+        asyncio.run(agent_loop.run_agent(
+            "solve",
+            settings={"model": "fake", "system_role": "assistant"},
+            schema=None,
+            system=None,
+            resume=None,
+            role="solver",
+            container_id=None,
+            search_config=None,
+        ))
+
+
 def test_run_agent_enforces_required_tool_before_final(monkeypatch):
     replies = iter([
         {"action": "final", "response": "guessed"},
@@ -231,6 +287,7 @@ def test_run_agent_enforces_required_tool_before_final(monkeypatch):
     assert result.metadata["required_tool_compliance"] is True
     assert result.metadata["successful_required_tools"] == ["shell"]
     assert result.metadata["missing_required_tools"] == []
+    assert result.metadata["required_tool_policy_reprompts"] == 1
     assert "requires successful use" in seen_messages[1][-1]["content"]
     assert any(
         event["type"] == "policy.required_tools_missing"
@@ -271,9 +328,37 @@ def test_run_agent_repairs_direct_role_schema_without_final_wrapper(monkeypatch)
     ))
 
     assert result.response == {"action": "proof", "kind": "valid"}
+    assert result.metadata["role_schema_reprompts"] == 1
+    assert result.metadata["protocol_reprompt_count"] == 1
     feedback = seen_messages[1][-1]["content"]
     assert "did not match the required JSON schema" in feedback
     assert "do not wrap it in action='final'" in feedback
+
+
+def test_run_agent_counts_malformed_json_reprompt(monkeypatch):
+    replies = iter([
+        "not json",
+        json.dumps({"action": "final", "response": "done"}),
+    ])
+
+    def fake_chat(_settings, _messages):
+        return next(replies), {}
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+
+    result = asyncio.run(agent_loop.run_agent(
+        "solve",
+        settings={"model": "fake"},
+        schema=None,
+        system=None,
+        resume=None,
+        role="solver",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.metadata["json_action_reprompts"] == 1
+    assert result.metadata["protocol_reprompt_count"] == 1
 
 
 def test_run_agent_rejects_unavailable_required_tool(monkeypatch):

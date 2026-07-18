@@ -58,4 +58,5 @@ def test_no_repair_config_sets_single_pass_limits():
     assert config["_limits"] == {
         "max_verify_attempts": 1,
         "max_solver_answers": 1,
+        "max_formalizer_invalid_attempts": 1,
     }

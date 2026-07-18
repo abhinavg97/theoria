@@ -230,7 +230,11 @@ def _chat_completion(
         "max_completion_tokens",
         "temperature",
         "top_p",
+        "top_k",
+        "min_p",
         "seed",
+        "reasoning_effort",
+        "chat_template_kwargs",
         "frequency_penalty",
         "presence_penalty",
         "stop",
@@ -612,16 +616,25 @@ async def run_agent(
 
     messages = [dict(m) for m in _SESSIONS.get(session_id, [])]
     if not messages:
-        messages.append({
-            "role": "system",
-            "content": _agent_system_prompt(
-                system=system,
-                schema=schema,
-                search_enabled=search_enabled,
-                shell_enabled=shell_enabled,
-            ),
-        })
-    messages.append({"role": "user", "content": prompt})
+        instructions = _agent_system_prompt(
+            system=system,
+            schema=schema,
+            search_enabled=search_enabled,
+            shell_enabled=shell_enabled,
+        )
+        system_role = str(settings.get("system_role", "system"))
+        if system_role == "system":
+            messages.append({"role": "system", "content": instructions})
+            messages.append({"role": "user", "content": prompt})
+        elif system_role == "user":
+            messages.append({
+                "role": "user",
+                "content": f"{instructions}\n\nTask:\n{prompt}",
+            })
+        else:
+            raise ValueError("system_role must be 'system' or 'user'")
+    else:
+        messages.append({"role": "user", "content": prompt})
 
     events: list[dict] = [{"type": "thread.started", "thread_id": session_id}]
     stderr_lines: list[str] = []
@@ -642,11 +655,16 @@ async def run_agent(
     search_provider_requests = 0
     search_result_count = 0
     search_latency_ms = 0
+    json_action_reprompts = 0
+    role_schema_reprompts = 0
+    unknown_action_reprompts = 0
+    required_tool_reprompts = 0
 
     def missing_required_tools() -> list[str]:
         return sorted(set(required_tools) - successful_tools)
 
     def request_required_tools() -> bool:
+        nonlocal required_tool_reprompts
         missing = missing_required_tools()
         if not missing:
             return False
@@ -663,6 +681,7 @@ async def run_agent(
             "type": "policy.required_tools_missing",
             "missing_tools": missing,
         })
+        required_tool_reprompts += 1
         return True
 
     def build_metadata(*, failed: bool = False, error: Exception | None = None) -> dict:
@@ -723,6 +742,15 @@ async def run_agent(
             ),
             "missing_required_tools": missing_required_tools(),
             "required_tool_compliance": not missing_required_tools(),
+            "protocol_reprompt_count": (
+                json_action_reprompts
+                + role_schema_reprompts
+                + unknown_action_reprompts
+            ),
+            "json_action_reprompts": json_action_reprompts,
+            "role_schema_reprompts": role_schema_reprompts,
+            "unknown_action_reprompts": unknown_action_reprompts,
+            "required_tool_policy_reprompts": required_tool_reprompts,
             "role": role,
             "provider_responses": provider_responses,
             "provider_usage": [
@@ -840,6 +868,7 @@ async def run_agent(
             try:
                 action = _extract_json_object(content)
             except ValueError as exc:
+                json_action_reprompts += 1
                 stderr_lines.append(str(exc))
                 messages.append({
                     "role": "user",
@@ -871,6 +900,7 @@ async def run_agent(
                 # confuse those values with the agent loop's tool/final
                 # control protocol when the role payload needs correction.
                 if action.get("action") not in {"tool", "final"}:
+                    role_schema_reprompts += 1
                     messages.append({
                         "role": "user",
                         "content": (
@@ -889,6 +919,7 @@ async def run_agent(
                 try:
                     _validate_schema(candidate, schema)
                 except ValidationError as exc:
+                    role_schema_reprompts += 1
                     messages.append({
                         "role": "user",
                         "content": (
@@ -908,6 +939,7 @@ async def run_agent(
                 break
 
             if action.get("action") != "tool":
+                unknown_action_reprompts += 1
                 messages.append({
                     "role": "user",
                     "content": "Unknown action. Use action=\"tool\" or action=\"final\".",

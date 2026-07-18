@@ -21,6 +21,10 @@ test = [
 [project.scripts]
 theoria = "cli:main"
 
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
 [tool.setuptools]
 py-modules = [
     "pipeline",

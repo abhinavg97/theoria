@@ -84,7 +84,7 @@ is in `runs/artifacts/<run_id>/telemetry.json`. All are gitignored. See
 
 ### Reproducing the HLE results
 
-`theoria hle` runs the **audited default configuration**: every role on Codex except the formalizer (always Claude), `--docker`, the Sage image, and the default prompts. The preamble (the environment description handed to the solver and judges) is matched to the image automatically, so on the default Sage image they're told about Sage rather than the Debian sandbox. The published HLE v2 runs predate this and used the Debian preamble on the Sage image; pass `--no-pair-preamble` to reproduce them verbatim. (The HLE-Verified dataset is pulled live from Hugging Face and isn't version-pinned, so upstream dataset edits can shift results over time.) To run a span of problems:
+`theoria hle` runs the **audited default configuration**: every role on Codex except the formalizer (always Claude), `--docker`, the Sage image, and the default prompts. The preamble (the environment description handed to the solver and judges) is matched to the image automatically, so on the default Sage image they're told about Sage rather than the Debian sandbox. The published HLE v2 runs predate this and used the Debian preamble on the Sage image; pass `--no-pair-preamble` to reproduce them verbatim. HLE-Verified is loaded from the pinned revision recorded in `loaders.py`; an explicit revision override is also retained in run metadata. To run a span of problems:
 
 ```bash
 theoria hle --skip 100 --max 50 --tag myrun --watch
@@ -156,6 +156,13 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
+For open-weight publication experiments, use the frozen artifact audit,
+model matrix, cohort definitions, and exact commands in
+[`experiments/PUBLICATION_COOKBOOK.md`](experiments/PUBLICATION_COOKBOOK.md).
+The historical GPQA and poisoned-proof artifacts have important selection and
+control-specificity caveats documented there; do not use their headline counts
+without the audit.
+
 The test suite covers the pure-Python logic (config merging, proof serialization, run-file parsing) that doesn't need Docker, a Claude/Codex subscription, or network access — it runs in CI on every PR. It does not exercise the pipeline itself; that still needs a real run (`theoria custom "..."`).
 
 ---
@@ -164,12 +171,17 @@ The test suite covers the pure-Python logic (config merging, proof serialization
 
 - **The judges are LLMs.** Verification is looped LLM auditing plus real tool/code execution in the sandbox — not a fixed formal proof checker. It raises the bar far above a single model's say-so; it is not a theorem prover.
 - **The built-in `correct` flag is a naive substring check**, for scanning only. The real signals are the `verified` flag and `theoria grade`.
-- **Answers are extracted** as the first element of the proof's final state; occasionally a correct conclusion sits behind a placeholder. Read the proof, not just the headline.
+- **Answers are extracted** as the first element of the proof's final state. A
+  placeholder is incorrect under the publication protocol even if a proof body
+  contains a correct value; inspect the trace only for diagnosis.
 - Every run records its exact models, CLI versions, and sandbox image in `runs/artifacts/<run_id>/meta.json` for reproducibility.
 - Every call records normalized input/output/cache/reasoning usage, failures,
   retries, and explicit cost provenance. Unknown or partial cost remains null
   instead of being presented as a complete total.
-- **Grading.** The bundled `theoria grade` shows the LLM grader slightly more per-attempt context than the internal audit grader it's ported from, so its grades may differ marginally on borderline cases — the JUDGE-PASSED/REJECTED verdict itself is unaffected.
+- **Grading.** The bundled `theoria grade` uses a condition-neutral selected-
+  candidate rubric for paired R0/R1 evaluation. It intentionally hides internal
+  attempts and may differ from the paper's historical trace-aware audit on
+  borderline cases; the JUDGE-PASSED/REJECTED verdict itself is unaffected.
 
 ---
 
@@ -185,6 +197,11 @@ python paper/generate_figures.py                   # redraws all 9 figures from 
 ```
 
 > **Why the arXiv paper reports 105 certified (96/105 = 91.43%) and this repo reports 106 (96/106 = 90.57%): one problem, p134.** The frozen one-run audit certified p134 with an answer that disagrees with the key; this repo counts it as a certified miss. Its failure mode was traced to a pedantry-filter bug that was then fixed — re-run after the fix, p134 declines, and the arXiv paper reports that post-fix bucket. Beneath the counting question is a harder one: whether p134's answer is even wrong. The audit's two graders found no defense for it, but the same blind adjudication we applied to every disputed case later split toward Theoria's answer. We genuinely don't know — so we publish both counts and the full trace, and let you judge.
+
+The paper's 96/105 also credits p133 and p509 as extraction successes. The
+open-weight publication protocol grades the selected answer itself, so its
+strict historical comparator is 94/105; it reports 96/105 separately as the
+paper's original trace-aware definition.
 
 The complete per-problem traces (full proofs, every judge verdict, both graders' reasoning, and the HLE-Verified question/answer text) are published as a **public gated (auto approve)** Hugging Face dataset: **[i-eat-food/theoria-hle-audit](https://huggingface.co/datasets/i-eat-food/theoria-hle-audit)**. See [`DATA.md`](DATA.md) for provenance and licenses.
 

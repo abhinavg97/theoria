@@ -1,21 +1,22 @@
 """LLM-based answer grader.
 
 The pipeline's built-in `correct` flag is a naive substring match — fine for
-a quick scan. This grader is a stronger (LLM-judge) check: it
-shows an LLM grader the problem, the expected answer, the system's final
-answer, and every attempt, and asks whether they conceptually match
-(handling equivalent notations, algebraic forms, unordered sets, etc.).
+a quick scan. This grader is a stronger (LLM-judge) check: it shows an LLM
+grader the problem, expected answer, canonical rationale, and one selected
+candidate, and asks whether they conceptually match (handling equivalent
+notations, algebraic forms, unordered sets, etc.). Internal traces and the
+candidate's repair condition are hidden from the grader.
 
-It is a faithful port of the internal audit grader, decoupled from the audit
-database: it reads a run JSON directly instead of SQLite. Same prompt
-(grader_prompt.md), same structured output (key_match + dispute_category).
+It reads a sealed run JSON directly rather than the historical audit database.
+The condition-neutral prompt is intentionally stricter than the historical
+trace-aware grader so the same evaluator can compare R0 and R1 candidates.
 
 Output per problem:
-    final.key_match         — did the shipped answer match the key?
+    final.key_match         — did the selected answer match the key?
     final.dispute_category  — if not a plain match, why (convention,
                               interpretation, tighter_bound, edge_case,
-                              extraction, pipeline_drift, other, none)
-    attempts[].key_match    — same judgment per individual attempt
+                              other, none)
+    attempts               — always empty for condition-blind grading
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from pipeline import load_config
 from telemetry import aggregate_calls, load_pricing
 
 
-# ── Structured output schema (identical to the internal audit grader) ──
+# ── Structured output schemas ──
 
 ATTEMPT_GRADE_SCHEMA = {
     "type": "object",
@@ -65,7 +66,7 @@ FINAL_GRADE_SCHEMA = {
             "type": "string",
             "enum": [
                 "none", "convention", "interpretation", "tighter_bound",
-                "edge_case", "extraction", "pipeline_drift", "other",
+                "edge_case", "other",
             ],
         },
     },
@@ -76,7 +77,11 @@ GRADE_SCHEMA = {
     "type": "object",
     "properties": {
         "final": FINAL_GRADE_SCHEMA,
-        "attempts": {"type": "array", "items": ATTEMPT_GRADE_SCHEMA},
+        "attempts": {
+            "type": "array",
+            "maxItems": 0,
+            "items": ATTEMPT_GRADE_SCHEMA,
+        },
     },
     "required": ["final", "attempts"],
 }
@@ -111,13 +116,15 @@ SOLVER_GRADE_SCHEMA = {
 }
 
 FINAL_PROMPT_PATH = Path(__file__).parent / "grader_prompt.md"
+# R0 and R1 must use exactly the same condition-blind candidate rubric.
+FIRST_ATTEMPT_PROMPT_PATH = FINAL_PROMPT_PATH
 SOLVER_PROMPT_PATH = Path(__file__).parent / "grader_solver_prompt.md"
 DEFAULT_GRADER_CONFIG = str(Path(__file__).parent / "configs" / "audit_grader.yaml")
 
 
 def load_prompt(target: str = "final") -> tuple[str, str]:
     """Return the target-specific grader prompt and its full SHA-256."""
-    if target == "final":
+    if target in {"final", "first_attempt"}:
         path = FINAL_PROMPT_PATH
     elif target == "solver_initial":
         path = SOLVER_PROMPT_PATH
@@ -129,7 +136,7 @@ def load_prompt(target: str = "final") -> tuple[str, str]:
 
 
 def schema_for_target(target: str) -> dict:
-    if target == "final":
+    if target in {"final", "first_attempt"}:
         return GRADE_SCHEMA
     if target == "solver_initial":
         return SOLVER_GRADE_SCHEMA
@@ -219,7 +226,9 @@ def fetch_rationales(
 def _result_for_target(result: dict, target: str) -> dict:
     """Return the auditable view of a source result selected for grading."""
     if target == "final":
-        return dict(result)
+        view = dict(result)
+        view.update({"attempts": [], "grading_target": target})
+        return view
     if target == "solver_initial":
         solutions = result.get("solver_solutions") or []
         if not solutions or not str(solutions[0]).strip():
@@ -233,18 +242,62 @@ def _result_for_target(result: dict, target: str) -> dict:
             "grading_target": target,
         })
         return view
+    if target == "first_attempt":
+        repair = result.get("repair_metrics")
+        answer = repair.get("first_attempt_answer") if isinstance(repair, dict) else None
+        attempts = result.get("attempts") or []
+        selected_attempt = attempts[0] if attempts else None
+        if (
+            answer is None
+            or not str(answer).strip()
+            or not selected_attempt
+            or selected_attempt.get("phase") != "verify"
+        ):
+            raise RuntimeError("source result is missing a first formalized candidate")
+        view = dict(result)
+        view.update({
+            "answer": answer,
+            "attempts": [],
+            "verified": bool(repair.get("first_attempt_verified")),
+            "grading_target": target,
+        })
+        return view
     raise ValueError(f"unsupported grading target: {target}")
+
+
+def _target_is_missing(result: dict, target: str) -> bool:
+    if target == "solver_initial":
+        solutions = result.get("solver_solutions") or []
+        return not solutions or not str(solutions[0]).strip()
+    if target == "first_attempt":
+        try:
+            _result_for_target(result, target)
+        except RuntimeError:
+            return True
+        return False
+    value = result.get("answer")
+    return value is None or not str(value).strip()
+
+
+def _validate_grade_alignment(verdict: dict, target_result: dict) -> None:
+    attempts = verdict.get("attempts")
+    if not isinstance(attempts, list):
+        raise RuntimeError("grader verdict is missing an attempts array")
+    expected = list(range(len(target_result.get("attempts") or [])))
+    actual = [attempt.get("attempt_index") for attempt in attempts]
+    if actual != expected:
+        raise RuntimeError(
+            "grader attempt indices do not align with the selected source view: "
+            f"actual={actual}, expected={expected}"
+        )
 
 
 def format_input(result: dict, rationale: dict | None = None) -> str:
     """Format the per-problem context that goes to the grader.
 
-    Follows the internal audit grader's layout (problem / expected /
-    rationale / final answer / attempts). One intentional difference: each
-    attempt shows its full terminal state (the internal grader saw only the
-    final answer slot), so reproduced grades may differ marginally on
-    borderline cases. The HLE rationale block is fetched separately; for
-    custom questions it renders as "(no rationale available)".
+    The final and first-attempt views deliberately expose the same fields and
+    use the same labels. This keeps the external evaluator blind to the repair
+    condition. The source traces remain sealed for later human adjudication.
     """
     rat_text = (rationale or {}).get("rationale") or "(no rationale available)"
     riv = (rationale or {}).get("is_valid")
@@ -256,39 +309,27 @@ def format_input(result: dict, rationale: dict | None = None) -> str:
             f"rationale_is_valid={riv!r} rationale_error_type={ret!r})\n"
         )
 
+    def display(value: object, missing: str) -> str:
+        return missing if value is None or not str(value).strip() else str(value)
+
+    target = result.get("grading_target") or "final"
+    target_label = (
+        "INITIAL SOLVER RESPONSE:"
+        if target == "solver_initial" else "SELECTED CANDIDATE:"
+    )
     parts = [
         "PROBLEM TEXT:",
         result.get("problem") or "(missing)",
         "",
         "EXPECTED ANSWER:",
-        result.get("expected") or "(missing)",
+        display(result.get("expected"), "(missing)"),
         "",
         "HLE RATIONALE:",
         rationale_flags + rat_text,
         "",
-        "GRADE TARGET:",
-        result.get("grading_target") or "final",
-        "",
-        (
-            "INITIAL SOLVER RESPONSE:"
-            if result.get("grading_target") == "solver_initial"
-            else "SYSTEM FINAL ANSWER:"
-        ),
-        result.get("answer") or "(no final answer)",
-        "",
-        "SYSTEM ATTEMPTS:",
+        target_label,
+        display(result.get("answer"), "(no selected answer)"),
     ]
-    attempts = result.get("attempts") or []
-    if not attempts:
-        parts.append("(no attempts recorded)")
-    else:
-        for i, a in enumerate(attempts):
-            phase = a.get("phase") or "?"
-            all_ok = a.get("all_ok")
-            state, just = _attempt_summary(a)
-            parts.append(f"--- attempt {i} (phase={phase}, all_ok={all_ok}) ---")
-            parts.append(f"  state: {state}")
-            parts.append(f"  justification: {just}")
     return "\n".join(parts)
 
 
@@ -450,11 +491,12 @@ async def grade_run(
     out_path: str | None = None,
     *,
     target: str = "final",
+    missing_as_incorrect: bool = False,
     watch: bool = True,
     pricing_path: str | None = None,
 ) -> dict:
     """Grade a stable snapshot of every problem in a completed run."""
-    if target not in {"final", "solver_initial"}:
+    if target not in {"final", "first_attempt", "solver_initial"}:
         raise ValueError(f"unsupported grading target: {target}")
     source_path = Path(run_file).expanduser().resolve(strict=True)
     source_bytes, source_run_hash = _read_stable_snapshot(source_path)
@@ -528,6 +570,7 @@ async def grade_run(
         "automatic_grader": True,
         "manual_adjudication_included": False,
         "automatic_grade_is_authoritative": False,
+        "missing_target_as_incorrect": missing_as_incorrect,
     }
     meta = {
         "audit_schema_version": harness.AUDIT_SCHEMA_VERSION,
@@ -637,17 +680,41 @@ async def grade_run(
             verdict = None
             problem_error: Exception | None = None
             target_result: dict | None = None
+            grade_source = "llm"
             try:
-                target_result = _result_for_target(result, target)
-                verdict = await grade_one(
-                    target_result, config, prompt_text, rationales.get(pid),
-                    response_schema=response_schema, watch=watch,
-                )
+                missing_target = _target_is_missing(result, target)
+                if missing_as_incorrect and missing_target:
+                    target_result = dict(result)
+                    target_result.update({
+                        "answer": None,
+                        "attempts": [],
+                        "verified": None,
+                        "grading_target": target,
+                    })
+                    verdict = {
+                        "final": {
+                            "key_match": False,
+                            "reasoning": f"No {target} response was retained.",
+                            "dispute_category": "none",
+                        },
+                        "attempts": [],
+                    }
+                    grade_source = "deterministic_missing_target"
+                    (problem_artifact_dir / "deterministic_verdict.json").write_text(
+                        json.dumps(verdict, indent=2)
+                    )
+                else:
+                    target_result = _result_for_target(result, target)
+                    verdict = await grade_one(
+                        target_result, config, prompt_text, rationales.get(pid),
+                        response_schema=response_schema, watch=watch,
+                    )
                 final = verdict.get("final")
                 if not isinstance(final, dict) or not isinstance(
                     final.get("key_match"), bool
                 ):
                     raise RuntimeError("grader verdict is missing a valid final grade")
+                _validate_grade_alignment(verdict, target_result)
             except Exception as exc:
                 problem_error = exc
                 (problem_artifact_dir / "traceback.txt").write_text(
@@ -697,6 +764,7 @@ async def grade_run(
                 "answer": target_result.get("answer"),
                 "verified": target_result.get("verified"),
                 "target": target,
+                "grade_source": grade_source,
                 "grader_model": grader_model,
                 "grader_prompt_sha": prompt_sha,
                 "calls": calls,
@@ -800,8 +868,10 @@ if __name__ == "__main__":
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
     parser.add_argument(
-        "--target", choices=("final", "solver_initial"), default="final",
+        "--target", choices=("final", "first_attempt", "solver_initial"),
+        default="final",
     )
+    parser.add_argument("--missing-as-incorrect", action="store_true")
     parser.add_argument(
         "--watch", action=argparse.BooleanOptionalAction, default=True,
     )
@@ -809,5 +879,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     asyncio.run(grade_run(
         args.run_file, args.config, args.out,
-        target=args.target, watch=args.watch, pricing_path=args.pricing,
+        target=args.target, missing_as_incorrect=args.missing_as_incorrect,
+        watch=args.watch, pricing_path=args.pricing,
     ))

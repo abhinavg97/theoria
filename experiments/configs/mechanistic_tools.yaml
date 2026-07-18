@@ -1,6 +1,7 @@
-# Enforce role-level mechanistic checks in the provider-neutral loop.
-# These are experimental conditions and must be reported separately from runs
-# that only prompt models to use tools.
+# Tool-execution diagnostic for the provider-neutral loop. Report it separately
+# from prompt-only runs. A successful web_search returns snippets; it does not
+# establish that a primary source was fetched, so this overlay is not an
+# evidence-gated factual-verification or structured-repair condition.
 citation:
   required_tools:
     - web_search

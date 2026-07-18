@@ -178,6 +178,8 @@ def test_repair_metrics_track_certified_answer_flip():
 
     assert metrics["repair_enabled"] is True
     assert metrics["repair_attempted"] is True
+    assert metrics["semantic_repair_attempted"] is True
+    assert metrics["post_judge_repair_attempted"] is True
     assert metrics["judge_repair_rounds"] == 1
     assert metrics["first_attempt_verified"] is False
     assert metrics["certified_by_repair"] is True
@@ -185,6 +187,11 @@ def test_repair_metrics_track_certified_answer_flip():
     assert metrics["answer_before_repair"] == "41"
     assert metrics["final_answer"] == "42"
     assert metrics["answer_changed_during_repair"] is True
+    assert metrics["normalized_answer_changed_during_repair"] is True
+    assert metrics["answer_before_repair_sha256"] != metrics["final_answer_sha256"]
+    assert metrics["answer_before_repair_normalized_sha256"] != (
+        metrics["final_answer_normalized_sha256"]
+    )
 
 
 def test_repair_metrics_track_solver_retry():
@@ -213,6 +220,7 @@ def test_repair_metrics_track_solver_retry():
     )
 
     assert metrics["repair_attempted"] is True
+    assert metrics["semantic_repair_attempted"] is True
     assert metrics["solver_retries"] == 1
     assert metrics["formalizer_reject_count"] == 1
     assert metrics["certified_by_repair"] is True
@@ -221,6 +229,75 @@ def test_repair_metrics_track_solver_retry():
     assert metrics["answer_change_observable"] is False
     assert metrics["answer_changed_during_repair"] is None
     assert metrics["solver_solution_text_changed_during_repair"] is True
+
+
+def test_repair_metrics_count_failed_repair_before_second_verification():
+    metrics = _build_repair_metrics(
+        [
+            {
+                "phase": "verify",
+                "all_ok": False,
+                "proof": {
+                    "initial_state": ["ANSWER"],
+                    "steps": [{
+                        "state": ["41"],
+                        "justification_type": "computation",
+                        "justification": "incorrect",
+                    }],
+                },
+            },
+            {
+                "phase": "formalizer_invalid",
+                "reason": "repair response omitted its proof",
+            },
+        ],
+        max_verify=3,
+        max_solver=1,
+        solver_answers=1,
+        solver_solutions=["41"],
+        final_answer="41",
+        verified=False,
+    )
+
+    assert metrics["repair_attempted"] is True
+    assert metrics["judge_repair_rounds"] == 0
+    assert metrics["formalizer_invalid_count"] == 1
+    assert metrics["semantic_repair_attempted"] is True
+    assert metrics["post_judge_repair_attempted"] is True
+
+
+def test_repair_metrics_separate_formalizer_format_retry_from_semantic_repair():
+    metrics = _build_repair_metrics(
+        [
+            {
+                "phase": "formalizer_invalid",
+                "reason": "proof object missing",
+            },
+            {
+                "phase": "verify",
+                "all_ok": True,
+                "proof": {
+                    "initial_state": ["ANSWER"],
+                    "steps": [{
+                        "state": ["42"],
+                        "justification_type": "computation",
+                        "justification": "6 * 7 = 42",
+                    }],
+                },
+            },
+        ],
+        max_verify=3,
+        max_solver=1,
+        solver_answers=1,
+        solver_solutions=["42"],
+        final_answer="42",
+        verified=True,
+    )
+
+    assert metrics["repair_attempted"] is True
+    assert metrics["semantic_repair_attempted"] is False
+    assert metrics["formalizer_invalid_retry_attempted"] is True
+    assert metrics["certified_after_nonsemantic_retry"] is True
 
 
 def test_repair_metrics_normalize_non_string_final_answer():
@@ -248,6 +325,62 @@ def test_repair_metrics_normalize_non_string_final_answer():
     assert metrics["first_attempt_answer"] == "42"
     assert metrics["final_answer"] == "42"
     assert metrics["answer_changed_during_repair"] is False
+
+
+def test_repair_metrics_hashes_normalized_equivalent_answers():
+    proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": ["  Cafe\u0301  AU   LAIT "],
+            "justification_type": "citation",
+            "justification": "name",
+        }],
+    }
+    metrics = _build_repair_metrics(
+        [
+            {"phase": "verify", "all_ok": False, "proof": proof},
+            {"phase": "verify", "all_ok": True, "proof": proof},
+        ],
+        max_verify=2,
+        max_solver=1,
+        solver_answers=1,
+        solver_solutions=["answer"],
+        final_answer="caf\u00e9 au lait",
+        verified=True,
+    )
+
+    assert metrics["answer_changed_during_repair"] is True
+    assert metrics["normalized_answer_changed_during_repair"] is False
+    assert metrics["answer_before_repair_sha256"] != metrics["final_answer_sha256"]
+    assert metrics["answer_before_repair_normalized_sha256"] == (
+        metrics["final_answer_normalized_sha256"]
+    )
+
+
+def test_repair_metrics_ignore_answer_label_formatting_in_normalized_flip():
+    proof = {
+        "initial_state": ["ANSWER"],
+        "steps": [{
+            "state": ["ANSWER = (B)"],
+            "justification_type": "problem_given",
+            "justification": "selected option",
+        }],
+    }
+    metrics = _build_repair_metrics(
+        [
+            {"phase": "verify", "all_ok": False, "proof": proof},
+            {"phase": "verify", "all_ok": True, "proof": proof},
+        ],
+        max_verify=2,
+        max_solver=1,
+        solver_answers=1,
+        solver_solutions=["B"],
+        final_answer="B",
+        verified=True,
+    )
+
+    assert metrics["answer_changed_during_repair"] is True
+    assert metrics["normalized_answer_changed_during_repair"] is False
 
 
 def test_formalizer_schema_accepts_proof_without_reject_reason():
@@ -306,8 +439,10 @@ def test_formalizer_missing_proof_is_reprompted(monkeypatch):
     assert result["attempts"][1]["phase"] == "verify"
     assert [c["role"] for c in calls].count("formalizer") == 2
     assert result["repair_metrics"]["formalizer_invalid_count"] == 1
-    assert result["repair_metrics"]["repair_attempted"] is False
-    assert result["repair_metrics"]["first_attempt_verified"] is True
+    assert result["repair_metrics"]["repair_attempted"] is True
+    assert result["repair_metrics"]["first_attempt_verified"] is False
+    assert result["repair_metrics"]["certified_by_repair"] is True
+    assert result["repair_metrics"]["first_attempt_answer"] is None
 
 
 def test_run_records_repair_metrics_after_judge_repair(monkeypatch):

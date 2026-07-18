@@ -2,3 +2,4 @@
 _limits:
   max_verify_attempts: 1
   max_solver_answers: 1
+  max_formalizer_invalid_attempts: 1

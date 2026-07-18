@@ -80,6 +80,7 @@ def test_grade_run_captures_calls_and_reproducibility_artifacts(
         "automatic_grader": True,
         "manual_adjudication_included": False,
         "automatic_grade_is_authoritative": False,
+        "missing_target_as_incorrect": False,
     }
 
     root = Path(summary["artifact_root"])
@@ -150,6 +151,199 @@ def test_grade_run_can_grade_initial_solver_response(tmp_path, monkeypatch):
         solver_prompt
     )
     assert Path(summary["artifact_root"]).name.startswith("grade_solver_initial_")
+
+
+def test_grade_run_can_blindly_grade_first_formalized_candidate(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    first = {"phase": "verify", "all_ok": False, "proof": {"steps": []}}
+    later = {"phase": "verify", "all_ok": True, "proof": {"steps": []}}
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 2+2?",
+        "expected": "4",
+        "answer": "4",
+        "verified": True,
+        "attempts": [first, later],
+        "repair_metrics": {
+            "first_attempt_answer": "5",
+            "first_attempt_verified": False,
+        },
+    }]))
+
+    async def fake_grade_one(result, _config, _prompt_text, *_args, **_kwargs):
+        assert result["answer"] == "5"
+        assert result["attempts"] == []
+        return {
+            "final": {
+                "key_match": False,
+                "reasoning": "wrong",
+                "dispute_category": "none",
+            },
+            "attempts": [],
+        }
+
+    monkeypatch.setattr(grade, "grade_one", fake_grade_one)
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(
+        str(source), target="first_attempt", watch=False,
+    ))
+
+    assert summary["grading_target"] == "first_attempt"
+    assert summary["results"][0]["answer"] == "5"
+    assert Path(summary["artifact_root"]).name.startswith("grade_first_attempt_")
+
+
+def test_solver_baseline_can_count_missing_response_as_incorrect(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 2+2?",
+        "expected": "4",
+        "answer": None,
+        "verified": False,
+        "solver_solutions": [],
+        "error": "provider timed out",
+    }]))
+    monkeypatch.setattr(
+        grade,
+        "grade_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing response must not call a grader")
+        ),
+    )
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(
+        str(source),
+        target="solver_initial",
+        missing_as_incorrect=True,
+        watch=False,
+    ))
+
+    assert summary["key_match"] == 0
+    assert summary["evaluation_policy"]["missing_target_as_incorrect"] is True
+    row = summary["results"][0]
+    assert row["grade_source"] == "deterministic_missing_target"
+    assert row["final"]["key_match"] is False
+    assert row["calls"] == []
+    root = Path(summary["artifact_root"])
+    assert list(root.glob("problem_*/deterministic_verdict.json"))
+
+
+def test_solver_baseline_uses_only_initial_response_for_missing_policy(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 2+2?",
+        "expected": "4",
+        "answer": "4",
+        "verified": True,
+        "solver_solutions": ["", "4"],
+    }]))
+    monkeypatch.setattr(
+        grade,
+        "grade_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing initial response must not call a grader")
+        ),
+    )
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(
+        str(source), target="solver_initial", missing_as_incorrect=True,
+        watch=False,
+    ))
+
+    assert summary["results"][0]["grade_source"] == "deterministic_missing_target"
+
+
+def test_final_grade_can_count_missing_response_as_incorrect(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 2+2?",
+        "expected": "4",
+        "answer": None,
+        "verified": False,
+    }]))
+    monkeypatch.setattr(
+        grade,
+        "grade_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing final response must not call a grader")
+        ),
+    )
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(
+        str(source), target="final", missing_as_incorrect=True, watch=False,
+    ))
+
+    assert summary["results"][0]["grade_source"] == "deterministic_missing_target"
+
+
+def test_numeric_zero_is_not_treated_as_a_missing_final_response(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 1-1?",
+        "expected": "0",
+        "answer": 0,
+        "verified": True,
+    }]))
+    called = False
+
+    async def fake_grade_one(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {
+            "final": {
+                "key_match": True,
+                "reasoning": "exact",
+                "dispute_category": "none",
+            },
+            "attempts": [],
+        }
+
+    monkeypatch.setattr(grade, "grade_one", fake_grade_one)
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    asyncio.run(grade.grade_run(
+        str(source), target="final", missing_as_incorrect=True, watch=False,
+    ))
+
+    assert called is True
 
 
 def test_malformed_verdict_fails_only_its_problem(tmp_path, monkeypatch):

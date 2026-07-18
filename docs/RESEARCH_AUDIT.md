@@ -83,6 +83,11 @@ at run start and marks runtime identity incomplete unless the live catalog
 model/version, deployment etag, running state, and upgrade policy match the
 declarations.
 
+Provider-neutral runs also retain `system_role`, `temperature`, `top_p`,
+`top_k`, `min_p`, `seed`, `reasoning_effort`, and chat-template settings when
+configured. This matters for reasoning models whose published protocol forbids
+a system role or distinguishes thinking from non-thinking mode.
+
 ## Call evidence
 
 Every successful or failed call has a `call_NNN_<role>/` directory containing
@@ -128,8 +133,21 @@ grades are explicitly marked non-authoritative; manual adjudication remains a
 separate research artifact and must be joined by problem ID for headline paper
 numbers.
 The grading target is explicit in metadata. `final` grades the shipped answer;
-`solver_initial` grades the first retained solver response from the same sealed
-run and fails closed for a problem if that response is unavailable.
+`first_attempt` grades the answer selected by the first semantic
+formalize-and-verify attempt; and `solver_initial` grades the first retained
+solver response from the same sealed run. Final and first-attempt grading use
+the identical condition-neutral rubric, and the evaluator receives neither the
+target name nor internal verification/repair traces. A missing selected response
+fails its grade row by default. Explicit `--missing-as-incorrect`
+intent-to-treat policy records a deterministic wrong grade instead and makes no
+model call.
+
+Local JSON benchmarks carry the SHA-256 of the complete source file into every
+problem record. Repair metrics retain exact and NFKC/case/whitespace-normalized
+before/after answer hashes so answer flips can be audited without relying on a
+display-only comparison. `repair_attempted` records any current-loop retry;
+`semantic_repair_attempted`, post-judge activity, formalizer-invalid retries,
+provider retries, and action/schema reprompts remain separate fields.
 
 ## Integrity and release checklist
 
@@ -142,8 +160,17 @@ original package inventory instead of running `pip freeze` again.
 
 Before using a run in a paper table:
 
-1. Require `meta.json.status == "completed"` and matching requested/completed
-   counts. Treat `completed_with_errors` as incomplete for headline results.
+1. For a pipeline run, require `meta.json.status` to be `completed` or
+   `completed_with_errors`, matching requested/completed counts, one sealed
+   result row per requested problem, and a valid artifact manifest. Under the
+   preregistered intent-to-treat policy, per-problem execution errors in a
+   `completed_with_errors` pipeline run are declines and remain in the
+   denominator. `failed` or `interrupted` pipeline runs, missing result rows,
+   and unsealed artifacts are incomplete and ineligible. Report execution-error
+   counts and any missing repair telemetry explicitly; do not silently impute
+   repair-process totals. A grading run used for precision must have status
+   `completed`: a grader failure is a missing outcome label, not a Theoria
+   decline, and must be rerun or resolved by the frozen adjudication policy.
 2. Prefer a clean Git state; otherwise archive the retained patch and
    untracked files identified by hash.
 3. Verify immutable model provenance, especially for remote deployments.

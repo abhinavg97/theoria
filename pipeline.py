@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -691,6 +693,27 @@ def _answer_from_proof_dict(proof_dict: dict | None) -> str | None:
     return str(state[0])
 
 
+def _normalize_answer_for_fingerprint(value: str) -> str:
+    normalized = " ".join(
+        unicodedata.normalize("NFKC", value).casefold().split()
+    ).strip(" .")
+    normalized = re.sub(
+        r"^(?:final\s+)?answer\s*(?:(?:is\s+)|[=:]\s*)",
+        "",
+        normalized,
+    ).strip(" .")
+    choice = re.fullmatch(r"[\[(]?([a-d])[\])\].:]?", normalized)
+    return choice.group(1) if choice else normalized
+
+
+def _answer_fingerprints(value: str | None) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    exact = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    normalized = _normalize_answer_for_fingerprint(value)
+    return exact, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _build_repair_metrics(
     attempts: list[dict],
     *,
@@ -705,17 +728,14 @@ def _build_repair_metrics(
     verify_attempt_records = [
         attempt for attempt in attempts if attempt.get("phase") == "verify"
     ]
-    # Invalid structured output is a protocol retry, not semantic repair.
-    # The first semantic event is either a proof verification or a formalizer
-    # rejection that sends the solver back for a genuinely new answer.
-    first_semantic_attempt = next((
-        attempt for attempt in attempts
-        if attempt.get("phase") in {"formalizer_reject", "verify"}
-    ), None)
+    # R0 permits one formalizer output. A schema-valid but incomplete proof is
+    # therefore a first-attempt decline; any guided correction belongs to R1.
+    # Lower-level JSON/action reprompts inside one provider-neutral role call are
+    # counted separately in call telemetry because the pipeline never sees them.
+    first_attempt = attempts[0] if attempts else None
     first_verify = (
-        first_semantic_attempt
-        if first_semantic_attempt
-        and first_semantic_attempt.get("phase") == "verify"
+        first_attempt
+        if first_attempt and first_attempt.get("phase") == "verify"
         else None
     )
     first_attempt_answer = _answer_from_proof_dict(
@@ -728,7 +748,26 @@ def _build_repair_metrics(
     verify_attempts = len(verify_attempt_records)
     solver_retries = max(0, solver_answers - 1)
     judge_repair_rounds = max(0, verify_attempts - 1)
-    repair_attempted = bool(judge_repair_rounds or solver_retries)
+    post_first_attempt_activity = len(attempts) > 1
+    post_judge_repair_attempted = any(
+        attempt.get("phase") == "verify"
+        and attempt.get("all_ok") is False
+        and index + 1 < len(attempts)
+        for index, attempt in enumerate(attempts)
+    )
+    semantic_repair_attempted = bool(
+        solver_retries or post_judge_repair_attempted
+    )
+    formalizer_invalid_count = sum(
+        1 for attempt in attempts
+        if attempt.get("phase") == "formalizer_invalid"
+    )
+    formalizer_invalid_retry_attempted = bool(
+        formalizer_invalid_count and post_first_attempt_activity
+    )
+    repair_attempted = bool(
+        semantic_repair_attempted or post_first_attempt_activity
+    )
     answer_change_observable = bool(
         not repair_attempted
         or (
@@ -749,6 +788,17 @@ def _build_repair_metrics(
         and len(solver_solutions) > 1
         and solver_solutions[0].strip() != solver_solutions[-1].strip()
     )
+    first_exact_hash, first_normalized_hash = _answer_fingerprints(
+        first_attempt_answer
+    )
+    final_exact_hash, final_normalized_hash = _answer_fingerprints(
+        normalized_final_answer
+    )
+    normalized_answer_changed = None
+    if not repair_attempted:
+        normalized_answer_changed = False
+    elif answer_change_observable:
+        normalized_answer_changed = first_normalized_hash != final_normalized_hash
 
     return {
         "repair_enabled": max_verify > 1 or max_solver > 1,
@@ -763,21 +813,34 @@ def _build_repair_metrics(
             1 for attempt in attempts
             if attempt.get("phase") == "formalizer_reject"
         ),
-        "formalizer_invalid_count": sum(
-            1 for attempt in attempts
-            if attempt.get("phase") == "formalizer_invalid"
-        ),
+        "formalizer_invalid_count": formalizer_invalid_count,
         "judge_repair_rounds": judge_repair_rounds,
+        "post_judge_repair_attempted": post_judge_repair_attempted,
+        "semantic_repair_attempted": semantic_repair_attempted,
+        "formalizer_invalid_retry_attempted": (
+            formalizer_invalid_retry_attempted
+        ),
         "first_attempt_verified": first_attempt_verified,
         "final_verified": bool(verified),
         "certified_by_repair": bool(
             verified and repair_attempted and not first_attempt_verified
         ),
+        "certified_after_nonsemantic_retry": bool(
+            verified
+            and repair_attempted
+            and not first_attempt_verified
+            and not semantic_repair_attempted
+        ),
         "first_attempt_answer": first_attempt_answer,
         "answer_before_repair": first_attempt_answer if repair_attempted else None,
         "final_answer": normalized_final_answer,
+        "answer_before_repair_sha256": first_exact_hash,
+        "answer_before_repair_normalized_sha256": first_normalized_hash,
+        "final_answer_sha256": final_exact_hash,
+        "final_answer_normalized_sha256": final_normalized_hash,
         "answer_change_observable": answer_change_observable,
         "answer_changed_during_repair": answer_changed,
+        "normalized_answer_changed_during_repair": normalized_answer_changed,
         "solver_solution_text_changed_during_repair": solver_solution_text_changed,
     }
 

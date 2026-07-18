@@ -23,7 +23,7 @@ def test_make_save_path_with_tag(tmp_path, monkeypatch):
 
     path = make_save_path("hle", tag="myrun")
 
-    assert re.fullmatch(r"runs/hle_myrun_\d{8}_\d{6}\.json", path)
+    assert re.fullmatch(r"runs/hle_myrun_\d{8}_\d{6}_\d{6}\.json", path)
     assert (tmp_path / "runs").is_dir()
 
 
@@ -32,7 +32,7 @@ def test_make_save_path_without_tag(tmp_path, monkeypatch):
 
     path = make_save_path("custom")
 
-    assert re.fullmatch(r"runs/custom_\d{8}_\d{6}\.json", path)
+    assert re.fullmatch(r"runs/custom_\d{8}_\d{6}_\d{6}\.json", path)
 
 
 def test_make_save_path_resume_reuses_existing_id(tmp_path, monkeypatch):
@@ -74,6 +74,11 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(
             "prompt": "Solve carefully.",
             "preamble": True,
             "temperature": 0,
+            "top_k": 20,
+            "min_p": 0.05,
+            "reasoning_effort": "high",
+            "system_role": "user",
+            "chat_template_kwargs": {"enable_thinking": True},
             "max_tokens": 1024,
         },
     }
@@ -91,6 +96,7 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(
         "cli_args": {
             "category": "Math",
             "resume": "prior-run",
+            "run_path_file": "runs/pointers/latest.txt",
             "api_key": "cli-secret",
         },
     })
@@ -106,6 +112,13 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(
     assert audit["config_sha256"]
     assert audit["config_source_fingerprints"][0]["sha256"]
     assert audit["role_model_manifest"]["solver"]["model"] == "qwen-test"
+    assert audit["role_model_manifest"]["solver"]["top_k"] == 20
+    assert audit["role_model_manifest"]["solver"]["min_p"] == 0.05
+    assert audit["role_model_manifest"]["solver"]["reasoning_effort"] == "high"
+    assert audit["role_model_manifest"]["solver"]["system_role"] == "user"
+    assert audit["role_model_manifest"]["solver"]["chat_template_kwargs"] == {
+        "enable_thinking": True,
+    }
     assert audit["role_model_manifest"]["solver"]["settings_sha256"]
     assert audit["prompt_fingerprints"]["solver"]["preamble_enabled"] is True
     assert audit["prompt_fingerprints"]["solver"]["prompt_chars"] == len(
@@ -115,6 +128,7 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(
     assert audit["run_args"]["cli_args"]["api_key"] == "<redacted>"
     assert "resume" not in audit["run_args_identity"]
     assert "resume" not in audit["run_args_identity"]["cli_args"]
+    assert "run_path_file" not in audit["run_args_identity"]["cli_args"]
     assert audit["sandbox_request_identity"] == {
         "enabled": True,
         "image": "theoria-sandbox:latest",

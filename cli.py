@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -98,6 +99,10 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
              "timing and rate limits; the value is recorded in run metadata.",
     )
     g.add_argument("--tag", default=None, help="Label for the results file.")
+    g.add_argument(
+        "--run-path-file", default=None, metavar="PATH",
+        help="After a sealed run completes, atomically write its JSON path here.",
+    )
     g.add_argument(
         "--experiment-id", default=None,
         help="Stable experiment/condition identifier recorded in audit metadata.",
@@ -192,6 +197,13 @@ def _run(problems, prefix, args, *, by_category=False):
     print(f"Saving to {save_path}\n")
     results = asyncio.run(harness.run_problems(problems, args.parallel, save_path))
     harness.print_summary(results, by_category=by_category)
+    if args.run_path_file:
+        pointer = Path(args.run_path_file)
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        temporary = pointer.with_name(pointer.name + ".tmp")
+        temporary.write_text(str(Path(save_path).resolve()) + "\n")
+        os.replace(temporary, pointer)
+        print(f"Run path written to {pointer}")
 
 
 # ── Commands ──────────────────────────────────────────────────────
@@ -222,7 +234,10 @@ def cmd_hle(args) -> None:
             problems.extend(sel)
     elif args.ids:
         ids = [s.strip() for s in args.ids.split(",")]
-        problems = loaders.load_hle(ids=ids, revision=args.dataset_revision)
+        try:
+            problems = loaders.load_hle(ids=ids, revision=args.dataset_revision)
+        except ValueError as exc:
+            sys.exit(str(exc))
     elif args.max is not None:
         if args.max <= 0:
             sys.exit("--max must be a positive integer.")
@@ -238,6 +253,21 @@ def cmd_hle(args) -> None:
             "  theoria hle --max 10   # the first 10"
         )
     _run(problems, "hle", args, by_category=True)
+
+
+def cmd_benchmark(args) -> None:
+    if args.ids and args.max is not None:
+        sys.exit("use either --ids or --max, not both")
+    if args.max is not None and args.max < 1:
+        sys.exit("--max must be a positive integer")
+    ids = [value.strip() for value in args.ids.split(",")] if args.ids else None
+    try:
+        problems = loaders.load_json_benchmark(
+            args.path, ids=ids, max_questions=args.max,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        sys.exit(str(exc))
+    _run(problems, "benchmark", args, by_category=True)
 
 
 def cmd_show(args) -> None:
@@ -279,6 +309,7 @@ def cmd_grade(args) -> None:
         args.config,
         args.out,
         target=args.target,
+        missing_as_incorrect=args.missing_as_incorrect,
         watch=args.watch,
         pricing_path=args.pricing,
     ))
@@ -591,6 +622,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_options(h)
     h.set_defaults(func=cmd_hle)
 
+    b = sub.add_parser(
+        "benchmark", help="Run a frozen local JSON benchmark file.",
+    )
+    b.add_argument("path", help="JSON list or object containing a problems list.")
+    b.add_argument("--ids", help="Comma-separated problem ids in requested order.")
+    b.add_argument("--max", type=int, default=None, help="Run the first N rows.")
+    add_run_options(b)
+    b.set_defaults(func=cmd_benchmark)
+
     s = sub.add_parser("show", help="Render a run JSON as readable markdown.")
     s.add_argument("run_file", help="Path to a run JSON.")
     s.add_argument("--label", default=None, help="Filename stem (default: problem id).")
@@ -605,8 +645,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Grader config YAML (default: configs/audit_grader.yaml).")
     g.add_argument("--out", default=None, help="Output grades JSON path.")
     g.add_argument(
-        "--target", choices=("final", "solver_initial"), default="final",
+        "--target", choices=("final", "first_attempt", "solver_initial"),
+        default="final",
         help="Answer to grade from the sealed run (default: final).",
+    )
+    g.add_argument(
+        "--missing-as-incorrect", action="store_true",
+        help="Count a missing selected response as an audited incorrect grade "
+             "instead of failing that grade row.",
     )
     g.add_argument(
         "--watch", action=argparse.BooleanOptionalAction, default=True,

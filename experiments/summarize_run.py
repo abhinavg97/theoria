@@ -7,11 +7,20 @@ import argparse
 import hashlib
 import json
 import math
+import random
 from collections import Counter
 from pathlib import Path
 
 import harness
-from grade import FINAL_PROMPT_PATH, SOLVER_PROMPT_PATH
+from grade import (
+    FINAL_PROMPT_PATH,
+    FIRST_ATTEMPT_PROMPT_PATH,
+    SOLVER_PROMPT_PATH,
+)
+
+
+BOOTSTRAP_SEED = 20260718
+BOOTSTRAP_RESAMPLES = 10_000
 
 
 def _sha256(path: Path) -> str:
@@ -38,12 +47,63 @@ def _rate(k: int, n: int) -> dict:
     }
 
 
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _paired_bootstrap_interval(
+    records: list[tuple[bool, bool, bool, bool]],
+    statistic,
+    *,
+    seed_offset: int = 0,
+) -> list[float] | None:
+    if not records:
+        return None
+    generator = random.Random(BOOTSTRAP_SEED + seed_offset)
+    estimates = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        sample = [records[generator.randrange(len(records))] for _ in records]
+        value = statistic(sample)
+        if value is not None:
+            estimates.append(value)
+    low = _percentile(estimates, 0.025)
+    high = _percentile(estimates, 0.975)
+    return [low, high] if low is not None and high is not None else None
+
+
+def _mcnemar_exact(before: list[bool], after: list[bool]) -> dict:
+    if len(before) != len(after):
+        raise ValueError("paired outcomes must have equal lengths")
+    lost = sum(left and not right for left, right in zip(before, after))
+    gained = sum(not left and right for left, right in zip(before, after))
+    discordant = lost + gained
+    if discordant == 0:
+        p_value = 1.0
+    else:
+        tail = sum(
+            math.comb(discordant, index)
+            for index in range(min(lost, gained) + 1)
+        ) / (2 ** discordant)
+        p_value = min(1.0, 2 * tail)
+    return {
+        "lost": lost,
+        "gained": gained,
+        "discordant": discordant,
+        "two_sided_exact_p": p_value,
+    }
+
+
 def _strict_correct(grade_result: dict) -> bool:
-    final = grade_result.get("final") or {}
-    return bool(
-        final.get("key_match")
-        or final.get("dispute_category") == "extraction"
-    )
+    return _key_match(grade_result)
 
 
 def _key_match(grade_result: dict) -> bool:
@@ -53,7 +113,8 @@ def _key_match(grade_result: dict) -> bool:
 def _favorable_correct(grade_result: dict) -> bool:
     final = grade_result.get("final") or {}
     return _strict_correct(grade_result) or final.get("dispute_category") in {
-        "convention", "interpretation", "tighter_bound", "edge_case", "other",
+        "convention", "interpretation", "tighter_bound", "edge_case",
+        "extraction", "pipeline_drift", "other",
     }
 
 
@@ -66,7 +127,7 @@ def _load_sealed_run(path: Path) -> tuple[list[dict], dict, str]:
         raise RuntimeError("run JSON must contain an object or list of objects")
     root = path.parent / "artifacts" / path.stem
     meta = json.loads((root / "meta.json").read_text())
-    if meta.get("status") != "completed":
+    if meta.get("status") not in {"completed", "completed_with_errors"}:
         raise RuntimeError(f"source run is not complete: {meta.get('status')!r}")
     manifest = harness.verify_artifact_manifest(str(root))
     source_sha = _sha256(path)
@@ -111,8 +172,12 @@ def _load_grades(
                 artifact_root = Path(summary["artifact_root"]).resolve()
         manifest = harness.verify_artifact_manifest(str(artifact_root))
         meta = json.loads((artifact_root / "meta.json").read_text())
-        if meta.get("status") != "completed":
+        if meta.get("status") not in {"completed", "completed_with_errors"}:
             raise RuntimeError(f"grade run is not complete: {path}")
+        if (meta.get("research_audit") or {}).get(
+            "model_runtime_identity_complete"
+        ) is not True:
+            raise RuntimeError(f"grader model runtime identity is incomplete: {path}")
         matching_entries = [
             entry for entry in manifest.get("entries") or []
             if entry.get("external")
@@ -122,9 +187,11 @@ def _load_grades(
             raise RuntimeError(f"grade file is not uniquely sealed: {path}")
         if matching_entries[0].get("sha256") != _sha256(path):
             raise RuntimeError(f"grade file hash does not match its seal: {path}")
-        expected_prompt_path = (
-            FINAL_PROMPT_PATH if target == "final" else SOLVER_PROMPT_PATH
-        )
+        expected_prompt_path = {
+            "final": FINAL_PROMPT_PATH,
+            "first_attempt": FIRST_ATTEMPT_PROMPT_PATH,
+            "solver_initial": SOLVER_PROMPT_PATH,
+        }[target]
         expected_prompt_sha = _sha256(expected_prompt_path)
         if summary.get("grader_prompt_sha") != expected_prompt_sha:
             raise RuntimeError(f"unexpected grader prompt for {target}: {path}")
@@ -192,10 +259,194 @@ def _graded_metric(
     return output
 
 
+def _wrong_rates(graded_metric: dict[str, dict]) -> dict[str, dict]:
+    output = {}
+    for grader, values in graded_metric.items():
+        correct = values["strict_correct"]
+        output[grader] = _rate(
+            correct["denominator"] - correct["numerator"],
+            correct["denominator"],
+        )
+    return output
+
+
+def _wrong_rate_asymmetry(
+    certified_wrong: dict[str, dict], declined_wrong: dict[str, dict],
+) -> dict[str, float | None]:
+    output = {}
+    for grader in sorted(set(certified_wrong) & set(declined_wrong)):
+        certified = certified_wrong[grader]["value"]
+        declined = declined_wrong[grader]["value"]
+        output[grader] = (
+            declined / certified
+            if certified not in {None, 0} and declined is not None
+            else None
+        )
+    return output
+
+
+def _paired_correctness_transitions(
+    first_graders: dict[str, dict[str, dict]],
+    final_graders: dict[str, dict[str, dict]],
+    ids: list[str],
+) -> dict[str, dict]:
+    output = {}
+    grader_names = sorted(set(first_graders) & set(final_graders))
+    views = grader_names + (["all_graders_consensus"] if grader_names else [])
+    for grader in views:
+        counts = Counter()
+        for problem_id in ids:
+            first_rows = (
+                [first_graders[name][problem_id] for name in grader_names]
+                if grader == "all_graders_consensus"
+                else [first_graders[grader][problem_id]]
+            )
+            final_rows = (
+                [final_graders[name][problem_id] for name in grader_names]
+                if grader == "all_graders_consensus"
+                else [final_graders[grader][problem_id]]
+            )
+            observed = all(
+                row.get("grade_source") != "deterministic_missing_target"
+                and row.get("answer") is not None
+                and bool(str(row.get("answer")).strip())
+                for row in first_rows
+            )
+            before = all(_strict_correct(row) for row in first_rows)
+            after = all(_strict_correct(row) for row in final_rows)
+            before_label = (
+                "missing" if not observed
+                else "correct" if before
+                else "incorrect"
+            )
+            counts[
+                before_label
+                + "_to_"
+                + ("correct" if after else "incorrect")
+            ] += 1
+        output[grader] = {
+            "problems": len(ids),
+            "transition_counts": dict(sorted(counts.items())),
+            "incorrect_to_correct_rate": _rate(
+                counts["incorrect_to_correct"],
+                counts["incorrect_to_correct"] + counts["incorrect_to_incorrect"],
+            ),
+            "correct_to_incorrect_damage_rate": _rate(
+                counts["correct_to_incorrect"],
+                counts["correct_to_incorrect"] + counts["correct_to_correct"],
+            ),
+        }
+    return output
+
+
+def _paired_operating_point_changes(
+    ids: list[str],
+    r0_ids: set[str],
+    r1_ids: set[str],
+    first_graders: dict[str, dict[str, dict]],
+    final_graders: dict[str, dict[str, dict]],
+) -> dict:
+    coverage_records = [
+        (problem_id in r0_ids, problem_id in r1_ids, False, False)
+        for problem_id in ids
+    ]
+
+    def coverage_difference(sample):
+        return sum(r1 - r0 for r0, r1, _c0, _c1 in sample) / len(sample)
+
+    output = {
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "coverage_r1_minus_r0": {
+            "estimate": (len(r1_ids) - len(r0_ids)) / len(ids) if ids else None,
+            "paired_bootstrap_95": _paired_bootstrap_interval(
+                coverage_records, coverage_difference,
+            ),
+            "mcnemar": _mcnemar_exact(
+                [record[0] for record in coverage_records],
+                [record[1] for record in coverage_records],
+            ),
+        },
+        "by_grader": {},
+    }
+    grader_names = sorted(set(first_graders) & set(final_graders))
+    views = grader_names + (["all_graders_consensus"] if grader_names else [])
+    for offset, grader in enumerate(views, 1):
+        records = []
+        for problem_id in ids:
+            r0 = problem_id in r0_ids
+            r1 = problem_id in r1_ids
+            if grader == "all_graders_consensus":
+                first_correct = all(
+                    _strict_correct(first_graders[name][problem_id])
+                    for name in grader_names
+                )
+                final_correct = all(
+                    _strict_correct(final_graders[name][problem_id])
+                    for name in grader_names
+                )
+            else:
+                first_correct = _strict_correct(
+                    first_graders[grader][problem_id]
+                )
+                final_correct = _strict_correct(
+                    final_graders[grader][problem_id]
+                )
+            records.append((
+                r0,
+                r1,
+                r0 and first_correct,
+                r1 and final_correct,
+            ))
+
+        def correct_certified_rate_difference(sample):
+            return sum(c1 - c0 for _r0, _r1, c0, c1 in sample) / len(sample)
+
+        def precision_difference(sample):
+            r0_total = sum(r0 for r0, _r1, _c0, _c1 in sample)
+            r1_total = sum(r1 for _r0, r1, _c0, _c1 in sample)
+            if not r0_total or not r1_total:
+                return None
+            return (
+                sum(c1 for _r0, _r1, _c0, c1 in sample) / r1_total
+                - sum(c0 for _r0, _r1, c0, _c1 in sample) / r0_total
+            )
+
+        r0_total = len(r0_ids)
+        r1_total = len(r1_ids)
+        output["by_grader"][grader] = {
+            "correct_and_certified_rate_r1_minus_r0": {
+                "estimate": (
+                    sum(record[3] - record[2] for record in records) / len(records)
+                    if records else None
+                ),
+                "paired_bootstrap_95": _paired_bootstrap_interval(
+                    records, correct_certified_rate_difference, seed_offset=offset,
+                ),
+                "mcnemar": _mcnemar_exact(
+                    [record[2] for record in records],
+                    [record[3] for record in records],
+                ),
+            },
+            "certified_precision_r1_minus_r0": {
+                "estimate": (
+                    sum(record[3] for record in records) / r1_total
+                    - sum(record[2] for record in records) / r0_total
+                    if r0_total and r1_total else None
+                ),
+                "paired_bootstrap_95": _paired_bootstrap_interval(
+                    records, precision_difference, seed_offset=1000 + offset,
+                ),
+            },
+        }
+    return output
+
+
 def summarize(
     run_path: Path,
     final_grade_paths: list[Path],
     solver_grade_paths: list[Path],
+    first_grade_paths: list[Path] | None = None,
 ) -> dict:
     results, meta, source_sha = _load_sealed_run(run_path)
     ids = [str(row.get("id")) for row in results]
@@ -208,16 +459,40 @@ def summarize(
     solver_grades = _load_grades(
         solver_grade_paths, source_sha, "solver_initial", id_set,
     ) if solver_grade_paths else {}
+    first_grades = _load_grades(
+        first_grade_paths or [], source_sha, "first_attempt", id_set,
+    ) if first_grade_paths else {}
+    nonempty_grader_sets = [
+        set(graders) for graders in (final_grades, first_grades, solver_grades)
+        if graders
+    ]
+    if nonempty_grader_sets and any(
+        graders != nonempty_grader_sets[0] for graders in nonempty_grader_sets[1:]
+    ):
+        raise RuntimeError("grader identities differ across grading targets")
 
+    repair_rows = [
+        row["repair_metrics"] for row in results
+        if isinstance(row.get("repair_metrics"), dict)
+    ]
+    missing_repair_error_rows = [
+        row for row in results
+        if not isinstance(row.get("repair_metrics"), dict) and row.get("error")
+    ]
+    if len(repair_rows) + len(missing_repair_error_rows) != len(results):
+        raise RuntimeError("source run is missing repair metrics")
     r0_ids = {
         str(row.get("id")) for row in results
-        if (row.get("repair_metrics") or {}).get("first_attempt_verified")
+        if not row.get("error")
+        and isinstance(row.get("repair_metrics"), dict)
+        and row["repair_metrics"].get("first_attempt_verified")
     }
-    r1_ids = {str(row.get("id")) for row in results if row.get("verified")}
+    r1_ids = {
+        str(row.get("id")) for row in results
+        if not row.get("error") and row.get("verified")
+    }
+    declined_ids = id_set - r1_ids
     execution_errors = sum(bool(row.get("error")) for row in results)
-    repair_rows = [row.get("repair_metrics") or {} for row in results]
-    if any(not isinstance(row.get("repair_metrics"), dict) for row in results):
-        raise RuntimeError("source run is missing repair metrics")
     if any(not isinstance(row.get("metrics"), dict) for row in results):
         raise RuntimeError("source run is missing per-problem telemetry")
     repair_attempted = sum(bool(row.get("repair_attempted")) for row in repair_rows)
@@ -231,17 +506,75 @@ def summarize(
     research_audit = meta.get("research_audit") or {}
     run_args = research_audit.get("run_args") or {}
 
+    r0_precision = _graded_metric(first_grades, ids, r0_ids)
+    r1_precision = _graded_metric(final_grades, ids, r1_ids)
+    declined_accuracy = _graded_metric(final_grades, ids, declined_ids)
+    certified_wrong = _wrong_rates(r1_precision)
+    declined_wrong = _wrong_rates(declined_accuracy)
+    repaired_ids = r1_ids - r0_ids
+    repair_attempted_ids = [
+        str(row.get("id")) for row in results
+        if not row.get("error")
+        and isinstance(row.get("repair_metrics"), dict)
+        and row["repair_metrics"].get("repair_attempted")
+    ]
+
+    domains = {}
+    domain_names = sorted({str(row.get("category") or "unknown") for row in results})
+    for domain in domain_names:
+        domain_ids = {
+            str(row.get("id")) for row in results
+            if str(row.get("category") or "unknown") == domain
+        }
+        domains[domain] = {
+            "problems": len(domain_ids),
+            "solver_accuracy": _graded_metric(
+                solver_grades, ids, domain_ids, solver_only=True,
+            ),
+            "r0_coverage": _rate(len(r0_ids & domain_ids), len(domain_ids)),
+            "r0_certified_precision": _graded_metric(
+                first_grades, ids, r0_ids & domain_ids,
+            ),
+            "r1_coverage": _rate(len(r1_ids & domain_ids), len(domain_ids)),
+            "r1_certified_precision": _graded_metric(
+                final_grades, ids, r1_ids & domain_ids,
+            ),
+        }
+
     tools = Counter()
+    tool_status_counts = Counter()
     evidence_by_role: dict[str, Counter] = {}
+    web_search_providers: set[str] = set()
+    web_search_totals = Counter()
     usage_complete_calls = 0
     calls = 0
     required_tool_calls = 0
     compliant_required_tool_calls = 0
     required_tool_obligations = 0
     satisfied_required_tool_obligations = 0
+    protocol_reprompt_count = 0
+    json_action_reprompts = 0
+    role_schema_reprompts = 0
+    unknown_action_reprompts = 0
+    required_tool_policy_reprompts = 0
+    telemetry_totals = Counter()
+    calls_by_role = Counter()
+    calls_by_model = Counter()
+    partial_cost_usd = 0.0
+    partial_cost_rows = 0
     for row in results:
         metrics = row.get("metrics") or {}
         tools.update(metrics.get("tool_calls_by_name") or {})
+        tool_status_counts.update(metrics.get("tool_status_counts") or {})
+        web_search_providers.update(metrics.get("web_search_providers") or [])
+        for field in (
+            "web_search_requests", "web_search_attempts",
+            "web_search_provider_requests", "web_search_successes",
+            "web_search_failures", "web_search_client_failures",
+            "web_search_provider_failures", "web_search_result_count",
+            "web_search_total_latency_ms",
+        ):
+            web_search_totals[field] += int(metrics.get(field, 0) or 0)
         calls += int(metrics.get("num_calls", 0) or 0)
         usage_complete_calls += int(metrics.get("usage_complete_calls", 0) or 0)
         required_tool_calls += int(metrics.get("required_tool_calls", 0) or 0)
@@ -254,8 +587,60 @@ def summarize(
         satisfied_required_tool_obligations += int(
             metrics.get("satisfied_required_tool_obligations", 0) or 0
         )
+        protocol_reprompt_count += int(
+            metrics.get("protocol_reprompt_count", 0) or 0
+        )
+        json_action_reprompts += int(
+            metrics.get("json_action_reprompts", 0) or 0
+        )
+        role_schema_reprompts += int(
+            metrics.get("role_schema_reprompts", 0) or 0
+        )
+        unknown_action_reprompts += int(
+            metrics.get("unknown_action_reprompts", 0) or 0
+        )
+        required_tool_policy_reprompts += int(
+            metrics.get("required_tool_policy_reprompts", 0) or 0
+        )
+        for field in (
+            "successful_calls", "failed_calls", "total_call_invocations",
+            "failed_call_invocations", "resume_retry_count", "total_retries",
+            "problem_duration_ms", "total_llm_duration_ms",
+            "total_input_tokens", "total_output_tokens",
+            "total_cache_read_input_tokens", "total_tokens",
+            "usage_available_calls", "priced_calls",
+        ):
+            telemetry_totals[field] += int(metrics.get(field, 0) or 0)
+        calls_by_role.update(metrics.get("calls_by_role") or {})
+        calls_by_model.update(metrics.get("calls_by_model") or {})
+        if metrics.get("partial_cost_usd") is not None:
+            partial_cost_usd += float(metrics["partial_cost_usd"])
+            partial_cost_rows += 1
         for role, counts in (metrics.get("mechanistic_evidence_by_role") or {}).items():
             evidence_by_role.setdefault(role, Counter()).update(counts or {})
+
+    certification_stages: dict[str, set[str]] = {}
+    for row in results:
+        if row.get("error") or not row.get("verified"):
+            continue
+        metrics = row.get("repair_metrics") or {}
+        if metrics.get("first_attempt_verified"):
+            stage = "r0_first_attempt"
+        elif int(metrics.get("verify_attempts", 0) or 0) <= 1:
+            stage = "repair_before_first_verification"
+        else:
+            stage = f"verification_attempt_{int(metrics['verify_attempts'])}"
+        certification_stages.setdefault(stage, set()).add(str(row.get("id")))
+    certification_stage_report = {
+        stage: {
+            "new_certifications": len(stage_ids),
+            "marginal_coverage": _rate(len(stage_ids), len(results)),
+            "certified_precision": _graded_metric(
+                final_grades, ids, stage_ids,
+            ),
+        }
+        for stage, stage_ids in sorted(certification_stages.items())
+    }
 
     report = {
         "schema_version": 1,
@@ -286,6 +671,10 @@ def summarize(
             ),
             "execution_errors": execution_errors,
             "intent_to_treat_denominator": len(results),
+            "repair_metrics_complete_problems": len(repair_rows),
+            "repair_metrics_missing_execution_errors": len(
+                missing_repair_error_rows
+            ),
         },
         "solver_only": {
             "accuracy": _graded_metric(
@@ -295,17 +684,79 @@ def summarize(
         "operating_points": {
             "r0_first_pass": {
                 "coverage": _rate(len(r0_ids), len(results)),
-                "certified_precision": _graded_metric(final_grades, ids, r0_ids),
+                "certified_precision": r0_precision,
             },
             "r1_final": {
                 "coverage": _rate(len(r1_ids), len(results)),
-                "certified_precision": _graded_metric(final_grades, ids, r1_ids),
+                "certified_precision": r1_precision,
             },
         },
+        "paired_changes": _paired_operating_point_changes(
+            ids, r0_ids, r1_ids, first_grades, final_grades,
+        ),
+        "selection": {
+            "certified_wrong_rate": certified_wrong,
+            "declined_candidate_accuracy": declined_accuracy,
+            "declined_wrong_rate": declined_wrong,
+            "declined_to_certified_wrong_rate_ratio": _wrong_rate_asymmetry(
+                certified_wrong, declined_wrong,
+            ),
+        },
         "repair": {
+            "metric_scope": {
+                "complete_repair_metric_rows": len(repair_rows),
+                "missing_execution_error_rows": len(missing_repair_error_rows),
+                "note": (
+                    "Process counts use complete repair-metric rows and are lower "
+                    "bounds. Complete-case yield can be optimistic; the conservative "
+                    "yield treats every missing execution-error row as an attempted, "
+                    "uncertified repair. Coverage always uses the full ITT cohort."
+                ),
+            },
             "attempted": repair_attempted,
             "certified_by_repair": certified_by_repair,
+            "semantic_repair_attempted": sum(
+                bool(row.get("semantic_repair_attempted"))
+                for row in repair_rows
+            ),
+            "post_judge_repair_attempted": sum(
+                bool(row.get("post_judge_repair_attempted"))
+                for row in repair_rows
+            ),
+            "formalizer_invalid_retry_attempted": sum(
+                bool(row.get("formalizer_invalid_retry_attempted"))
+                for row in repair_rows
+            ),
+            "certified_after_nonsemantic_retry": sum(
+                bool(row.get("certified_after_nonsemantic_retry"))
+                for row in repair_rows
+            ),
             "yield": _rate(certified_by_repair, repair_attempted),
+            "yield_missing_errors_as_attempted": _rate(
+                certified_by_repair,
+                repair_attempted + len(missing_repair_error_rows),
+            ),
+            "certified_by_repair_precision": _graded_metric(
+                final_grades, ids, repaired_ids,
+            ),
+            "correctness_transitions": _paired_correctness_transitions(
+                first_grades, final_grades, repair_attempted_ids,
+            ),
+            "solver_retries": sum(
+                int(row.get("solver_retries", 0) or 0) for row in repair_rows
+            ),
+            "judge_repair_rounds": sum(
+                int(row.get("judge_repair_rounds", 0) or 0)
+                for row in repair_rows
+            ),
+            "formalizer_reject_count": sum(
+                int(row.get("formalizer_reject_count", 0) or 0)
+                for row in repair_rows
+            ),
+            "formalizer_invalid_count": sum(
+                int(row.get("formalizer_invalid_count", 0) or 0)
+                for row in repair_rows
+            ),
             "answer_changed": sum(
                 value is True
                 for value in (
@@ -317,9 +768,30 @@ def summarize(
                 and not row.get("answer_change_observable")
                 for row in repair_rows
             ),
+            "normalized_answer_changed": sum(
+                row.get("normalized_answer_changed_during_repair") is True
+                for row in repair_rows
+            ),
+            "certified_answer_flips": sum(
+                row.get("certified_by_repair")
+                and row.get("answer_changed_during_repair") is True
+                for row in repair_rows
+            ),
+            "certified_normalized_answer_flips": sum(
+                row.get("certified_by_repair")
+                and row.get("normalized_answer_changed_during_repair") is True
+                for row in repair_rows
+            ),
+            "judge_repair_round_distribution": dict(sorted(Counter(
+                int(row.get("judge_repair_rounds", 0) or 0)
+                for row in repair_rows
+            ).items())),
+            "certification_stage": certification_stage_report,
         },
+        "per_domain": domains,
         "mechanistic_evidence": {
             "tool_calls_by_name": dict(sorted(tools.items())),
+            "tool_status_counts": dict(sorted(tool_status_counts.items())),
             "by_role": {
                 role: dict(sorted(counts.items()))
                 for role, counts in sorted(evidence_by_role.items())
@@ -330,17 +802,76 @@ def summarize(
             "required_tool_obligation_compliance": _rate(
                 satisfied_required_tool_obligations, required_tool_obligations,
             ),
-            "note": "Tool counts are evidence of use, not proof of compliance.",
+            "web_search": {
+                **dict(sorted(web_search_totals.items())),
+                "providers": sorted(web_search_providers),
+                "mean_provider_latency_ms": (
+                    web_search_totals["web_search_total_latency_ms"]
+                    / web_search_totals["web_search_provider_requests"]
+                    if web_search_totals["web_search_provider_requests"]
+                    else None
+                ),
+            },
+            "fetched_source_urls_available": False,
+            "note": (
+                "Tool status is transport-level evidence. Search results are "
+                "snippet leads; this loop does not retain fetched source bodies."
+            ),
         },
         "telemetry": {
             "calls": calls,
+            "successful_calls": telemetry_totals["successful_calls"],
+            "failed_calls": telemetry_totals["failed_calls"],
+            "total_call_invocations": telemetry_totals[
+                "total_call_invocations"
+            ],
+            "failed_call_invocations": telemetry_totals[
+                "failed_call_invocations"
+            ],
+            "resume_retry_count": telemetry_totals["resume_retry_count"],
+            "total_retries": telemetry_totals["total_retries"],
+            "calls_by_role": dict(sorted(calls_by_role.items())),
+            "calls_by_model": dict(sorted(calls_by_model.items())),
+            "problem_duration_ms_sum": telemetry_totals[
+                "problem_duration_ms"
+            ],
+            "total_llm_duration_ms": telemetry_totals[
+                "total_llm_duration_ms"
+            ],
+            "total_input_tokens": telemetry_totals["total_input_tokens"],
+            "total_output_tokens": telemetry_totals["total_output_tokens"],
+            "total_cache_read_input_tokens": telemetry_totals[
+                "total_cache_read_input_tokens"
+            ],
+            "total_tokens": telemetry_totals["total_tokens"],
+            "usage_available_calls": telemetry_totals[
+                "usage_available_calls"
+            ],
             "usage_complete_calls": usage_complete_calls,
             "usage_complete_fraction": (
                 usage_complete_calls / calls if calls else None
             ),
+            "protocol_reprompt_count": protocol_reprompt_count,
+            "json_action_reprompts": json_action_reprompts,
+            "role_schema_reprompts": role_schema_reprompts,
+            "unknown_action_reprompts": unknown_action_reprompts,
+            "required_tool_policy_reprompts": required_tool_policy_reprompts,
+            "priced_calls": telemetry_totals["priced_calls"],
+            "cost_coverage_fraction": (
+                telemetry_totals["priced_calls"] / calls if calls else None
+            ),
+            "partial_cost_usd": (
+                partial_cost_usd if partial_cost_rows else None
+            ),
+            "total_cost_usd": (
+                partial_cost_usd
+                if calls and telemetry_totals["priced_calls"] == calls
+                else None
+            ),
         },
         "graders": {
             "final": sorted(final_grades),
+            "first_attempt": sorted(first_grades),
             "solver_initial": sorted(solver_grades),
             "automatic_grades_are_authoritative": False,
         },
@@ -383,10 +914,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run", type=Path)
     parser.add_argument("--final-grade", type=Path, action="append", default=[])
+    parser.add_argument("--first-grade", type=Path, action="append", default=[])
     parser.add_argument("--solver-grade", type=Path, action="append", default=[])
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    report = summarize(args.run, args.final_grade, args.solver_grade)
+    if args.out and args.out.exists():
+        raise SystemExit(f"output already exists: {args.out}")
+    report = summarize(
+        args.run, args.final_grade, args.solver_grade, args.first_grade,
+    )
     print_report(report)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

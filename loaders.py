@@ -14,7 +14,9 @@ parsing. The CLI (cli.py) wires these into the harness.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 
 HLE_DATASET_NAME = "skylenage/HLE-Verified"
@@ -102,7 +104,13 @@ def load_hle(
 
     if ids is not None:
         by_id = {problem["id"]: problem for problem in problems}
-        problems = [by_id[problem_id] for problem_id in ids if problem_id in by_id]
+        missing = [problem_id for problem_id in ids if problem_id not in by_id]
+        if missing:
+            raise ValueError(
+                "requested HLE ids are absent from the pinned text-only cohort: "
+                f"{missing}"
+            )
+        problems = [by_id[problem_id] for problem_id in ids]
     return problems
 
 
@@ -117,3 +125,78 @@ def build_question(question: str, problem_id: str = "question") -> list[dict]:
         "dataset": "custom",
         "dataset_name": "custom",
     }]
+
+
+def load_json_benchmark(
+    path: str | Path,
+    *,
+    ids: list[str] | None = None,
+    max_questions: int | None = None,
+) -> list[dict]:
+    """Load a local benchmark object/list without redistributing its text."""
+    source = Path(path).expanduser().resolve(strict=True)
+    raw = source.read_bytes()
+    payload = json.loads(raw)
+    metadata = (payload.get("metadata") or {}) if isinstance(payload, dict) else {}
+    if not isinstance(metadata, dict):
+        raise ValueError("benchmark metadata must be an object")
+    rows = payload.get("problems") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise ValueError("benchmark JSON must be a list or contain a problems list")
+    requested = set(ids) if ids is not None else None
+    validated_rows = []
+    source_ids = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"benchmark row {index} is not an object")
+        problem_id = str(row.get("id") or "").strip()
+        question = row.get("question")
+        if not problem_id or not isinstance(question, str) or not question.strip():
+            raise ValueError(f"benchmark row {index} needs nonempty id and question")
+        if problem_id in source_ids:
+            raise ValueError(f"benchmark contains duplicate id: {problem_id}")
+        source_ids.add(problem_id)
+        validated_rows.append((row, problem_id, question))
+
+    problems = []
+    for row, problem_id, question in validated_rows:
+        if requested is not None and problem_id not in requested:
+            continue
+        answer = row.get("answer")
+        problem = dict(row)
+        problem.update({
+            "id": problem_id,
+            "question": question,
+            "answer": "" if answer is None else str(answer),
+            "dataset": str(metadata.get("name") or row.get("dataset") or source.stem),
+            "dataset_name": str(
+                metadata.get("dataset_name")
+                or row.get("dataset_name")
+                or metadata.get("name")
+                or source.stem
+            ),
+            "dataset_source": str(
+                metadata.get("source") or row.get("dataset_source") or source
+            ),
+            "dataset_revision": str(
+                metadata.get("dataset_revision")
+                or row.get("dataset_revision")
+                or "local"
+            ),
+            "benchmark_file_sha256": hashlib.sha256(raw).hexdigest(),
+        })
+        for field in ("dataset_fingerprint", "dataset_config", "dataset_subset"):
+            value = metadata.get(field) or row.get(field)
+            if value is not None:
+                problem[field] = value
+        problems.append(problem)
+        if max_questions and len(problems) >= max_questions:
+            break
+    if requested is not None:
+        found = {problem["id"] for problem in problems}
+        missing = sorted(requested - found)
+        if missing:
+            raise ValueError(f"benchmark ids not found: {missing}")
+        by_id = {problem["id"]: problem for problem in problems}
+        problems = [by_id[problem_id] for problem_id in ids]
+    return problems

@@ -215,7 +215,12 @@ def _role_model_manifest(config: dict) -> dict:
             "effort": resolved.get("effort"),
             "temperature": resolved.get("temperature"),
             "top_p": resolved.get("top_p"),
+            "top_k": resolved.get("top_k"),
+            "min_p": resolved.get("min_p"),
             "seed": resolved.get("seed"),
+            "reasoning_effort": resolved.get("reasoning_effort"),
+            "system_role": resolved.get("system_role", "system"),
+            "chat_template_kwargs": resolved.get("chat_template_kwargs"),
             "max_tokens": resolved.get("max_tokens"),
             "max_completion_tokens": resolved.get("max_completion_tokens"),
             "context_length": resolved.get("context_length"),
@@ -639,6 +644,7 @@ def _run_args_identity(run_args: dict) -> dict:
     identity.pop("resume", None)
     if isinstance(identity.get("cli_args"), dict):
         identity["cli_args"].pop("resume", None)
+        identity["cli_args"].pop("run_path_file", None)
     return identity
 
 
@@ -1841,7 +1847,7 @@ def make_save_path(prefix: str, tag: str | None = None,
     os.makedirs("runs", exist_ok=True)
     if resume:
         return f"runs/{resume}.json"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     name = f"{prefix}_{tag}_{timestamp}" if tag else f"{prefix}_{timestamp}"
     return f"runs/{name}.json"
 
@@ -2147,6 +2153,11 @@ async def run_one(
     resume_retry_count = 0
     cached_calls = 0
     resumed_session_calls = 0
+    protocol_reprompt_count = 0
+    json_action_reprompts = 0
+    role_schema_reprompts = 0
+    unknown_action_reprompts = 0
+    required_tool_policy_reprompts = 0
     total_tool_calls = 0
     tool_calls_by_name: dict[str, int] = {}
     tool_calls_by_role: dict[str, dict[str, int]] = {}
@@ -2183,6 +2194,13 @@ async def run_one(
         resume_retry_count += int(c.get("resume_retry_count", 0) or 0)
         cached_calls += int(bool(c.get("resumed_from_cache")))
         resumed_session_calls += int(bool(c.get("resumed")))
+        protocol_reprompt_count += int(c.get("protocol_reprompt_count", 0) or 0)
+        json_action_reprompts += int(c.get("json_action_reprompts", 0) or 0)
+        role_schema_reprompts += int(c.get("role_schema_reprompts", 0) or 0)
+        unknown_action_reprompts += int(c.get("unknown_action_reprompts", 0) or 0)
+        required_tool_policy_reprompts += int(
+            c.get("required_tool_policy_reprompts", 0) or 0
+        )
         total_retries += int(c.get("retry_count", 0) or 0)
         in_tokens = c.get("input_tokens", 0) or 0
         out_tokens = c.get("output_tokens", 0) or 0
@@ -2327,6 +2345,11 @@ async def run_one(
         "unlogged_call_slots": unlogged_call_slots,
         "cached_calls": cached_calls,
         "resumed_session_calls": resumed_session_calls,
+        "protocol_reprompt_count": protocol_reprompt_count,
+        "json_action_reprompts": json_action_reprompts,
+        "role_schema_reprompts": role_schema_reprompts,
+        "unknown_action_reprompts": unknown_action_reprompts,
+        "required_tool_policy_reprompts": required_tool_policy_reprompts,
         "total_retries": total_retries,
         "calls_by_role": calls_by_role,
         "calls_by_model": calls_by_model,
@@ -2536,6 +2559,13 @@ def _aggregate_run_metrics(
         "cached_calls": sum_field("cached_calls"),
         "resumed_session_calls": sum_field("resumed_session_calls"),
         "total_retries": sum_field("total_retries"),
+        "protocol_reprompt_count": sum_field("protocol_reprompt_count"),
+        "json_action_reprompts": sum_field("json_action_reprompts"),
+        "role_schema_reprompts": sum_field("role_schema_reprompts"),
+        "unknown_action_reprompts": sum_field("unknown_action_reprompts"),
+        "required_tool_policy_reprompts": sum_field(
+            "required_tool_policy_reprompts"
+        ),
         "calls_by_role": merge_counts("calls_by_role"),
         "calls_by_model": merge_counts("calls_by_model"),
         "tokens_by_role": merge_counts("tokens_by_role"),

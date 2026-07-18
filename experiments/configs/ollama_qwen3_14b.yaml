@@ -1,5 +1,7 @@
 _model: &model
-  model: qwen3:14b
+  model: qwen3:14b-q8_0
+  model_revision: ollama-registry-manifest-sha256:304bf7349c71ad37a07eec8be67212b3f05b0f243f4a6f7c98e90dd2f3009f48
+  quantization: Q8_0
 
 solver: *model
 interpreter: *model
