@@ -1,0 +1,25 @@
+# Independent, version-pinned automatic grader. Azure resource:
+# gpt-5.4-20260305-theoria-grader, versionUpgradeOption=NoAutoUpgrade.
+audit_grader:
+  backend: theoria_agent
+  model: gpt-5.4-20260305-theoria-grader
+  model_source: azure-foundry
+  model_revision: "gpt-5.4:2026-03-05"
+  deployment_version: "etag-6b0d6b9f-273a-4247-89dd-51f92d9a8e70"
+  deployment_upgrade_policy: NoAutoUpgrade
+  azure_subscription_id: fd2d6c8b-1c2e-47c8-bc37-885d210aaba4
+  azure_resource_group: rg-soccer826-8608
+  azure_account: theoria-resource
+  dtype: provider-managed-undisclosed
+  quantization: provider-managed-undisclosed
+  server_hardware: azure-globalstandard-undisclosed
+  endpoint: https://theoria-resource.cognitiveservices.azure.com/openai/v1
+  api_key_env: AZURE_OPENAI_API_KEY
+  auth_header: api-key
+  max_turns: 8
+  max_completion_tokens: 4096
+  temperature: 0
+  search: true
+  allow_shell: false
+  allow_host_tools: false
+  preamble: false

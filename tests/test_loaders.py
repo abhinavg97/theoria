@@ -71,3 +71,24 @@ def test_hle_loader_pins_revision_and_records_fingerprint(monkeypatch):
     assert problems[0]["dataset_name"] == HLE_DATASET_NAME
     assert problems[0]["dataset_fingerprint"] == "resolved-fingerprint"
     assert problems[0]["dataset_config"] == "default"
+
+
+def test_hle_loader_preserves_explicit_id_order(monkeypatch):
+    rows = [{
+        "id": pid,
+        "question": f"Q-{pid}",
+        "answer": f"A-{pid}",
+        "category": "Math",
+        "Verified_Classes": "Gold subset",
+        "json": json.dumps({"image": None, "answer_type": "exact"}),
+    } for pid in ("first", "second", "third")]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        types.SimpleNamespace(load_dataset=lambda *_args, **_kwargs: rows),
+    )
+
+    problems = load_hle(ids=["third", "first"])
+
+    assert [problem["id"] for problem in problems] == ["third", "first"]

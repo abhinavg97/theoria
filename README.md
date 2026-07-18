@@ -115,11 +115,16 @@ theoria show runs/custom_<timestamp>.json        # one run file at a time
 # notations/forms) — a stronger check than the built-in `correct` substring
 # flag, though still an LLM judgment, not ground truth.
 theoria grade runs/hle_<timestamp>.json          # one run file at a time
+
+# Grade the initial solver response from the same sealed run.
+theoria grade runs/hle_<timestamp>.json --target solver_initial
 ```
 
 `theoria grade` writes per-problem `key_match` + `dispute_category` to `runs/grades/`.
 Its model calls use the same telemetry schema and artifact capture as pipeline
 runs.
+The default target is `final`; `--target solver_initial` grades the first
+retained solver response while preserving the source-run SHA-256 linkage.
 
 ---
 

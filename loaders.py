@@ -100,6 +100,9 @@ def load_hle(
         if max_questions and len(problems) >= max_questions:
             break
 
+    if ids is not None:
+        by_id = {problem["id"]: problem for problem in problems}
+        problems = [by_id[problem_id] for problem_id in ids if problem_id in by_id]
     return problems
 
 

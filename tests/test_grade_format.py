@@ -1,4 +1,14 @@
-from grade import _attempt_summary, format_input
+import pytest
+
+from jsonschema import ValidationError, validate
+
+from grade import (
+    SOLVER_GRADE_SCHEMA,
+    _attempt_summary,
+    _result_for_target,
+    format_input,
+    load_prompt,
+)
 
 
 def test_attempt_summary_formalizer_reject():
@@ -55,3 +65,54 @@ def test_format_input_includes_rationale_flags_when_present():
     assert "rationale_is_valid=False" in text
     assert "rationale_error_type='typo'" in text
     assert "--- attempt 0 (phase=verified, all_ok=True) ---" in text
+
+
+def test_solver_initial_target_uses_first_solver_response_only():
+    source = {
+        "answer": "repaired answer",
+        "verified": True,
+        "solver_solutions": ["initial answer", "repaired answer"],
+        "attempts": [{"phase": "verify"}],
+    }
+
+    result = _result_for_target(source, "solver_initial")
+    text = format_input(result)
+
+    assert result["answer"] == "initial answer"
+    assert result["verified"] is None
+    assert result["attempts"] == []
+    assert "GRADE TARGET:\nsolver_initial" in text
+    assert "INITIAL SOLVER RESPONSE:\ninitial answer" in text
+    assert "repaired answer" not in text
+
+
+def test_solver_initial_target_fails_closed_when_response_is_missing():
+    with pytest.raises(RuntimeError, match="missing an initial solver response"):
+        _result_for_target({"solver_solutions": []}, "solver_initial")
+
+
+def test_grading_targets_use_distinct_prompts():
+    final_prompt, final_sha = load_prompt("final")
+    solver_prompt, solver_sha = load_prompt("solver_initial")
+
+    assert "final shipped answer" in final_prompt
+    assert "solver-only baseline" in solver_prompt
+    assert "does not permit" in solver_prompt
+    assert final_sha != solver_sha
+
+
+def test_load_prompt_rejects_unknown_target():
+    with pytest.raises(ValueError, match="unsupported grading target"):
+        load_prompt("unknown")
+
+
+def test_solver_grade_schema_rejects_extraction_credit():
+    with pytest.raises(ValidationError):
+        validate({
+            "final": {
+                "key_match": False,
+                "reasoning": "placeholder",
+                "dispute_category": "extraction",
+            },
+            "attempts": [],
+        }, SOLVER_GRADE_SCHEMA)

@@ -217,6 +217,7 @@ def _role_model_manifest(config: dict) -> dict:
             "top_p": resolved.get("top_p"),
             "seed": resolved.get("seed"),
             "max_tokens": resolved.get("max_tokens"),
+            "max_completion_tokens": resolved.get("max_completion_tokens"),
             "context_length": resolved.get("context_length"),
             "max_turns": resolved.get("max_turns"),
             "search": resolved.get("search"),
@@ -364,6 +365,158 @@ def _probe_openai_compatible_models(config: dict) -> list[dict]:
     return probes
 
 
+def _probe_remote_models(config: dict) -> list[dict]:
+    """Verify declared remote model identity, including Azure control plane."""
+    grouped: dict[tuple[str, str], dict] = {}
+    for role, settings in _role_items(config):
+        resolved = _effective_role_settings(config, settings)
+        if resolved.get("backend") != "theoria_agent":
+            continue
+        endpoint = str(resolved.get("endpoint") or resolved.get("base_url") or "")
+        try:
+            hostname = urllib.parse.urlsplit(endpoint).hostname
+        except ValueError:
+            hostname = None
+        if hostname in {"localhost", "127.0.0.1", "::1"}:
+            continue
+        key = (endpoint, str(resolved.get("model")))
+        entry = grouped.setdefault(key, {"settings": resolved, "roles": []})
+        entry["roles"].append(role)
+
+    probes = []
+    for (endpoint, deployment), entry in sorted(grouped.items()):
+        settings = entry["settings"]
+        source = settings.get("model_source")
+        probe = {
+            "backend": "azure-foundry" if source == "azure-foundry" else "remote-declared",
+            "endpoint": _redact_url(endpoint),
+            "model": deployment,
+            "roles": sorted(entry["roles"]),
+            "declared_model_source": source,
+            "declared_model_revision": settings.get("model_revision"),
+            "declared_deployment_version": settings.get("deployment_version"),
+        }
+        if source != "azure-foundry":
+            probe.update({
+                "resolved": False,
+                "error_type": "UnverifiedRemoteModel",
+                "error": "remote model has no supported live control-plane probe",
+            })
+            probes.append(probe)
+            continue
+
+        resource_group = settings.get("azure_resource_group")
+        account = settings.get("azure_account")
+        subscription = settings.get("azure_subscription_id")
+        expected_upgrade = settings.get("deployment_upgrade_policy")
+        if not all((resource_group, account, subscription, expected_upgrade)):
+            probe.update({
+                "resolved": False,
+                "error_type": "IncompleteAzureIdentity",
+                "error": (
+                    "Azure identity requires azure_resource_group, azure_account, "
+                    "azure_subscription_id, and deployment_upgrade_policy"
+                ),
+            })
+            probes.append(probe)
+            continue
+
+        command = [
+            "az", "cognitiveservices", "account", "deployment", "show",
+            "--subscription", str(subscription),
+            "--resource-group", str(resource_group),
+            "--name", str(account),
+            "--deployment-name", deployment,
+            "--output", "json",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            probe.update({
+                "resolved": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            })
+            probes.append(probe)
+            continue
+        if completed.returncode != 0:
+            probe.update({
+                "resolved": False,
+                "error_type": "AzureCLIError",
+                "error": completed.stderr.strip()[:500],
+            })
+            probes.append(probe)
+            continue
+        try:
+            body = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            probe.update({
+                "resolved": False,
+                "error_type": type(exc).__name__,
+                "error": "Azure CLI returned invalid JSON",
+            })
+            probes.append(probe)
+            continue
+
+        properties = body.get("properties") or {}
+        model = properties.get("model") or {}
+        live_etag = str(body.get("etag") or "").strip('"')
+        live_revision = f"{model.get('name')}:{model.get('version')}"
+        declared_etag = str(settings.get("deployment_version") or "")
+        if declared_etag.startswith("etag-"):
+            declared_etag = declared_etag[5:]
+        mismatches = []
+        comparisons = {
+            "model_revision": (
+                str(settings.get("model_revision") or ""), live_revision,
+            ),
+            "deployment_version": (declared_etag, live_etag),
+            "deployment_upgrade_policy": (
+                str(expected_upgrade),
+                str(properties.get("versionUpgradeOption")),
+            ),
+        }
+        for name, (declared, live) in comparisons.items():
+            if declared != live:
+                mismatches.append({
+                    "field": name, "declared": declared, "live": live,
+                })
+        probe.update({
+            "resolved": (
+                properties.get("provisioningState") == "Succeeded"
+                and properties.get("deploymentState") == "Running"
+                and not mismatches
+            ),
+            "subscription_id": str(subscription),
+            "resource_group": str(resource_group),
+            "account": str(account),
+            "deployment_id": body.get("id"),
+            "deployment_etag": live_etag,
+            "catalog_model": {
+                "format": model.get("format"),
+                "name": model.get("name"),
+                "version": model.get("version"),
+            },
+            "version_upgrade_option": properties.get("versionUpgradeOption"),
+            "provisioning_state": properties.get("provisioningState"),
+            "deployment_state": properties.get("deploymentState"),
+            "sku": body.get("sku"),
+            "mismatches": mismatches,
+            "control_plane_response_sha256": _sha256_json(body),
+        })
+        if mismatches:
+            probe["error_type"] = "AzureIdentityMismatch"
+        probes.append(probe)
+    return probes
+
+
 def _prompt_fingerprints(config: dict) -> dict:
     fingerprints = {}
     for role, settings in _role_items(config):
@@ -431,6 +584,25 @@ def _model_runtime_identity(probes: list[dict]) -> list[dict]:
             identity["descriptor"] = _stable_model_descriptor(
                 probe.get("descriptor")
             )
+        elif probe.get("backend") in {"azure-foundry", "remote-declared"}:
+            identity.update({
+                "declared_model_source": probe.get("declared_model_source"),
+                "declared_model_revision": probe.get("declared_model_revision"),
+                "declared_deployment_version": probe.get(
+                    "declared_deployment_version"
+                ),
+                "subscription_id": probe.get("subscription_id"),
+                "resource_group": probe.get("resource_group"),
+                "account": probe.get("account"),
+                "deployment_id": probe.get("deployment_id"),
+                "deployment_etag": probe.get("deployment_etag"),
+                "catalog_model": probe.get("catalog_model"),
+                "version_upgrade_option": probe.get("version_upgrade_option"),
+                "sku": _stable_model_descriptor(probe.get("sku")),
+                "control_plane_response_sha256": probe.get(
+                    "control_plane_response_sha256"
+                ),
+            })
         if not identity["resolved"]:
             identity["error_type"] = probe.get("error_type")
         identities.append(identity)
@@ -491,12 +663,17 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
     probe_started = time.perf_counter()
     # These are independent network probes. Run them concurrently so an
     # unavailable local server costs one timeout window rather than two.
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         ollama_future = executor.submit(_probe_ollama_models, config)
         compatible_future = executor.submit(
             _probe_openai_compatible_models, config,
         )
-        model_runtime_probes = ollama_future.result() + compatible_future.result()
+        remote_future = executor.submit(_probe_remote_models, config)
+        model_runtime_probes = (
+            ollama_future.result()
+            + compatible_future.result()
+            + remote_future.result()
+        )
     model_runtime_probe_duration_ms = int(round(
         (time.perf_counter() - probe_started) * 1000
     ))
@@ -504,10 +681,11 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
     run_args = _run_args_manifest(args_ref)
     run_args_identity = _run_args_identity(run_args)
     sandbox_identity = _sandbox_request_identity(args_ref)
+    resolved_limits = pipeline.resolved_limits(config)
     concurrency = {
         "problem_parallelism": args_ref.get("parallel"),
         "provider_concurrency": (
-            (config.get("_limits") or {}).get("max_provider_concurrency")
+            resolved_limits.get("max_provider_concurrency")
         ),
     }
     return {
@@ -530,7 +708,7 @@ def _research_audit_metadata(config: dict, args_ref: dict) -> dict:
             for identity in model_runtime_identity
         ),
         "prompt_fingerprints": _prompt_fingerprints(config),
-        "limits": dict(config.get("_limits") or {}),
+        "limits": resolved_limits,
         "run_args": run_args,
         "run_args_identity": run_args_identity,
         "run_args_identity_sha256": _sha256_json(run_args_identity),
@@ -888,6 +1066,19 @@ def _problem_artifact_directory(root: str, problem_id: object) -> str:
             f"problem ID escapes the artifact root: {problem_id!r}"
         )
     return path
+
+
+def _safe_hashed_name(value: object, fallback: str) -> str:
+    text = str(value)
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or fallback
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"{slug[:48]}_{digest}"
+
+
+def _partial_state_path(problem_id: object, run_id: object | None = None) -> str:
+    run_name = _safe_hashed_name(run_id or "adhoc", "run")
+    problem_name = _safe_hashed_name(problem_id, "problem")
+    return os.path.join("runs", "partial", run_name, f"{problem_name}.json")
 
 
 def _write_problem_checkpoint(
@@ -1673,7 +1864,7 @@ async def run_one(
     Carries over all fields from the problem dict (except 'question',
     which becomes 'problem' in the result via pipeline.run).
 
-    Also writes a per-problem partial state file to runs/partial/<pid>.json
+    Also writes a per-problem partial state file under `runs/partial/`
     that gets updated after every meaningful pipeline event. On crash
     mid-problem, that file contains everything that completed.
 
@@ -1701,8 +1892,12 @@ async def run_one(
     print(f"# {pid}")
     print(f"{'#'*60}")
 
-    os.makedirs("runs/partial", exist_ok=True)
-    partial_path = f"runs/partial/{pid}.json"
+    partial_path = _partial_state_path(pid, run_id)
+    os.makedirs(os.path.dirname(partial_path), exist_ok=True)
+    try:
+        os.remove(partial_path)
+    except FileNotFoundError:
+        pass
 
     # Per-problem LLM call log. llm() appends one dict per completed call.
     # Shared across child asyncio tasks via contextvars — parallel judges
@@ -1800,6 +1995,15 @@ async def run_one(
     except Exception as e:
         print(f"[{pid}]   ERROR: {e}")
         traceback_path = None
+        partial_state: dict = {}
+        try:
+            with open(partial_path) as f:
+                loaded_partial = json.load(f)
+            if isinstance(loaded_partial, dict):
+                partial_state = loaded_partial
+        except (OSError, json.JSONDecodeError):
+            partial_state = {}
+        partial_snapshot_path = None
         if prob_art_dir:
             traceback_path = os.path.join(prob_art_dir, "traceback.txt")
             try:
@@ -1807,6 +2011,15 @@ async def run_one(
                     f.write(traceback.format_exc())
             except OSError:
                 traceback_path = None
+            if partial_state:
+                partial_snapshot_path = os.path.join(
+                    prob_art_dir, "partial_state_on_error.json",
+                )
+                try:
+                    with open(partial_snapshot_path, "w") as f:
+                        json.dump(partial_state, f, indent=2, default=str)
+                except OSError:
+                    partial_snapshot_path = None
         event(
             logger,
             logging.ERROR,
@@ -1821,6 +2034,12 @@ async def run_one(
             "verified": False,
             "error": str(e),
             "traceback_path": traceback_path,
+            "partial_state_path": partial_snapshot_path,
+            "solution": partial_state.get("solution"),
+            "solver_solutions": partial_state.get("solver_solutions") or [],
+            "attempts": partial_state.get("attempts") or [],
+            "in_progress_attempt": partial_state.get("in_progress_attempt"),
+            "partial_last_event": partial_state.get("last_event"),
         }
     finally:
         call_log.reset(token)
@@ -1933,6 +2152,12 @@ async def run_one(
     tool_calls_by_role: dict[str, dict[str, int]] = {}
     tool_status_counts = {"success": 0, "failure": 0, "unknown": 0}
     tool_status_by_role: dict[str, dict[str, int]] = {}
+    required_tool_calls = 0
+    compliant_required_tool_calls = 0
+    required_tool_obligations = 0
+    satisfied_required_tool_obligations = 0
+    required_tool_obligations_by_role: dict[str, dict[str, int]] = {}
+    satisfied_required_tools_by_role: dict[str, dict[str, int]] = {}
     mechanistic_evidence: dict[str, dict] = {}
     web_search_providers: set[str] = set()
     web_search_requests = 0
@@ -1999,6 +2224,23 @@ async def run_one(
             "successful_web_search_calls": 0,
         })
         evidence["calls"] += 1
+        required = {
+            str(name) for name in (c.get("required_tools") or [])
+        }
+        satisfied = {
+            str(name) for name in (c.get("successful_required_tools") or [])
+        }
+        if required:
+            required_tool_calls += 1
+            compliant_required_tool_calls += int(required <= satisfied)
+            required_tool_obligations += len(required)
+            satisfied_required_tool_obligations += len(required & satisfied)
+            role_required = required_tool_obligations_by_role.setdefault(r, {})
+            role_satisfied = satisfied_required_tools_by_role.setdefault(r, {})
+            for name in required:
+                role_required[name] = role_required.get(name, 0) + 1
+            for name in required & satisfied:
+                role_satisfied[name] = role_satisfied.get(name, 0) + 1
         for tool_call in c.get("all_tool_calls") or c.get("tool_calls") or []:
             name = tool_call.get("tool_name") or "unknown"
             total_tool_calls += 1
@@ -2113,6 +2355,20 @@ async def run_one(
         "tool_calls_by_role": tool_calls_by_role,
         "tool_status_counts": tool_status_counts,
         "tool_status_by_role": tool_status_by_role,
+        "required_tool_calls": required_tool_calls,
+        "compliant_required_tool_calls": compliant_required_tool_calls,
+        "required_tool_call_compliance_fraction": (
+            compliant_required_tool_calls / required_tool_calls
+            if required_tool_calls else None
+        ),
+        "required_tool_obligations": required_tool_obligations,
+        "satisfied_required_tool_obligations": satisfied_required_tool_obligations,
+        "required_tool_obligation_compliance_fraction": (
+            satisfied_required_tool_obligations / required_tool_obligations
+            if required_tool_obligations else None
+        ),
+        "required_tool_obligations_by_role": required_tool_obligations_by_role,
+        "satisfied_required_tools_by_role": satisfied_required_tools_by_role,
         "mechanistic_evidence_by_role": mechanistic_evidence,
         "web_search_providers": sorted(web_search_providers),
         "web_search_requests": web_search_requests,
@@ -2254,6 +2510,12 @@ def _aggregate_run_metrics(
         row.get("partial_cost_usd") for row in metric_rows
         if row.get("partial_cost_usd") is not None
     ]
+    required_calls = sum_field("required_tool_calls")
+    compliant_required_calls = sum_field("compliant_required_tool_calls")
+    required_obligations = sum_field("required_tool_obligations")
+    satisfied_required_obligations = sum_field(
+        "satisfied_required_tool_obligations"
+    )
     return {
         "duration_ms": duration_ms,
         "requested_problems": requested,
@@ -2298,6 +2560,24 @@ def _aggregate_run_metrics(
         "tool_calls_by_role": merge_nested_counts("tool_calls_by_role"),
         "tool_status_counts": merge_counts("tool_status_counts"),
         "tool_status_by_role": merge_nested_counts("tool_status_by_role"),
+        "required_tool_calls": required_calls,
+        "compliant_required_tool_calls": compliant_required_calls,
+        "required_tool_call_compliance_fraction": (
+            compliant_required_calls / required_calls
+            if required_calls else None
+        ),
+        "required_tool_obligations": required_obligations,
+        "satisfied_required_tool_obligations": satisfied_required_obligations,
+        "required_tool_obligation_compliance_fraction": (
+            satisfied_required_obligations / required_obligations
+            if required_obligations else None
+        ),
+        "required_tool_obligations_by_role": merge_nested_counts(
+            "required_tool_obligations_by_role"
+        ),
+        "satisfied_required_tools_by_role": merge_nested_counts(
+            "satisfied_required_tools_by_role"
+        ),
         "mechanistic_evidence_by_role": merge_nested_counts(
             "mechanistic_evidence_by_role"
         ),

@@ -1,6 +1,7 @@
 import asyncio
 
 import pipeline
+import pytest
 from jsonschema import validate
 from pipeline import (
     Proof,
@@ -12,6 +13,7 @@ from pipeline import (
     _formalizer_decision_feedback,
     _proof_from_dict,
     _proof_to_dict,
+    max_formalizer_invalid_attempts,
     max_solver_answers,
     max_verify_attempts,
 )
@@ -87,16 +89,19 @@ def test_limits_fall_back_to_defaults_when_config_empty(monkeypatch):
 
     assert max_verify_attempts() == 3
     assert max_solver_answers() == 3
+    assert max_formalizer_invalid_attempts() == 3
 
 
 def test_limits_read_from_config_when_present(monkeypatch):
     monkeypatch.setitem(pipeline.CONFIG, "_limits", {
         "max_verify_attempts": 5,
         "max_solver_answers": 1,
+        "max_formalizer_invalid_attempts": 4,
     })
 
     assert max_verify_attempts() == 5
     assert max_solver_answers() == 1
+    assert max_formalizer_invalid_attempts() == 4
 
 
 def test_repair_metrics_mark_no_repair_baseline():
@@ -391,3 +396,76 @@ def test_formalizer_decision_feedback_reports_missing_action_fields():
     assert "reject_reason" in _formalizer_decision_feedback({
         "action": "reject",
     })
+
+
+def test_formalizer_decision_feedback_rejects_unresolved_answer_slot():
+    feedback = _formalizer_decision_feedback({
+        "action": "proof",
+        "proof": {
+            "initial_state": ["ANSWER"],
+            "steps": [{
+                "state": ["ANSWER", "The actual fact was appended elsewhere"],
+                "justification_type": "citation",
+                "justification": "source",
+            }],
+        },
+    })
+
+    assert "leaves the answer slot unresolved" in feedback
+
+
+def test_formalizer_decision_feedback_accepts_resolved_answer_slot():
+    assert _formalizer_decision_feedback({
+        "action": "proof",
+        "proof": {
+            "initial_state": ["ANSWER"],
+            "steps": [{
+                "state": ["ANSWER = 42"],
+                "justification_type": "computation",
+                "justification": "6 * 7",
+            }],
+        },
+    }) is None
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["ANSWER", "ANSWER =", "ANSWER:", "<ANSWER>", "ANSWER = TBD", "?"],
+)
+def test_formalizer_decision_feedback_rejects_placeholder_variants(placeholder):
+    feedback = _formalizer_decision_feedback({
+        "action": "proof",
+        "proof": {
+            "initial_state": ["GOAL"],
+            "steps": [{
+                "state": [placeholder],
+                "justification_type": "computation",
+                "justification": "claimed completion",
+            }],
+        },
+    })
+
+    assert "leaves the answer slot unresolved" in feedback
+
+
+def test_initial_state_judge_does_not_receive_later_proof_states(monkeypatch):
+    proof = Proof(
+        initial_state=["ANSWER"],
+        steps=[Step(
+            state=["ANSWER = 42"],
+            justification_type="computation",
+            justification="6 * 7",
+        )],
+    )
+    seen = {}
+
+    async def fake_llm(prompt, **_kwargs):
+        seen["prompt"] = prompt
+        return {"accepted": True, "reason": "ok"}, "session"
+
+    monkeypatch.setattr(pipeline, "llm", fake_llm)
+
+    asyncio.run(pipeline.judge_initial_state(proof, "What is 6 * 7?"))
+
+    assert "Initial state (state 0): ['ANSWER']" in seen["prompt"]
+    assert "ANSWER = 42" not in seen["prompt"]

@@ -1,0 +1,6 @@
+audit_grader:
+  backend: codex
+  model: gpt-5.4
+  effort: xhigh
+  search: true
+  preamble: false

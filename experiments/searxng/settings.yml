@@ -1,0 +1,12 @@
+use_default_settings: true
+
+server:
+  limiter: false
+  image_proxy: false
+  secret_key: "theoria-local-experiment-search-not-for-public-service"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json

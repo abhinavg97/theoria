@@ -1,0 +1,5 @@
+# Diagnostic-only profile: force the solver to demonstrate both tool paths.
+solver:
+  required_tools:
+    - web_search
+    - shell

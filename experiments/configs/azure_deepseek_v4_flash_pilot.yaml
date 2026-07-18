@@ -1,0 +1,31 @@
+# Existing Azure deployment for readiness testing only. The deployment is set
+# to automatic model upgrades, so do not use it for frozen evaluation runs.
+_theoria_agent: &theoria_agent
+  backend: theoria_agent
+  model: DeepSeek-V4-Flash
+  model_source: azure-foundry
+  model_revision: "2026-04-23"
+  deployment_version: "etag-049e5aa9-9a97-4a24-b051-96e5301082c6"
+  dtype: provider-managed-undisclosed
+  quantization: provider-managed-undisclosed
+  server_hardware: azure-globalstandard-undisclosed
+  endpoint: https://theoria-resource.cognitiveservices.azure.com/openai/v1
+  api_key_env: AZURE_OPENAI_API_KEY
+  auth_header: api-key
+  max_turns: 12
+  max_tokens: 4096
+  temperature: 0
+  allow_shell: true
+  allow_host_tools: false
+  tool_timeout: 120
+  tool_output_chars: 12000
+
+solver: { <<: *theoria_agent }
+interpreter: { <<: *theoria_agent }
+formalizer: { <<: *theoria_agent }
+citation: { <<: *theoria_agent }
+problem_given: { <<: *theoria_agent }
+computation: { <<: *theoria_agent }
+pedantry: { <<: *theoria_agent }
+convention_lift: { <<: *theoria_agent }
+initial_state: { <<: *theoria_agent }

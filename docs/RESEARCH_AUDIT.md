@@ -68,12 +68,20 @@ them:
 model_source: azure-foundry
 model_revision: exact-catalog-model-version
 deployment_version: immutable-deployment-version
+deployment_upgrade_policy: NoAutoUpgrade
+azure_subscription_id: exact-subscription-id
+azure_resource_group: exact-resource-group
+azure_account: exact-AI-Services-account
 dtype: bfloat16
 quantization: none
 server_hardware: 8x-H100-80GB
 ```
 
 These fields are retained in the effective settings and config identity hash.
+For `model_source: azure-foundry`, Theoria also queries the Azure control plane
+at run start and marks runtime identity incomplete unless the live catalog
+model/version, deployment etag, running state, and upgrade policy match the
+declarations.
 
 ## Call evidence
 
@@ -100,6 +108,11 @@ separate from requests that reached the provider and provider-side failures, so
 provider reliability must use `web_search_provider_requests` as its denominator.
 A search snippet is not equivalent to a fetched primary source, and analyses
 must not label it as one.
+When a role declares `required_tools`, the provider-neutral loop refuses its
+final response until every declared tool has succeeded. Per-call and run-level
+artifacts separately record required calls, obligations, satisfied tools, and
+compliance fractions. This proves execution of the configured mechanism, not
+that the tool result was interpreted correctly.
 
 ## Grading evidence
 
@@ -114,6 +127,9 @@ every grader prompt/response, failures/retries, and aggregate usage. Automatic
 grades are explicitly marked non-authoritative; manual adjudication remains a
 separate research artifact and must be joined by problem ID for headline paper
 numbers.
+The grading target is explicit in metadata. `final` grades the shipped answer;
+`solver_initial` grades the first retained solver response from the same sealed
+run and fails closed for a problem if that response is unavailable.
 
 ## Integrity and release checklist
 

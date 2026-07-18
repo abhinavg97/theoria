@@ -1,0 +1,35 @@
+# Version-pinned Azure Foundry deployment for OSS evaluation. Azure resource:
+# gpt-oss-120b-v1-theoria-eval, with versionUpgradeOption=NoAutoUpgrade.
+_theoria_agent: &theoria_agent
+  backend: theoria_agent
+  model: gpt-oss-120b-v1-theoria-eval
+  model_source: azure-foundry
+  model_revision: "gpt-oss-120b:1"
+  deployment_version: "etag-e8e26651-a4f0-4506-a612-49d2a0700e48"
+  deployment_upgrade_policy: NoAutoUpgrade
+  azure_subscription_id: fd2d6c8b-1c2e-47c8-bc37-885d210aaba4
+  azure_resource_group: rg-soccer826-8608
+  azure_account: theoria-resource
+  dtype: provider-managed-undisclosed
+  quantization: provider-managed-undisclosed
+  server_hardware: azure-globalstandard-undisclosed
+  endpoint: https://theoria-resource.cognitiveservices.azure.com/openai/v1
+  api_key_env: AZURE_OPENAI_API_KEY
+  auth_header: api-key
+  max_turns: 12
+  max_tokens: 4096
+  temperature: 0
+  allow_shell: true
+  allow_host_tools: false
+  tool_timeout: 120
+  tool_output_chars: 12000
+
+solver: { <<: *theoria_agent }
+interpreter: { <<: *theoria_agent }
+formalizer: { <<: *theoria_agent }
+citation: { <<: *theoria_agent }
+problem_given: { <<: *theoria_agent }
+computation: { <<: *theoria_agent }
+pedantry: { <<: *theoria_agent }
+convention_lift: { <<: *theoria_agent }
+initial_state: { <<: *theoria_agent }

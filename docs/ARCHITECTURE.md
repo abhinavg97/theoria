@@ -115,7 +115,7 @@ and is unaudited.
 
 ```
 runs/<command>_<tag>_<timestamp>.json     the results (one entry per problem)
-runs/partial/<id>.json                    crash-safe live snapshot
+runs/partial/<run>/<safe-id>_<hash>.json  crash-safe live snapshot
 runs/artifacts/<run_id>/
     meta.json                             argv, redacted config, config/prompt/model
                                           fingerprints, problem-set manifest,

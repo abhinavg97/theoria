@@ -278,6 +278,7 @@ def cmd_grade(args) -> None:
         args.run_file,
         args.config,
         args.out,
+        target=args.target,
         watch=args.watch,
         pricing_path=args.pricing,
     ))
@@ -603,6 +604,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--config", action="append", default=None,
                    help="Grader config YAML (default: configs/audit_grader.yaml).")
     g.add_argument("--out", default=None, help="Output grades JSON path.")
+    g.add_argument(
+        "--target", choices=("final", "solver_initial"), default="final",
+        help="Answer to grade from the sealed run (default: final).",
+    )
     g.add_argument(
         "--watch", action=argparse.BooleanOptionalAction, default=True,
         help="Stream grader LLM events (default: on).",

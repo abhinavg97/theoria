@@ -1,0 +1,14 @@
+# Enforce role-level mechanistic checks in the provider-neutral loop.
+# These are experimental conditions and must be reported separately from runs
+# that only prompt models to use tools.
+citation:
+  required_tools:
+    - web_search
+
+computation:
+  required_tools:
+    - shell
+
+convention_lift:
+  required_tools:
+    - web_search

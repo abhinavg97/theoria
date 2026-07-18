@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +129,39 @@ def _formalizer_decision_feedback(decision: dict) -> str | None:
                 f"object did not match the required schema: {exc.message}. "
                 "Reply again with exactly one JSON decision containing either "
                 "a complete proof object or a reject_reason."
+            )
+        proof = decision["proof"]
+        initial_state = proof.get("initial_state") or []
+        steps = proof.get("steps") or []
+        if not steps:
+            return (
+                "Your proof contains no steps, so it does not resolve the "
+                "goal. Return a corrected proof with at least one justified "
+                "step, or reject the solver answer."
+            )
+        final_state = steps[-1].get("state") or []
+        if not final_state or not str(final_state[0]).strip():
+            return (
+                "Your proof's final state has no answer in state[0]. Return a "
+                "corrected proof whose final state[0] is the resolved answer."
+            )
+        initial_goal = str(initial_state[0]).strip() if initial_state else ""
+        final_answer = str(final_state[0]).strip()
+        unresolved_slot = re.fullmatch(
+            r"[<\[({]*\s*(?:final\s+)?(?:answer|result)\s*[>\])}]*"
+            r"\s*(?:(?:=|:)\s*(?:\?|tbd|todo|pending|unknown|[_-]*)?)?\s*",
+            final_answer,
+            flags=re.IGNORECASE,
+        )
+        if (
+            final_answer in {"?", "_", "-"}
+            or unresolved_slot is not None
+            or (initial_goal and final_answer.casefold() == initial_goal.casefold())
+        ):
+            return (
+                "Your proof leaves the answer slot unresolved: final "
+                f"state[0] is {final_answer!r}. The final state[0] must contain "
+                "the actual resolved answer, not the original goal placeholder."
             )
     if action == "reject":
         reason = decision.get("reject_reason")
@@ -323,7 +357,9 @@ async def judge_initial_state(
     user_msg = (
         f"Problem: {problem}\n\n"
         f"Initial state (state 0): {proof.initial_state}\n\n"
-        f"Full proof for context:\n{_format_proof(proof)}"
+        "Audit only this initial state against the problem text. Later proof "
+        "states are intentionally omitted because they are outside this "
+        "judge's scope."
     )
     data, _ = await llm(
         user_msg, role="initial_state", schema=VERDICT_SCHEMA, system=system,
@@ -616,18 +652,31 @@ def _print_verdicts(
 # `_limits:` block in a stacked --config YAML.
 _DEFAULT_MAX_VERIFY_ATTEMPTS = 3   # formalize+judge cycles per problem
 _DEFAULT_MAX_SOLVER_ANSWERS = 3    # distinct solver answers per problem
+_DEFAULT_MAX_FORMALIZER_INVALID_ATTEMPTS = 3
 
 
-def _limits() -> dict:
-    return CONFIG.get("_limits") or {}
+def resolved_limits(config: dict | None = None) -> dict:
+    raw = dict((config if config is not None else CONFIG).get("_limits") or {})
+    raw.setdefault("max_verify_attempts", _DEFAULT_MAX_VERIFY_ATTEMPTS)
+    raw.setdefault("max_solver_answers", _DEFAULT_MAX_SOLVER_ANSWERS)
+    raw.setdefault(
+        "max_formalizer_invalid_attempts",
+        _DEFAULT_MAX_FORMALIZER_INVALID_ATTEMPTS,
+    )
+    return raw
 
 
 def max_verify_attempts() -> int:
-    return int(_limits().get("max_verify_attempts", _DEFAULT_MAX_VERIFY_ATTEMPTS))
+    return int(resolved_limits()["max_verify_attempts"])
 
 
 def max_solver_answers() -> int:
-    return int(_limits().get("max_solver_answers", _DEFAULT_MAX_SOLVER_ANSWERS))
+    return int(resolved_limits()["max_solver_answers"])
+
+
+def max_formalizer_invalid_attempts() -> int:
+    """Protocol/schema corrections, separate from semantic repair rounds."""
+    return int(resolved_limits()["max_formalizer_invalid_attempts"])
 
 
 def _answer_from_proof_dict(proof_dict: dict | None) -> str | None:
@@ -651,6 +700,7 @@ def _build_repair_metrics(
     solver_solutions: list[str] | None,
     final_answer: object | None,
     verified: bool,
+    max_formalizer_invalid: int = _DEFAULT_MAX_FORMALIZER_INVALID_ATTEMPTS,
 ) -> dict:
     verify_attempt_records = [
         attempt for attempt in attempts if attempt.get("phase") == "verify"
@@ -705,6 +755,7 @@ def _build_repair_metrics(
         "repair_attempted": repair_attempted,
         "max_verify_attempts": max_verify,
         "max_solver_answers": max_solver,
+        "max_formalizer_invalid_attempts": max_formalizer_invalid,
         "verify_attempts": verify_attempts,
         "solver_answers": solver_answers,
         "solver_retries": solver_retries,
@@ -891,6 +942,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
 
     max_verify = max_verify_attempts()
     max_solver = max_solver_answers()
+    max_formalizer_invalid = max_formalizer_invalid_attempts()
 
     while True:
         # Ask formalizer for a decision
@@ -921,9 +973,10 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
                 "decision": decision,
             })
             await save_partial("attempt_appended:formalizer_invalid")
-            if malformed_formalizer_decisions >= max_verify:
+            if malformed_formalizer_decisions >= max_formalizer_invalid:
                 log(
-                    f"\n[!] Max incomplete formalizer decisions ({max_verify}) "
+                    "\n[!] Max incomplete formalizer decisions "
+                    f"({max_formalizer_invalid}) "
                     "reached, giving up"
                 )
                 break
@@ -1196,6 +1249,7 @@ async def run(problem: str, *, pid: str | None = None, partial_save_path: str | 
         solver_solutions=solver_solutions,
         final_answer=answer,
         verified=verified,
+        max_formalizer_invalid=max_formalizer_invalid,
     )
 
     print(f"\n{'='*40}")

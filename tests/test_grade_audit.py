@@ -89,11 +89,67 @@ def test_grade_run_captures_calls_and_reproducibility_artifacts(
     assert meta["source_run_sha256"] == summary["run_file_sha256"]
     assert meta["grader_prompt_sha256"] == summary["grader_prompt_sha"]
     assert meta["rationale_dataset"]["fingerprint"] == "fake-fingerprint"
+    assert meta["grading_target"] == "final"
     assert (root / "grader_prompt.txt").exists()
     assert (root / "grader_schema.json").exists()
     assert (root / "rationales.json").exists()
     manifest = json.loads((root / "artifact_manifest.json").read_text())
     assert any(entry["path"] == "meta.json" for entry in manifest["entries"])
+
+
+def test_grade_run_can_grade_initial_solver_response(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "p1",
+        "problem": "What is 2+2?",
+        "expected": "4",
+        "answer": "4",
+        "verified": True,
+        "solver_solutions": ["I initially answered 5", "I repaired it to 4"],
+        "attempts": [{"phase": "verify"}],
+    }]))
+
+    solver_prompt = grade.SOLVER_PROMPT_PATH.read_text()
+
+    async def fake_grade_one(result, _config, prompt_text, *_args, **_kwargs):
+        assert result["answer"] == "I initially answered 5"
+        assert result["verified"] is None
+        assert result["attempts"] == []
+        assert prompt_text == solver_prompt
+        return {
+            "final": {
+                "key_match": False,
+                "reasoning": "wrong",
+                "dispute_category": "none",
+            },
+            "attempts": [],
+        }
+
+    monkeypatch.setattr(grade, "grade_one", fake_grade_one)
+    monkeypatch.setattr(
+        grade, "fetch_rationales", lambda *_args, **_kwargs: ({}, {}),
+    )
+
+    summary = asyncio.run(grade.grade_run(
+        str(source), target="solver_initial", watch=False,
+    ))
+
+    assert summary["grading_target"] == "solver_initial"
+    assert summary["results"][0]["target"] == "solver_initial"
+    assert summary["results"][0]["answer"] == "I initially answered 5"
+    meta = json.loads(
+        (Path(summary["artifact_root"]) / "meta.json").read_text()
+    )
+    assert meta["grading_target"] == "solver_initial"
+    assert meta["grader_prompt_sha256"] == grade.hashlib.sha256(
+        solver_prompt.encode()
+    ).hexdigest()
+    assert (Path(summary["artifact_root"]) / "grader_prompt.txt").read_text() == (
+        solver_prompt
+    )
+    assert Path(summary["artifact_root"]).name.startswith("grade_solver_initial_")
 
 
 def test_malformed_verdict_fails_only_its_problem(tmp_path, monkeypatch):
@@ -136,6 +192,33 @@ def test_malformed_verdict_fails_only_its_problem(tmp_path, monkeypatch):
         (Path(summary["artifact_root"]) / "meta.json").read_text()
     )
     assert meta["status"] == "completed_with_errors"
+
+
+def test_hle_grade_fails_closed_without_canonical_rationale(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _stub_audit_environment(monkeypatch)
+    source = Path("source.json")
+    source.write_text(json.dumps([{
+        "id": "hle-id",
+        "dataset_name": grade.HLE_DATASET_NAME,
+        "dataset_revision": grade.HLE_DATASET_REVISION,
+        "problem": "Question",
+        "expected": "Answer",
+        "answer": "Answer",
+    }]))
+    monkeypatch.setattr(
+        grade,
+        "fetch_rationales",
+        lambda *_a, **_k: ({}, {"available": False}),
+    )
+
+    with pytest.raises(RuntimeError, match="canonical rationale coverage"):
+        asyncio.run(grade.grade_run(str(source), watch=False))
+
+    roots = list(Path("runs/artifacts").glob("grade_source_*"))
+    assert len(roots) == 1
+    meta = json.loads((roots[0] / "meta.json").read_text())
+    assert meta["status"] == "failed"
 
 
 def test_grade_run_uses_one_immutable_source_snapshot(tmp_path, monkeypatch):

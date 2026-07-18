@@ -41,6 +41,7 @@ def test_chat_completion_sends_declared_sampling_controls(monkeypatch):
         "endpoint": "https://example.test/v1",
         "model": "deployment",
         "max_tokens": 512,
+        "max_completion_tokens": 768,
         "temperature": 0.2,
         "top_p": 0.8,
         "seed": 7,
@@ -51,6 +52,7 @@ def test_chat_completion_sends_declared_sampling_controls(monkeypatch):
 
     payload = json.loads(requests[0][0].data)
     assert payload["max_tokens"] == 512
+    assert payload["max_completion_tokens"] == 768
     assert payload["temperature"] == 0.2
     assert payload["top_p"] == 0.8
     assert payload["seed"] == 7
@@ -193,6 +195,107 @@ def test_run_agent_executes_shell_tool_with_explicit_host_opt_in(monkeypatch):
     assert result.metadata["output_tokens"] == 4
     assert result.metadata["tool_calls"][0]["tool_name"] == "shell"
     assert "42" in result.metadata["tool_calls"][0]["output"]
+
+
+def test_run_agent_enforces_required_tool_before_final(monkeypatch):
+    replies = iter([
+        {"action": "final", "response": "guessed"},
+        {"action": "tool", "tool": "shell", "input": {"cmd": "printf 42"}},
+        {"action": "final", "response": "42"},
+    ])
+    seen_messages = []
+
+    def fake_chat(settings, messages):
+        seen_messages.append(list(messages))
+        return json.dumps(next(replies)), {}
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+
+    result = asyncio.run(agent_loop.run_agent(
+        "compute",
+        settings={
+            "model": "fake",
+            "allow_shell": True,
+            "allow_host_tools": True,
+            "required_tools": ["shell"],
+        },
+        schema=None,
+        system=None,
+        resume=None,
+        role="computation",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.response == "42"
+    assert result.metadata["required_tool_compliance"] is True
+    assert result.metadata["successful_required_tools"] == ["shell"]
+    assert result.metadata["missing_required_tools"] == []
+    assert "requires successful use" in seen_messages[1][-1]["content"]
+    assert any(
+        event["type"] == "policy.required_tools_missing"
+        for event in result.events
+    )
+
+
+def test_run_agent_repairs_direct_role_schema_without_final_wrapper(monkeypatch):
+    replies = iter([
+        {"action": "proof", "kind": "invalid"},
+        {"action": "proof", "kind": "valid"},
+    ])
+    seen_messages = []
+
+    def fake_chat(settings, messages):
+        seen_messages.append(list(messages))
+        return json.dumps(next(replies)), {}
+
+    monkeypatch.setattr(agent_loop, "_chat_completion", fake_chat)
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {"const": "proof"},
+            "kind": {"const": "valid"},
+        },
+        "required": ["action", "kind"],
+    }
+
+    result = asyncio.run(agent_loop.run_agent(
+        "formalize",
+        settings={"model": "fake"},
+        schema=schema,
+        system=None,
+        resume=None,
+        role="formalizer",
+        container_id=None,
+        search_config=None,
+    ))
+
+    assert result.response == {"action": "proof", "kind": "valid"}
+    feedback = seen_messages[1][-1]["content"]
+    assert "did not match the required JSON schema" in feedback
+    assert "do not wrap it in action='final'" in feedback
+
+
+def test_run_agent_rejects_unavailable_required_tool(monkeypatch):
+    monkeypatch.setattr(
+        agent_loop,
+        "_chat_completion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider must not be called")
+        ),
+    )
+
+    with pytest.raises(agent_loop.AgentRunError, match="required tools are unavailable"):
+        asyncio.run(agent_loop.run_agent(
+            "verify citation",
+            settings={"model": "fake", "required_tools": ["web_search"]},
+            schema=None,
+            system=None,
+            resume=None,
+            role="citation",
+            container_id=None,
+            search_config=None,
+        ))
 
 
 def test_run_agent_fails_host_shell_closed_by_default(monkeypatch):

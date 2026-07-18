@@ -227,6 +227,7 @@ def _chat_completion(
     }
     for key in (
         "max_tokens",
+        "max_completion_tokens",
         "temperature",
         "top_p",
         "seed",
@@ -601,6 +602,13 @@ async def run_agent(
     tool_timeout = float(settings.get("tool_timeout", DEFAULT_TOOL_TIMEOUT_SECS))
     output_limit = int(settings.get("tool_output_chars", DEFAULT_TOOL_OUTPUT_CHARS))
     max_search_results = int(settings.get("search_results", DEFAULT_SEARCH_RESULTS))
+    raw_required_tools = settings.get("required_tools") or []
+    if isinstance(raw_required_tools, str):
+        raw_required_tools = [raw_required_tools]
+    if not isinstance(raw_required_tools, list):
+        raise ValueError("required_tools must be a list of tool names")
+    required_tools = tuple(dict.fromkeys(str(name) for name in raw_required_tools))
+    successful_tools: set[str] = set()
 
     messages = [dict(m) for m in _SESSIONS.get(session_id, [])]
     if not messages:
@@ -634,6 +642,28 @@ async def run_agent(
     search_provider_requests = 0
     search_result_count = 0
     search_latency_ms = 0
+
+    def missing_required_tools() -> list[str]:
+        return sorted(set(required_tools) - successful_tools)
+
+    def request_required_tools() -> bool:
+        missing = missing_required_tools()
+        if not missing:
+            return False
+        messages.append({
+            "role": "user",
+            "content": (
+                "You cannot give a final response yet. This role requires "
+                f"successful use of these tools first: {', '.join(missing)}. "
+                "Call the required tool now, use its result, and only then "
+                "return the final response."
+            ),
+        })
+        events.append({
+            "type": "policy.required_tools_missing",
+            "missing_tools": missing,
+        })
+        return True
 
     def build_metadata(*, failed: bool = False, error: Exception | None = None) -> dict:
         completed_turns = len([
@@ -687,6 +717,12 @@ async def run_agent(
             ),
             "web_search_error_categories": search_error_categories,
             "shell_enabled": shell_enabled,
+            "required_tools": list(required_tools),
+            "successful_required_tools": sorted(
+                set(required_tools) & successful_tools
+            ),
+            "missing_required_tools": missing_required_tools(),
+            "required_tool_compliance": not missing_required_tools(),
             "role": role,
             "provider_responses": provider_responses,
             "provider_usage": [
@@ -726,6 +762,17 @@ async def run_agent(
         return metadata
 
     try:
+        available_tools = set()
+        if shell_enabled:
+            available_tools.add("shell")
+        if search_enabled:
+            available_tools.add("web_search")
+        unavailable_required = sorted(set(required_tools) - available_tools)
+        if unavailable_required:
+            raise RuntimeError(
+                "required tools are unavailable for this role: "
+                + ", ".join(unavailable_required)
+            )
         for turn in range(max_turns):
             started = time.monotonic()
             chat_result = await asyncio.to_thread(_chat_completion, settings, messages)
@@ -803,18 +850,37 @@ async def run_agent(
                 })
                 continue
 
+            schema_error: ValidationError | None = None
             if schema is not None:
                 try:
                     _validate_schema(action, schema)
-                except ValidationError:
-                    pass
+                except ValidationError as exc:
+                    schema_error = exc
                 else:
+                    if request_required_tools():
+                        continue
                     final_response = action
                     events.append({
                         "type": "item.completed",
                         "item": {"type": "agent_message", "text": json.dumps(action)},
                     })
                     break
+
+                # Structured role schemas can themselves contain an `action`
+                # discriminator (for example formalizer proof/reject). Do not
+                # confuse those values with the agent loop's tool/final
+                # control protocol when the role payload needs correction.
+                if action.get("action") not in {"tool", "final"}:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous response did not match the required "
+                            f"JSON schema: {schema_error.message}. Return one "
+                            "corrected JSON object matching the role schema "
+                            "directly; do not wrap it in action='final'."
+                        ),
+                    })
+                    continue
 
             if action.get("action") == "final":
                 candidate = action.get("response", "")
@@ -831,6 +897,8 @@ async def run_agent(
                             "JSON action only."
                         ),
                     })
+                    continue
+                if request_required_tools():
                     continue
                 final_response = candidate
                 events.append({
@@ -1005,6 +1073,8 @@ async def run_agent(
             tool_metadata["duration_ms"] = int(round(
                 (time.perf_counter() - tool_started) * 1000
             ))
+            if tool_metadata.get("ok") is True:
+                successful_tools.add(str(tool))
 
             events.append({
                 "type": "item.completed",

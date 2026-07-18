@@ -1,0 +1,12 @@
+_model: &model
+  model: qwen3:32b
+
+solver: *model
+interpreter: *model
+formalizer: *model
+citation: *model
+problem_given: *model
+computation: *model
+pedantry: *model
+convention_lift: *model
+initial_state: *model

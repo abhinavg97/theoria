@@ -124,7 +124,11 @@ def test_research_audit_metadata_redacts_and_fingerprints_config(
         "problem_parallelism": 3,
         "provider_concurrency": None,
     }
-    assert audit["limits"] == {"max_verify_attempts": 1, "max_solver_answers": 1}
+    assert audit["limits"] == {
+        "max_verify_attempts": 1,
+        "max_solver_answers": 1,
+        "max_formalizer_invalid_attempts": 3,
+    }
 
 
 def test_problem_set_manifest_records_ids_and_dataset_identity():
@@ -265,6 +269,68 @@ def test_model_runtime_identity_uses_digest_and_ignores_volatile_fields():
 
     assert first == same
     assert first != changed
+
+
+def test_azure_model_probe_verifies_live_control_plane_identity(monkeypatch):
+    body = {
+        "etag": '"deployment-etag"',
+        "id": "/subscriptions/sub/resourceGroups/rg/providers/deployment",
+        "properties": {
+            "deploymentState": "Running",
+            "provisioningState": "Succeeded",
+            "versionUpgradeOption": "NoAutoUpgrade",
+            "model": {
+                "format": "OpenAI-OSS",
+                "name": "gpt-oss-120b",
+                "version": "1",
+            },
+        },
+        "sku": {"name": "GlobalStandard", "capacity": 500},
+    }
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps(body)
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess, "run", lambda *_args, **_kwargs: Completed(),
+    )
+    probes = harness._probe_remote_models({
+        "solver": {
+            "backend": "theoria_agent",
+            "model": "gpt-oss-eval",
+            "endpoint": "https://example.cognitiveservices.azure.com/openai/v1",
+            "model_source": "azure-foundry",
+            "model_revision": "gpt-oss-120b:1",
+            "deployment_version": "etag-deployment-etag",
+            "deployment_upgrade_policy": "NoAutoUpgrade",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+            "azure_account": "account",
+        },
+    })
+
+    assert len(probes) == 1
+    assert probes[0]["resolved"] is True
+    assert probes[0]["catalog_model"]["version"] == "1"
+    assert probes[0]["deployment_etag"] == "deployment-etag"
+
+
+def test_unverified_remote_model_is_incomplete():
+    probes = harness._probe_remote_models({
+        "solver": {
+            "backend": "theoria_agent",
+            "model": "remote-model",
+            "endpoint": "https://example.test/v1",
+            "model_source": "hosted",
+            "model_revision": "revision",
+            "deployment_version": "deployment",
+        },
+    })
+
+    assert probes[0]["resolved"] is False
+    assert probes[0]["error_type"] == "UnverifiedRemoteModel"
 
 
 def test_problem_set_manifest_is_immutable_on_resume(tmp_path):
@@ -959,6 +1025,76 @@ def test_copy_to_container_restores_as_runtime_user_without_chown(
     assert all("chown" not in command for command in commands)
 
 
+def test_run_one_retains_partial_solver_state_after_later_failure(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+
+    async def fail_after_solver(_problem, *, pid, partial_save_path):
+        partial = {
+            "pid": pid,
+            "problem": "Q",
+            "solution": "initial solver answer",
+            "solver_solutions": ["initial solver answer"],
+            "attempts": [],
+            "in_progress_attempt": None,
+            "last_event": "solver_returned",
+        }
+        Path(partial_save_path).write_text(json.dumps(partial))
+        raise RuntimeError("formalizer failed")
+
+    monkeypatch.setattr(harness, "run", fail_after_solver)
+    root = tmp_path / "artifacts"
+
+    result = asyncio.run(harness.run_one(
+        {"id": "p1", "question": "Q", "answer": "A"},
+        artifact_root=str(root),
+    ))
+
+    assert result["error"] == "formalizer failed"
+    assert result["solver_solutions"] == ["initial solver answer"]
+    assert result["solution"] == "initial solver answer"
+    assert result["partial_last_event"] == "solver_returned"
+    snapshot = Path(result["partial_state_path"])
+    assert snapshot.is_file()
+    assert json.loads(snapshot.read_text())["solver_solutions"] == [
+        "initial solver answer",
+    ]
+
+
+def test_run_one_does_not_reuse_stale_partial_state(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    stale = tmp_path / harness._partial_state_path("p1")
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({
+        "solution": "stale answer",
+        "solver_solutions": ["stale answer"],
+        "last_event": "solver_returned",
+    }))
+
+    async def fail_before_solver(*_args, **_kwargs):
+        raise RuntimeError("early failure")
+
+    monkeypatch.setattr(harness, "run", fail_before_solver)
+
+    result = asyncio.run(harness.run_one({
+        "id": "p1", "question": "Q", "answer": "A",
+    }))
+
+    assert result["solver_solutions"] == []
+    assert result["solution"] is None
+    assert result["partial_last_event"] is None
+
+
+def test_partial_state_paths_are_isolated_by_run_id():
+    first = harness._partial_state_path("same-problem", "run-one")
+    second = harness._partial_state_path("same-problem", "run-two")
+
+    assert first != second
+    assert "run-one" in first
+    assert "run-two" in second
+
+
 def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
     results = [
         {
@@ -980,6 +1116,16 @@ def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
                 "tool_calls_by_role": {"computation": {"shell": 1}},
                 "tool_status_counts": {"success": 1},
                 "tool_status_by_role": {"computation": {"success": 1}},
+                "required_tool_calls": 1,
+                "compliant_required_tool_calls": 1,
+                "required_tool_obligations": 1,
+                "satisfied_required_tool_obligations": 1,
+                "required_tool_obligations_by_role": {
+                    "computation": {"shell": 1},
+                },
+                "satisfied_required_tools_by_role": {
+                    "computation": {"shell": 1},
+                },
                 "mechanistic_evidence_by_role": {
                     "computation": {
                         "calls": 1,
@@ -1021,6 +1167,14 @@ def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
                 "tool_calls_by_role": {"computation": {"shell": 1}},
                 "tool_status_counts": {"failure": 1},
                 "tool_status_by_role": {"computation": {"failure": 1}},
+                "required_tool_calls": 1,
+                "compliant_required_tool_calls": 0,
+                "required_tool_obligations": 1,
+                "satisfied_required_tool_obligations": 0,
+                "required_tool_obligations_by_role": {
+                    "computation": {"shell": 1},
+                },
+                "satisfied_required_tools_by_role": {},
                 "mechanistic_evidence_by_role": {
                     "computation": {
                         "calls": 1,
@@ -1046,6 +1200,18 @@ def test_run_metrics_preserve_role_model_and_mechanistic_rollups():
     assert metrics["tool_status_by_role"]["computation"] == {
         "success": 1,
         "failure": 1,
+    }
+    assert metrics["required_tool_calls"] == 2
+    assert metrics["compliant_required_tool_calls"] == 1
+    assert metrics["required_tool_call_compliance_fraction"] == 0.5
+    assert metrics["required_tool_obligations"] == 2
+    assert metrics["satisfied_required_tool_obligations"] == 1
+    assert metrics["required_tool_obligation_compliance_fraction"] == 0.5
+    assert metrics["required_tool_obligations_by_role"] == {
+        "computation": {"shell": 2},
+    }
+    assert metrics["satisfied_required_tools_by_role"] == {
+        "computation": {"shell": 1},
     }
     assert metrics["mechanistic_evidence_by_role"]["computation"] == {
         "calls": 2,

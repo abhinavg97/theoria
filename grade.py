@@ -81,15 +81,59 @@ GRADE_SCHEMA = {
     "required": ["final", "attempts"],
 }
 
-PROMPT_PATH = Path(__file__).parent / "grader_prompt.md"
+SOLVER_FINAL_GRADE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "key_match": {"type": "boolean"},
+        "reasoning": {"type": "string"},
+        "dispute_category": {
+            "type": "string",
+            "enum": [
+                "none", "convention", "interpretation", "tighter_bound",
+                "edge_case", "other",
+            ],
+        },
+    },
+    "required": ["key_match", "reasoning", "dispute_category"],
+}
+
+SOLVER_GRADE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "final": SOLVER_FINAL_GRADE_SCHEMA,
+        "attempts": {
+            "type": "array",
+            "maxItems": 0,
+            "items": ATTEMPT_GRADE_SCHEMA,
+        },
+    },
+    "required": ["final", "attempts"],
+}
+
+FINAL_PROMPT_PATH = Path(__file__).parent / "grader_prompt.md"
+SOLVER_PROMPT_PATH = Path(__file__).parent / "grader_solver_prompt.md"
 DEFAULT_GRADER_CONFIG = str(Path(__file__).parent / "configs" / "audit_grader.yaml")
 
 
-def load_prompt() -> tuple[str, str]:
-    """Return the grader system prompt and its full SHA-256."""
-    text = PROMPT_PATH.read_text()
+def load_prompt(target: str = "final") -> tuple[str, str]:
+    """Return the target-specific grader prompt and its full SHA-256."""
+    if target == "final":
+        path = FINAL_PROMPT_PATH
+    elif target == "solver_initial":
+        path = SOLVER_PROMPT_PATH
+    else:
+        raise ValueError(f"unsupported grading target: {target}")
+    text = path.read_text()
     sha = hashlib.sha256(text.encode()).hexdigest()
     return text, sha
+
+
+def schema_for_target(target: str) -> dict:
+    if target == "final":
+        return GRADE_SCHEMA
+    if target == "solver_initial":
+        return SOLVER_GRADE_SCHEMA
+    raise ValueError(f"unsupported grading target: {target}")
 
 
 # ── Turn one run-JSON result into the grader's text input ─────────
@@ -172,6 +216,26 @@ def fetch_rationales(
     return (out, provenance) if include_provenance else out
 
 
+def _result_for_target(result: dict, target: str) -> dict:
+    """Return the auditable view of a source result selected for grading."""
+    if target == "final":
+        return dict(result)
+    if target == "solver_initial":
+        solutions = result.get("solver_solutions") or []
+        if not solutions or not str(solutions[0]).strip():
+            raise RuntimeError("source result is missing an initial solver response")
+        selected = solutions[0]
+        view = dict(result)
+        view.update({
+            "answer": selected,
+            "attempts": [],
+            "verified": None,
+            "grading_target": target,
+        })
+        return view
+    raise ValueError(f"unsupported grading target: {target}")
+
+
 def format_input(result: dict, rationale: dict | None = None) -> str:
     """Format the per-problem context that goes to the grader.
 
@@ -202,7 +266,14 @@ def format_input(result: dict, rationale: dict | None = None) -> str:
         "HLE RATIONALE:",
         rationale_flags + rat_text,
         "",
-        "SYSTEM FINAL ANSWER:",
+        "GRADE TARGET:",
+        result.get("grading_target") or "final",
+        "",
+        (
+            "INITIAL SOLVER RESPONSE:"
+            if result.get("grading_target") == "solver_initial"
+            else "SYSTEM FINAL ANSWER:"
+        ),
         result.get("answer") or "(no final answer)",
         "",
         "SYSTEM ATTEMPTS:",
@@ -226,6 +297,7 @@ def format_input(result: dict, rationale: dict | None = None) -> str:
 async def grade_one(
     result: dict, config: dict, prompt_text: str, rationale: dict | None = None,
     *,
+    response_schema: dict = GRADE_SCHEMA,
     watch: bool = True,
 ) -> dict:
     """Grade one problem result. Returns the parsed structured verdict."""
@@ -233,7 +305,7 @@ async def grade_one(
     response, _session = await _llm_call(
         user_prompt,
         role="audit_grader",
-        schema=GRADE_SCHEMA,
+        schema=response_schema,
         system=prompt_text,
         config=config,
         watch=watch,
@@ -377,10 +449,13 @@ async def grade_run(
     config_paths: list[str] | None = None,
     out_path: str | None = None,
     *,
+    target: str = "final",
     watch: bool = True,
     pricing_path: str | None = None,
 ) -> dict:
     """Grade a stable snapshot of every problem in a completed run."""
+    if target not in {"final", "solver_initial"}:
+        raise ValueError(f"unsupported grading target: {target}")
     source_path = Path(run_file).expanduser().resolve(strict=True)
     source_bytes, source_run_hash = _read_stable_snapshot(source_path)
     try:
@@ -406,7 +481,8 @@ async def grade_run(
             "No 'audit_grader' role in the loaded config. Pass "
             "--config configs/audit_grader.yaml."
         )
-    prompt_text, prompt_sha = load_prompt()
+    prompt_text, prompt_sha = load_prompt(target)
+    response_schema = schema_for_target(target)
     settings = effective_settings(
         config["audit_grader"], web_search_config=config.get("_web_search"),
     )
@@ -417,8 +493,9 @@ async def grade_run(
 
     started_at = datetime.now(timezone.utc).isoformat()
     started_perf = time.perf_counter()
+    grade_prefix = "grade_" if target == "final" else f"grade_{target}_"
     grade_run_id = (
-        f"grade_{source_path.stem}_"
+        f"{grade_prefix}{source_path.stem}_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     )
     if out_path is None:
@@ -437,7 +514,7 @@ async def grade_run(
         (grade_artifact_root / "source_run_meta.json").write_bytes(source_meta_bytes)
     (grade_artifact_root / "grader_prompt.txt").write_text(prompt_text)
     (grade_artifact_root / "grader_schema.json").write_text(
-        json.dumps(GRADE_SCHEMA, indent=2)
+        json.dumps(response_schema, indent=2)
     )
 
     audit = harness._research_audit_metadata(config, {
@@ -456,6 +533,7 @@ async def grade_run(
         "audit_schema_version": harness.AUDIT_SCHEMA_VERSION,
         "run_id": grade_run_id,
         "kind": "audit_grading",
+        "grading_target": target,
         "status": "running",
         "started_at": started_at,
         "source_run_file": str(source_path),
@@ -469,7 +547,7 @@ async def grade_run(
         "output_path": str(output_path),
         "grader_model": grader_model,
         "grader_prompt_sha256": prompt_sha,
-        "grader_schema_sha256": harness._sha256_json(GRADE_SCHEMA),
+        "grader_schema_sha256": harness._sha256_json(response_schema),
         "evaluation_policy": evaluation_policy,
         "config": harness._redact_config(config),
         "config_sha256": audit["config_sha256"],
@@ -513,6 +591,22 @@ async def grade_run(
             rationales, rationale_provenance = fetched
         else:
             rationales, rationale_provenance = fetched, {}
+        hle_ids = {
+            str(result.get("id")) for result in results
+            if result.get("dataset_name") == HLE_DATASET_NAME
+        }
+        if hle_ids:
+            missing_rationales = sorted(hle_ids - set(rationales))
+            if (
+                rationale_provenance.get("available") is not True
+                or missing_rationales
+            ):
+                raise RuntimeError(
+                    "HLE grading requires canonical rationale coverage for "
+                    "every source problem; "
+                    f"available={rationale_provenance.get('available')!r}, "
+                    f"missing_ids={missing_rationales}"
+                )
         (grade_artifact_root / "rationales.json").write_text(
             json.dumps(rationales, indent=2, default=str)
         )
@@ -542,9 +636,12 @@ async def grade_run(
             problem_started = time.perf_counter()
             verdict = None
             problem_error: Exception | None = None
+            target_result: dict | None = None
             try:
+                target_result = _result_for_target(result, target)
                 verdict = await grade_one(
-                    result, config, prompt_text, rationales.get(pid), watch=watch,
+                    target_result, config, prompt_text, rationales.get(pid),
+                    response_schema=response_schema, watch=watch,
                 )
                 final = verdict.get("final")
                 if not isinstance(final, dict) or not isinstance(
@@ -586,6 +683,7 @@ async def grade_run(
                 })
                 continue
             assert verdict is not None
+            assert target_result is not None
             final = verdict["final"]
             n_match += int(final["key_match"])
             print(
@@ -596,8 +694,9 @@ async def grade_run(
                 "id": pid,
                 "artifact_subdir": artifact_name,
                 "expected": result.get("expected"),
-                "answer": result.get("answer"),
-                "verified": result.get("verified"),
+                "answer": target_result.get("answer"),
+                "verified": target_result.get("verified"),
+                "target": target,
                 "grader_model": grader_model,
                 "grader_prompt_sha": prompt_sha,
                 "calls": calls,
@@ -633,6 +732,7 @@ async def grade_run(
             "graded": len(results),
             "key_match": n_match,
             "grader_model": grader_model,
+            "grading_target": target,
             "grader_prompt_sha": prompt_sha,
             "artifact_root": str(grade_artifact_root),
             "rationale_dataset": rationale_provenance,
@@ -700,11 +800,14 @@ if __name__ == "__main__":
                              f"Default: {DEFAULT_GRADER_CONFIG}")
     parser.add_argument("--out", default=None, help="Output grades JSON path")
     parser.add_argument(
+        "--target", choices=("final", "solver_initial"), default="final",
+    )
+    parser.add_argument(
         "--watch", action=argparse.BooleanOptionalAction, default=True,
     )
     parser.add_argument("--pricing", default=None)
     args = parser.parse_args()
     asyncio.run(grade_run(
         args.run_file, args.config, args.out,
-        watch=args.watch, pricing_path=args.pricing,
+        target=args.target, watch=args.watch, pricing_path=args.pricing,
     ))
