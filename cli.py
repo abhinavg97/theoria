@@ -100,17 +100,50 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _resolve_sandbox(args) -> tuple[bool, str]:
+    """Where the audited default (Docker on, Sage image) meets the user's
+    explicit flags. Shared by _preflight and _resolve so the two can't
+    drift out of sync — a preflight that checked a different image than
+    the run uses would be worse than no preflight."""
+    docker = True if args.docker is None else args.docker
+    image = SAGE_IMAGE if args.image is None else args.image
+    return docker, image
+
+
+def _preflight(args) -> None:
+    """Fail before the problems are loaded if Docker mode is on but the
+    sandbox image isn't there.
+
+    run_problems checks this too and is the real gate — but it runs after
+    `theoria hle` has already pulled the HLE-Verified dataset from Hugging
+    Face (~335 MB on a cold cache). Checking here turns a multi-minute
+    download-then-fail into a two-second setup error.
+    """
+    docker, image = _resolve_sandbox(args)
+    if not docker:
+        return
+    if sandbox.image_digest(image) is not None:
+        return
+    if image in (SAGE_IMAGE, STD_IMAGE):
+        build = "theoria build" + (" --sage" if image == SAGE_IMAGE else " --standard")
+    else:
+        build = f"docker build -t {image} <context>/"
+    sys.exit(
+        f"Sandbox image {image} is not available locally "
+        f"(not built, or Docker isn't running).\n"
+        f"  → {build}\n"
+        f"  → theoria doctor    checks the rest of your setup\n"
+        f"Or pass --no-docker to run without container isolation."
+    )
+
+
 def _resolve(args) -> None:
     """Apply the audited HLE setup, letting the remaining knobs (--image /
     --no-docker / --config / ...) override, then hand off to the harness."""
     # The audited configuration is the only one: Codex on every role except
     # the formalizer, which apply_args pins to Claude.
-    backend, docker, image = "codex", True, SAGE_IMAGE
-
-    if args.docker is not None:
-        docker = args.docker
-    if args.image is not None:
-        image = args.image
+    backend = "codex"
+    docker, image = _resolve_sandbox(args)
 
     # Pair the preamble to the image so the solver/judges are told the truth
     # about their container. Stacked as a base layer *under* any explicit
@@ -157,6 +190,7 @@ def _run(problems, prefix, args, *, by_category=False):
 # ── Commands ──────────────────────────────────────────────────────
 
 def cmd_custom(args) -> None:
+    _preflight(args)
     if args.file:
         question = Path(args.file).read_text().strip()
     elif args.question:
@@ -168,6 +202,8 @@ def cmd_custom(args) -> None:
 
 
 def cmd_hle(args) -> None:
+    # Before load_hle() — it downloads the dataset from Hugging Face.
+    _preflight(args)
     if args.problems:
         # `theoria hle 1` runs HLE problem 1 (1-based, in dataset order).
         problems = []

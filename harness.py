@@ -481,10 +481,14 @@ async def run_problems(
     through to each run_one so every LLM call writes full artifacts.
 
     If apply_args() recorded --docker, also:
+      - looks up the local sandbox image digest (and fails here if the
+        image isn't built) for call metadata;
       - extracts claude subscription creds from the macOS Keychain
         into a tempfile so the sandbox containers can mount it;
-      - looks up the local sandbox image digest for call metadata;
       - tells each run_one to spin up its own per-problem container.
+
+    Those credential tempfiles are always removed on the way out —
+    including when one of the Docker preflight checks raises.
     """
     artifact_root = make_artifact_root(save_path)
     print(f"Artifact root: {artifact_root}")
@@ -497,55 +501,6 @@ async def run_problems(
     run_id = os.path.basename(save_path)
     if run_id.endswith(".json"):
         run_id = run_id[:-5]
-
-    if use_docker:
-        claude_creds_path = sbx.refresh_claude_credentials()
-        claude_config_path = sbx.prepare_claude_config()
-        image_digest = sbx.image_digest(sandbox_image)
-        print(f"Docker mode: image={sandbox_image} "
-              f"image_digest={image_digest} "
-              f"creds={'present' if claude_creds_path else 'MISSING'} "
-              f"config_snapshot={'present' if claude_config_path else 'MISSING'}")
-        if claude_creds_path is None:
-            raise RuntimeError(
-                "Docker mode requested but could not read Claude credentials "
-                "from the macOS Keychain (not logged in, or not on macOS). "
-                "The formalizer needs them — without them a run would burn a "
-                "solver call and then fail. Run `claude` and sign in, then "
-                "retry (`theoria doctor` checks this)."
-            )
-        if image_digest is None:
-            raise RuntimeError(
-                f"Docker mode requested but image {sandbox_image} is "
-                f"not available locally. Build it first with the "
-                f"appropriate Dockerfile (see sandbox/ or sandbox-sage/)."
-            )
-        if claude_config_path is None:
-            raise RuntimeError(
-                "Docker mode requested but could not snapshot "
-                "~/.claude.json (file missing or repeatedly corrupted "
-                "mid-snapshot). Claude calls would fail inside the "
-                "container without it. Pause other Claude Code instances "
-                "if you have them running and retry."
-            )
-        # Gap-close #1 + #4: record the image digest and the tool
-        # versions as they exist INSIDE the container. These drift
-        # from the host over time — for a paper, the container
-        # versions are the authoritative ones.
-        container_versions = sbx.container_tool_versions(sandbox_image)
-        print(f"  container tools: {container_versions}")
-        update_artifact_root_meta(artifact_root, {
-            "sandbox": {
-                "enabled": True,
-                "image": sandbox_image,
-                "image_digest": image_digest,
-                "container_tool_versions": container_versions,
-                "claude_creds_source": (
-                    "macOS Keychain → plaintext temp mount"
-                    if claude_creds_path else "none"
-                ),
-            },
-        })
 
     results: list[dict] = []
     lock = asyncio.Lock()
@@ -572,7 +527,64 @@ async def run_problems(
             print(f"\n  [{len(results)}/{len(problems)} saved to {save_path}]")
         return result
 
+    # Credential acquisition happens INSIDE this try so the `finally`
+    # covers it. The guard clauses below raise, and a run that extracts
+    # the Keychain token and then bails out must still wipe it —
+    # previously those raises escaped before the cleanup block existed,
+    # leaving a plaintext OAuth token in $TMPDIR after every failed run.
     try:
+        if use_docker:
+            # Cheapest check first, and the only one that touches no
+            # secrets: if the sandbox image isn't there, nothing else
+            # matters, and we never go near the Keychain.
+            image_digest = sbx.image_digest(sandbox_image)
+            if image_digest is None:
+                raise RuntimeError(
+                    f"Docker mode requested but image {sandbox_image} is "
+                    f"not available locally. Build it first with the "
+                    f"appropriate Dockerfile (see sandbox/ or sandbox-sage/)."
+                )
+            claude_creds_path = sbx.refresh_claude_credentials()
+            claude_config_path = sbx.prepare_claude_config()
+            print(f"Docker mode: image={sandbox_image} "
+                  f"image_digest={image_digest} "
+                  f"creds={'present' if claude_creds_path else 'MISSING'} "
+                  f"config_snapshot={'present' if claude_config_path else 'MISSING'}")
+            if claude_creds_path is None:
+                raise RuntimeError(
+                    "Docker mode requested but could not read Claude credentials "
+                    "from the macOS Keychain (not logged in, or not on macOS). "
+                    "The formalizer needs them — without them a run would burn a "
+                    "solver call and then fail. Run `claude` and sign in, then "
+                    "retry (`theoria doctor` checks this)."
+                )
+            if claude_config_path is None:
+                raise RuntimeError(
+                    "Docker mode requested but could not snapshot "
+                    "~/.claude.json (file missing or repeatedly corrupted "
+                    "mid-snapshot). Claude calls would fail inside the "
+                    "container without it. Pause other Claude Code instances "
+                    "if you have them running and retry."
+                )
+            # Gap-close #1 + #4: record the image digest and the tool
+            # versions as they exist INSIDE the container. These drift
+            # from the host over time — for a paper, the container
+            # versions are the authoritative ones.
+            container_versions = sbx.container_tool_versions(sandbox_image)
+            print(f"  container tools: {container_versions}")
+            update_artifact_root_meta(artifact_root, {
+                "sandbox": {
+                    "enabled": True,
+                    "image": sandbox_image,
+                    "image_digest": image_digest,
+                    "container_tool_versions": container_versions,
+                    "claude_creds_source": (
+                        "macOS Keychain → plaintext temp mount"
+                        if claude_creds_path else "none"
+                    ),
+                },
+            })
+
         await asyncio.gather(*[run_and_save(p) for p in problems])
     finally:
         finalize_artifact_root(artifact_root)
